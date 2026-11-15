@@ -158,9 +158,28 @@ function Test-SharedPCTarget {
         $i.SetEduPolicies -eq $false -and $i.SetPowerPolicies -eq $false -and $i.RestrictLocalStorage -eq $false)
 }
 
+function Test-SharedPCUnset {
+    param($Settings)
+    foreach ($name in @('EnableSharedPCMode','EnableAccountManager','AccountModel','DeletionPolicy',
+        'SetEduPolicies','SetPowerPolicies','RestrictLocalStorage')) {
+        if ($null -ne $Settings.$name) { return $false }
+    }
+    return $true
+}
+
 function Get-Status {
     param($Context)
     $shared=Get-SharedPCState
+    $settings=$null
+    if ($shared.State -eq 'Observed' -and $shared.Count -eq 1) {
+        # Текущее наблюдение для check; null не заменяется CSP default/false.
+        $settings=[ordered]@{}
+        foreach ($name in @('EnableSharedPCMode','EnableAccountManager','AccountModel','DeletionPolicy',
+            'SetEduPolicies','SetPowerPolicies','RestrictLocalStorage')) {
+            $settings[$name]=$shared.Instance.$name
+        }
+        $settings=[pscustomobject]$settings
+    }
     $conflicts=@(Get-PolicyConflicts $Context)
     $exemptions=@(foreach ($account in @($Context.Config.OrdinaryAccounts)) {
         $key=[Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\Microsoft\Windows\CurrentVersion\SharedPC\Exemptions\'+$account.Sid)
@@ -173,7 +192,7 @@ function Get-Status {
         LastCompletedMode=if ($Context.Metadata) { $Context.Metadata.LastCompletedMode } else { $null }
         EffectiveMode=if ($Context.Metadata -and $Context.Metadata.Prepared -and $configured -and $conflicts.Count -eq 0) { 'normal' } else { 'Unconfirmed' }
         OwnUsbPolicy='NotConfigured'; Conflicts=$conflicts
-        SharedPCState=$shared.State; SharedPCReason=$shared.Reason; SharedPCTargetMatches=$configured
+        SharedPCState=$shared.State; SharedPCReason=$shared.Reason; SharedPCSettings=$settings; SharedPCTargetMatches=$configured
         OrdinaryAccounts=$exemptions; Revision=$Context.Revision
         FullReady=$false; FilesystemSupported=$false; NetworkSupported=$false; GuestLifecycleValidated=$false; OrdinaryScenariosVerified=$false
         Blockers=@('Структурное ограничение файлового доступа Guest ещё не испытано; абсолютная home-only гарантия не заявляется.','Guest network isolation не принята.','Immediate Guest cleanup и обычные занятия после permanent SharedPC не приняты.')
@@ -221,10 +240,8 @@ function Get-PreparationContext {
                 finally { $key.Dispose() }
             }
         }
-        if ($shared.State -eq 'Observed' -and ($shared.Instance.EnableSharedPCMode -or $shared.Instance.EnableAccountManager -or
-            $shared.Instance.SetEduPolicies -or $shared.Instance.SetPowerPolicies -or $shared.Instance.RestrictLocalStorage -or
-            [int]$shared.Instance.AccountModel -ne 0 -or [int]$shared.Instance.DeletionPolicy -ne 1)) {
-            throw 'Существующие SharedPC значения не являются NotConfigured.'
+        if (-not (Test-SharedPCUnset $shared.Instance)) {
+            throw 'До первой подготовки все семь SharedPC полей должны быть unset/null; configured values требуют отдельного разбора.'
         }
         foreach ($account in @($context.Config.OrdinaryAccounts)) {
             $key=[Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\Microsoft\Windows\CurrentVersion\SharedPC\Exemptions\'+$account.Sid)
