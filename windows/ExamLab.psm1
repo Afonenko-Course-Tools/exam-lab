@@ -77,6 +77,7 @@ function Test-DeclaredConfig {
 }
 
 function Read-Context {
+    param([switch]$AllowUnlistedOnlyForNormal)
     Assert-Host
     if ($PSScriptRoot -ne $script:CodeRoot -or
         (Get-FileHash -LiteralPath (Join-Path $script:CodeRoot 'ExamLab.psm1') -Algorithm SHA256).Hash -cne $script:LoadedSourceHash) {
@@ -106,12 +107,16 @@ function Read-Context {
     # SharedPC происхождение не угадывается по имени; roster не дополняется автоматически.
     $declared=@($config.OrdinaryAccounts | ForEach-Object {$_.Sid})
     $unlisted=@(Get-LocalUser | Where-Object { [int]($_.SID.Value.Split('-')[-1]) -ge 1000 -and $_.SID.Value -notin $declared })
-    if ($unlisted.Count) { throw 'Есть неописанные локальные SID. Нужна отдельная подготовка roster/проверка identity; список не расширяется автоматически.' }
+    if ($unlisted.Count -and -not $AllowUnlistedOnlyForNormal) { throw 'Есть неописанные локальные SID. Нужна отдельная подготовка roster/проверка identity; список не расширяется автоматически.' }
     $lgpo=Join-Path $script:CodeRoot 'LGPO.exe'
     if ((Get-FileHash -LiteralPath $lgpo -Algorithm SHA256).Hash -ne '0C97F29543418B30340C4FF5D930D31E6196DD59C2CC74B6B890FA7B90C910C7') { throw 'Неизвестный LGPO.exe.' }
     $signature=Get-AuthenticodeSignature -LiteralPath $lgpo
     if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') { throw 'Подпись Microsoft LGPO не подтверждена.' }
-    [pscustomobject]@{ Config=$config; Revision=$revision; Metadata=$metadata; LGPO=$lgpo }
+    [pscustomobject]@{
+        Config=$config; Revision=$revision; Metadata=$metadata; LGPO=$lgpo
+        IdentityUnconfirmed=($unlisted.Count -gt 0)
+        UnlistedAccounts=@($unlisted | ForEach-Object {[pscustomobject]@{Sid=$_.SID.Value;Name=$_.Name}})
+    }
 }
 
 function Get-SharedPCState {
@@ -190,7 +195,9 @@ function Get-Status {
     [pscustomobject]@{
         Prepared=($null -ne $Context.Metadata -and $Context.Metadata.Prepared -and $configured)
         LastCompletedMode=if ($Context.Metadata) { $Context.Metadata.LastCompletedMode } else { $null }
-        EffectiveMode=if ($Context.Metadata -and $Context.Metadata.Prepared -and $configured -and $conflicts.Count -eq 0) { 'normal' } else { 'Unconfirmed' }
+        EffectiveMode=if ($Context.Metadata -and $Context.Metadata.Prepared -and $configured -and $conflicts.Count -eq 0 -and -not $Context.IdentityUnconfirmed) { 'normal' } else { 'Unconfirmed' }
+        IdentityUnconfirmed=$Context.IdentityUnconfirmed; UnlistedAccounts=$Context.UnlistedAccounts
+        IdentityWarning=if ($Context.IdentityUnconfirmed) { 'Новые SID не распознаны. Ordinary roster не изменён; normal снимает только собственные ограничения.' } else { $null }
         OwnUsbPolicy='NotConfigured'; Conflicts=$conflicts
         SharedPCState=$shared.State; SharedPCReason=$shared.Reason; SharedPCSettings=$settings; SharedPCTargetMatches=$configured
         OrdinaryAccounts=$exemptions; Revision=$Context.Revision
@@ -314,7 +321,7 @@ function Set-ExamLabMode {
     param([Parameter(Mandatory)][ValidateSet('exam','normal')][string]$Mode)
     # ВАЖНО: этот отказ предшествует чтению config, lock/metadata и любым Windows writes.
     if ($Mode -eq 'exam') { throw 'Экзамен заблокирован до native-проверки структурного файлового ограничения и сети. Windows не изменена.' }
-    $context=Read-Context
+    $context=Read-Context -AllowUnlistedOnlyForNormal
     $status=Get-Status $context
     # В этом кандидате ещё нет setter USB/FS/network: собственный переключаемый
     # набор пуст. normal — честный no-op даже при partial prepare/foreign conflict;

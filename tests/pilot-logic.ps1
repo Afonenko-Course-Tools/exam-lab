@@ -37,6 +37,15 @@ try {
     $tokens=$null; $errors=$null
     $ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot '..\windows\ExamLab.psm1'),[ref]$tokens,[ref]$errors)
     $commands=@($ast.FindAll({param($n) $n -is [Management.Automation.Language.CommandAst]},$true) | ForEach-Object {$_.GetCommandName()})
+    $exceptions=@($ast.FindAll({param($n)
+        $n -is [Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Read-Context' -and
+        @($n.CommandElements | Where-Object {$_ -is [Management.Automation.Language.CommandParameterAst] -and $_.ParameterName -eq 'AllowUnlistedOnlyForNormal'}).Count -gt 0
+    },$true))
+    if ($exceptions.Count -ne 1) { throw 'FAIL unlisted SID exception должен иметь ровно один call site.' }
+    $caller=$exceptions[0].Parent
+    while ($caller -and $caller -isnot [Management.Automation.Language.FunctionDefinitionAst]) { $caller=$caller.Parent }
+    if (-not $caller -or $caller.Name -ne 'Set-ExamLabMode') { throw 'FAIL prepare/check не могут обходить strict roster.' }
+    'PASS roster exception: только normal route; exam проверен ранним отказом'
     foreach($name in @('netsh.exe','reg.exe','secedit.exe','Disable-NetFirewallRule','Set-NetFirewallProfile','Set-Acl','Save-Baseline','Restore-Baseline','New-CimInstance')) {
         if($name -in $commands){throw "FAIL global mutation/restore остался: $name"}
     }
