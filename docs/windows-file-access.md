@@ -81,3 +81,65 @@ Mandatory Integrity Control (MIC). Независимая проверка пр�
 Explorer, IDEA, Java и Git под Low здесь не принимались. Перед выбором файловой
 политики нужно подтвердить структурное разделение данных, совместимость
 инструментов и сохранность обычных занятий. MIC остаётся исследуемым кандидатом.
+
+## Готовый кандидат: Sandboxie Privacy Mode
+
+По документации и исходникам выпуска
+[Sandboxie Plus 1.18.8 / Classic 5.73.8](https://github.com/sandboxie-plus/Sandboxie/releases/tag/v1.18.8)
+готовым кандидатом для широкого разделения является
+[Privacy Mode](https://sandboxie-plus.github.io/sandboxie-docs/PlusContent/privacy-mode/).
+Он скрывает существующие данные вне системной области, позволяет читать Windows,
+установленные программы и системную область Microsoft в ProgramData, а новые
+рабочие файлы создаёт внутри песочницы. Это штатная исходная политика;
+совместимость её шаблонов с нашим учебным окружением ещё не проверена.
+
+Директивы доступа работают с шаблонами путей и Shell Folders.
+[`ReadFilePath`](https://sandboxie-plus.github.io/sandboxie-docs/Content/ReadFilePath/)
+открывает чтение, а
+[`OpenFilePath`](https://sandboxie-plus.github.io/sandboxie-docs/Content/OpenFilePath/)
+также разрешает непосредственную запись вне песочницы. Эти параметры не выражают
+условие «владелец файла совпадает с SID экзаменационного пользователя».
+
+Для текущей учётки есть штатное сочетание
+[`Enabled=y,<имя учётки>`](https://sandboxie-plus.github.io/sandboxie-docs/Content/Enabled/)
+и универсального `ForceProcess=*`. Перед применением имя нужно сверить с SID
+настоящего текущего Guest; при следующем Guest это соответствие проверяется снова.
+В [драйвере выпуска 1.18.8](https://github.com/sandboxie-plus/Sandboxie/blob/v1.18.8/Sandboxie/core/drv/process_force.c#L1078-L1140)
+фильтр учётки применяется до правил принудительного запуска. Это кандидат
+для новых процессов без перечня отдельных приложений. Уже работающий Explorer
+сам в песочницу не переносится; исключения компонентов Sandboxie и маршруты
+запуска вне box ещё требуют проверки. Изолированная Java-программа не доказывает
+охват всего Guest-сеанса.
+
+У технической оценки есть два разных режима:
+
+| Проба | Условия по источникам 1.18.8 |
+| --- | --- |
+| Без сертификата | Email и аккаунт не нужны, но драйвер планирует завершение процессов с соответствующими функциями через пять минут. |
+| Пробный сертификат на десять дней | Клиент запрашивает email и отправляет имя и HWID онлайн. Отдельной регистрации аккаунта в этом клиентском пути нет; фактическая выдача не проверялась. |
+
+Пятиминутный предел задан в
+[коде драйвера](https://github.com/sandboxie-plus/Sandboxie/blob/v1.18.8/Sandboxie/core/drv/process.c#L714-L745).
+Длительность продолжительной пробы определена в
+[SettingsWindow.h](https://github.com/sandboxie-plus/Sandboxie/blob/v1.18.8/SandboxiePlus/SandMan/Windows/SettingsWindow.h#L239-L240),
+запрос email — в
+[SettingsWindow.cpp](https://github.com/sandboxie-plus/Sandboxie/blob/v1.18.8/SandboxiePlus/SandMan/Windows/SettingsWindow.cpp#L3133-L3150),
+а передача имени и HWID — в
+[OnlineUpdater.cpp](https://github.com/sandboxie-plus/Sandboxie/blob/v1.18.8/SandboxiePlus/SandMan/OnlineUpdater.cpp#L287-L331).
+Ограниченная оценка описана в
+[LICENSE.Plus](https://github.com/sandboxie-plus/Sandboxie/blob/v1.18.8/LICENSE.Plus);
+для образовательной эксплуатации документация отдельно требует
+[Business Certificate](https://sandboxie-plus.github.io/sandboxie-docs/Content/FeatureComparison/).
+
+В отдельной Windows canary установка 1.18.8 с проверенной подписью прошла;
+служба и драйвер работали. До политики обычный пользователь через Java читал
+два внешних маркера и JDK, записывал и читал свой workspace. После применения
+минимального принудительного запуска для этой фиксированной учётки новый вход
+дал чёрный рабочий стол и `SBIE2327 Error in COM server: [31 / 258]`.
+Explorer и Java не появились; причина отказа не установлена. Отрицательный
+результат независимо проверен, стенд штатно выключен с сохранением диска.
+
+Поэтому чтение внешних файлов, JDK и workspace под этой политикой не проверены.
+Охват всего Guest-сеанса, IDEA/Git и дочерних процессов, сохранность обычных
+занятий и очистка не приняты. Проба фиксированной учётки не проверяет жизненный
+цикл Shared PC Guest; пятиминутная оценка не является экзаменационным режимом.
