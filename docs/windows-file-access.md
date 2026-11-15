@@ -139,6 +139,13 @@ Explorer, IDEA, Java и Git под Low здесь не принимались. �
 Explorer и Java не появились; причина отказа не установлена. Отрицательный
 результат независимо проверен, стенд штатно выключен с сохранением диска.
 
+В исходниках 1.18.8 [`LogErr`](https://github.com/sandboxie-plus/Sandboxie/blob/v1.18.8/Sandboxie/core/svc/comserver.cpp#L1355-L1364) выводит коды в формате `%02X / %d`.
+`0x31` обозначает [запрос COM class factory](https://github.com/sandboxie-plus/Sandboxie/blob/v1.18.8/Sandboxie/core/svc/comserver.cpp#L258-L286), а `258` — [`WAIT_TIMEOUT`](https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-waitformultipleobjects)
+при [ожидании ответа прокси](https://github.com/sandboxie-plus/Sandboxie/blob/v1.18.8/Sandboxie/core/svc/comserver.cpp#L1083-L1132) со [штатным пределом 30 секунд](https://github.com/sandboxie-plus/Sandboxie/blob/v1.18.8/Sandboxie/core/svc/comserver.cpp#L43-L50).
+Это локализация симптома; причина зависания остаётся неизвестной.
+Следующий диагностический шаг — штатные [`ClsidTrace`](https://github.com/sandboxie-plus/Sandboxie/blob/v1.18.8/Sandboxie/core/dll/com.c#L1416-L1419) и [`NotifyForceProcessEnabled`](https://github.com/sandboxie-plus/Sandboxie/blob/v1.18.8/Sandboxie/core/drv/process_force.c#L419-L421),
+с сопоставлением CLSID, PID и времени, без добавления исключений доступа.
+
 Поэтому чтение внешних файлов, JDK и workspace под этой политикой не проверены.
 Охват всего Guest-сеанса, IDEA/Git и дочерних процессов, сохранность обычных
 занятий и очистка не приняты. Проба фиксированной учётки не проверяет жизненный
