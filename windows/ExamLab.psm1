@@ -5,17 +5,15 @@ $script:CodeRoot = Join-Path $env:ProgramFiles 'ExamLab'
 $script:DataRoot = Join-Path $env:ProgramData 'ExamLab'
 $script:ConfigFile = Join-Path $script:DataRoot 'pc.json'
 $script:ModeFile = Join-Path $script:DataRoot 'mode.json'
-$script:UsbKey = 'Software\Policies\Microsoft\Windows\RemovableStorageDevices'
 $script:Namespace = 'root\cimv2\mdm\dmmap'
 $script:LoadedSourceHash = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash
 
-function Invoke-Native {
-    param([string]$File, [string[]]$Arguments)
-    $previous = $ErrorActionPreference
-    try { $ErrorActionPreference='Continue'; $output=& $File @Arguments 2>&1; $code=$LASTEXITCODE }
-    finally { $ErrorActionPreference=$previous }
-    if ($code -ne 0) { throw "$File завершился с кодом $code`: $($output | Out-String)" }
-    return ($output | Out-String)
+function Test-ExistingFile {
+    param([string]$Path)
+    try { $item=Get-Item -LiteralPath $Path -Force -ErrorAction Stop }
+    catch [System.Management.Automation.ItemNotFoundException] { return $false }
+    if ($item -isnot [IO.FileInfo]) { throw "Ожидался файл: $Path" }
+    return $true
 }
 
 function Assert-Host {
@@ -26,10 +24,10 @@ function Assert-Host {
     if ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value -ne 'S-1-5-18') {
         throw 'Запустите фиксированное задание ExamLab из повышенного административного сеанса.'
     }
-    if ([IO.File]::Exists((Join-Path $script:DataRoot 'state.json'))) {
+    if ((Test-ExistingFile (Join-Path $script:DataRoot 'state.json'))) {
         throw 'Обнаружен state.json прежнего прототипа. Миграция и старый finish не выполняются.'
     }
-    if (-not [IO.File]::Exists((Join-Path $env:ProgramData 'ExamLab-TestVM'))) { throw 'Нет маркера одноразовой тестовой VM.' }
+    if (-not (Test-ExistingFile (Join-Path $env:ProgramData 'ExamLab-TestVM'))) { throw 'Нет маркера одноразовой тестовой VM.' }
     $machine=Get-CimInstance Win32_ComputerSystem
     if (($machine.Manufacturer+' '+$machine.Model) -notmatch 'QEMU|KVM|Red Hat' -or $machine.PartOfDomain) { throw 'Этот кандидат допускает только standalone QEMU/KVM VM.' }
     $os=Get-CimInstance Win32_OperatingSystem
@@ -59,9 +57,9 @@ function Assert-SafePath {
 
 function Test-DeclaredConfig {
     param($Config)
-    if (-not $Config -or @($Config.PSObject.Properties.Name).Count -ne 1 -or
+    if ($Config -isnot [pscustomobject] -or @($Config.PSObject.Properties.Name | Where-Object {$_ -notin @('OrdinaryAccounts','Network')}).Count -or
         $Config.PSObject.Properties.Name -notcontains 'OrdinaryAccounts' -or $Config.OrdinaryAccounts -isnot [Array] -or @($Config.OrdinaryAccounts).Count -eq 0) {
-        throw 'pc.json должен содержать только непустой OrdinaryAccounts.'
+        throw 'pc.json: непустой OrdinaryAccounts и необязательный Network.'
     }
     $sids=@{}; $names=@{}
     foreach ($account in @($Config.OrdinaryAccounts)) {
@@ -69,9 +67,13 @@ function Test-DeclaredConfig {
             $account.PSObject.Properties.Name -notcontains 'Sid' -or $account.PSObject.Properties.Name -notcontains 'Name' -or
             $account.Sid -isnot [string] -or $account.Name -isnot [string] -or
             $account.Sid -notmatch '^S-1-5-21-\d+-\d+-\d+-\d+$' -or
-            [string]::IsNullOrWhiteSpace($account.Name) -or $account.Name -match '[\\/\x00-\x1f]' -or
+            [string]::IsNullOrWhiteSpace($account.Name) -or $account.Name.Trim() -cne $account.Name -or $account.Name -match '[\\/\x00-\x1f]' -or
             $sids.ContainsKey($account.Sid) -or $names.ContainsKey($account.Name)) { throw 'Неверный или повторный Sid/Name в OrdinaryAccounts.' }
         $sids[$account.Sid]=$true; $names[$account.Name]=$true
+    }
+    if ($Config.PSObject.Properties.Name -contains 'Network') {
+        if ($null -eq $Config.Network) { throw 'Явный Network:null недопустим; удалите необязательный раздел.' }
+        Test-ExamNetworkConfig $Config.Network
     }
     return $Config
 }
@@ -85,12 +87,14 @@ function Read-Context {
     }
     Assert-SafePath $script:CodeRoot -Readable
     Assert-SafePath $script:DataRoot
-    foreach ($file in @('ExamLab.psm1','exam-lab.ps1','LGPO.exe')) { Assert-SafePath (Join-Path $script:CodeRoot $file) -Readable }
+    foreach ($file in @('ExamLab.psm1','exam-lab.ps1','ExamLab.Usb.psm1','ExamNetwork.psm1','LGPO.exe')) { Assert-SafePath (Join-Path $script:CodeRoot $file) -Readable }
+    Import-Module (Join-Path $script:CodeRoot 'ExamLab.Usb.psm1') -Force
+    Import-Module (Join-Path $script:CodeRoot 'ExamNetwork.psm1') -Force
     Assert-SafePath $script:ConfigFile
     $config=Test-DeclaredConfig ([IO.File]::ReadAllText($script:ConfigFile) | ConvertFrom-Json)
     $revision=(Get-FileHash -LiteralPath $script:ConfigFile -Algorithm SHA256).Hash
     $metadata=$null
-    if ([IO.File]::Exists($script:ModeFile)) {
+    if ((Test-ExistingFile $script:ModeFile)) {
         Assert-SafePath $script:ModeFile
         $metadata=[IO.File]::ReadAllText($script:ModeFile) | ConvertFrom-Json
         if (@($metadata.PSObject.Properties.Name).Count -ne 3 -or
@@ -127,31 +131,14 @@ function Get-SharedPCState {
     } catch { [pscustomobject]@{ State='Unknown'; Count=$null; Instance=$null; Reason=$_.Exception.Message } }
 }
 
-function Get-PolicyConflicts {
+function Get-ComponentStatus {
     param($Context)
-    $conflicts=@()
-    # Сейчас нет публичного USB setter. Любой существующий removable-storage entry
-    # чужой: normal не удаляет его и не заменяет на Deny_Read=0.
-    foreach ($folder in @('GroupPolicy','GroupPolicyUsers')) {
-        $path=Join-Path $env:windir ('System32\'+$folder)
-        if (-not [IO.Directory]::Exists($path)) { continue }
-        foreach ($file in @(Get-ChildItem -LiteralPath $path -Recurse -Force -Filter Registry.pol)) {
-            if ($file.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Reparse point в GPO.' }
-            $side=if ($file.FullName -match '\\Machine\\') { '/m' } else { '/u' }
-            $text=Invoke-Native $Context.LGPO @('/parse',$side,$file.FullName)
-            if ($text -match [regex]::Escape($script:UsbKey)) { $conflicts += "Чужая USB GPO: $($file.FullName)" }
-        }
+    $network=$null
+    if ($Context.Config.PSObject.Properties.Name -contains 'Network') { $network=$Context.Config.Network }
+    [pscustomobject]@{
+        Usb=(Get-ExamLabUsbStatus -ConfigRevision $Context.Revision)
+        Network=(Get-ExamNetworkStatus -Config $network -ConfigRevision $Context.Revision)
     }
-    # Только уже загруженные hive: check не делает reg load/save/export.
-    foreach ($account in @($Context.Config.OrdinaryAccounts)) {
-        $hive=[Microsoft.Win32.Registry]::Users.OpenSubKey($account.Sid)
-        if (-not $hive) { continue }
-        try {
-            $key=$hive.OpenSubKey($script:UsbKey)
-            if ($key) { $key.Dispose(); $conflicts += "Чужой effective USB class/value/ACL scope: $($account.Sid)" }
-        } finally { $hive.Dispose() }
-    }
-    return $conflicts
 }
 
 function Test-SharedPCTarget {
@@ -159,7 +146,7 @@ function Test-SharedPCTarget {
     if ($Shared.State -ne 'Observed') { return $false }
     $i=$Shared.Instance
     return ($i.EnableSharedPCMode -eq $true -and $i.EnableAccountManager -eq $true -and
-        [int]$i.AccountModel -eq 2 -and [int]$i.DeletionPolicy -eq 0 -and
+        [int]$i.AccountModel -eq 2 -and $null -ne $i.DeletionPolicy -and [int]$i.DeletionPolicy -eq 0 -and
         $i.SetEduPolicies -eq $false -and $i.SetPowerPolicies -eq $false -and $i.RestrictLocalStorage -eq $false)
 }
 
@@ -185,7 +172,11 @@ function Get-Status {
         }
         $settings=[pscustomobject]$settings
     }
-    $conflicts=@(Get-PolicyConflicts $Context)
+    $components=Get-ComponentStatus $Context
+    # Единственный USB scanner принадлежит компоненту: он различает own и foreign.
+    $conflicts=@($components.Usb.Conflicts)+@($components.Network.Blockers)
+    $sourceNormal=($components.Usb.State -in @('NotConfigured','Normal') -and $components.Network.SourceNormal -and
+        $components.Usb.NormalAllowed -and $components.Network.NormalAllowed -and $conflicts.Count -eq 0)
     $exemptions=@(foreach ($account in @($Context.Config.OrdinaryAccounts)) {
         $key=[Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\Microsoft\Windows\CurrentVersion\SharedPC\Exemptions\'+$account.Sid)
         $exists=$null -ne $key; if ($key) { $key.Dispose() }
@@ -195,10 +186,11 @@ function Get-Status {
     [pscustomobject]@{
         Prepared=($null -ne $Context.Metadata -and $Context.Metadata.Prepared -and $configured)
         LastCompletedMode=if ($Context.Metadata) { $Context.Metadata.LastCompletedMode } else { $null }
-        EffectiveMode=if ($Context.Metadata -and $Context.Metadata.Prepared -and $configured -and $conflicts.Count -eq 0 -and -not $Context.IdentityUnconfirmed) { 'normal' } else { 'Unconfirmed' }
+        EffectiveMode=if ($Context.Metadata -and $Context.Metadata.Prepared -and $configured -and $conflicts.Count -eq 0 -and $sourceNormal -and -not $components.Usb.EffectiveReadbackPending -and -not $Context.IdentityUnconfirmed) { 'normal' } else { 'Unconfirmed' }
         IdentityUnconfirmed=$Context.IdentityUnconfirmed; UnlistedAccounts=$Context.UnlistedAccounts
         IdentityWarning=if ($Context.IdentityUnconfirmed) { 'Новые SID не распознаны. Ordinary roster не изменён; normal снимает только собственные ограничения.' } else { $null }
-        OwnUsbPolicy='NotConfigured'; Conflicts=$conflicts
+        Components=$components; OwnSourceNormal=$sourceNormal; Conflicts=$conflicts
+        SourceMode=if ($sourceNormal) {'normal'} else {'Unconfirmed'}
         SharedPCState=$shared.State; SharedPCReason=$shared.Reason; SharedPCSettings=$settings; SharedPCTargetMatches=$configured
         OrdinaryAccounts=$exemptions; Revision=$Context.Revision
         FullReady=$false; FilesystemSupported=$false; NetworkSupported=$false; GuestLifecycleValidated=$false; OrdinaryScenariosVerified=$false
@@ -290,7 +282,7 @@ function Initialize-ExamLab {
     if ($preflight.AlreadyPrepared) { return $preflight.Status }
     # Первая проверка не считается актуальной после ожидания общего installer lock.
     $lockPath=Join-Path $script:DataRoot 'operation.lock'
-    if ([IO.File]::Exists($lockPath)) { Assert-SafePath $lockPath }
+    if ((Test-ExistingFile $lockPath)) { Assert-SafePath $lockPath }
     $lock=[IO.File]::Open($lockPath,'OpenOrCreate','ReadWrite','None')
     try {
         $preflight=Get-PreparationContext
@@ -321,15 +313,44 @@ function Set-ExamLabMode {
     param([Parameter(Mandatory)][ValidateSet('exam','normal')][string]$Mode)
     # ВАЖНО: этот отказ предшествует чтению config, lock/metadata и любым Windows writes.
     if ($Mode -eq 'exam') { throw 'Экзамен заблокирован до native-проверки структурного файлового ограничения и сети. Windows не изменена.' }
-    $context=Read-Context -AllowUnlistedOnlyForNormal
-    $status=Get-Status $context
-    # В этом кандидате ещё нет setter USB/FS/network: собственный переключаемый
-    # набор пуст. normal — честный no-op даже при partial prepare/foreign conflict;
-    # он не трогает SharedPC и не выдает отсутствие своих entries за ordinary PASS.
-    $status | Add-Member -NotePropertyName Normal -NotePropertyValue @{
-        Changed=$false; OwnedEntriesRemoved=0; Reason='Собственных exam entries пока нет; normal ничего не изменил.'
-    }
-    return $status
+    # Read-only preflight до создания lock; после acquire контекст читается заново.
+    $null=Read-Context -AllowUnlistedOnlyForNormal
+    $lockPath=Join-Path $script:DataRoot 'operation.lock'
+    if ((Test-ExistingFile $lockPath)) { Assert-SafePath $lockPath }
+    $lock=[IO.File]::Open($lockPath,'OpenOrCreate','ReadWrite','None')
+    try {
+        $context=Read-Context -AllowUnlistedOnlyForNormal
+        $components=Get-ComponentStatus $context
+        $blockers=@($components.Usb.NormalBlockers)+@($components.Network.Blockers)
+        if (-not $components.Usb.NormalAllowed -or -not $components.Network.NormalAllowed) {
+            throw ('normal не применён: component preflight: '+($blockers -join '; '))
+        }
+        $network=$null
+        if ($context.Config.PSObject.Properties.Name -contains 'Network') { $network=$context.Config.Network }
+        # Все preflight завершены; фиксированные setters повторяют свои проверки.
+        # При последующем отказе нет общего успеха/rollback; own intent сохраняется.
+        $usb=$null; $net=$null; $phase='Usb'
+        try {
+            $usb=Invoke-ExamLabUsbModeUnderLock -Mode normal -ConfigRevision $context.Revision -OperationLock $lock
+            $phase='Network'
+            $net=Invoke-ExamNetworkUnderLock -Action Normal -Config $network -ConfigRevision $context.Revision -OperationLock $lock
+        } catch {
+            $partial=[pscustomobject]@{Completed=$false;FailedComponent=$phase;Usb=$usb;Network=$net;Error=$_.Exception.Message}
+            throw ('normal не завершён; частичный результат без rollback: '+($partial | ConvertTo-Json -Depth 6 -Compress))
+        }
+        $status=Get-Status $context
+        if (-not $status.OwnSourceNormal) {
+            $incomplete=[pscustomobject]@{Completed=$false;Usb=$usb;Network=$net;FinalComponents=$status.Components;Conflicts=$status.Conflicts}
+            throw ('normal source readback не подтверждён; без rollback: '+($incomplete | ConvertTo-Json -Depth 6 -Compress))
+        }
+        $status | Add-Member -NotePropertyName Normal -NotePropertyValue ([pscustomobject]@{
+            SourceCleanupCompleted=$status.OwnSourceNormal
+            Usb=$usb; Network=$net
+            EffectiveReadbackPending=$true
+            Reason='Сняты только собственные source entries; USB effective readback требует входа пользователя. SharedPC не выключается.'
+        })
+        return $status
+    } finally { $lock.Dispose() }
 }
 
 Export-ModuleMember -Function Get-ExamLabStatus,Initialize-ExamLab,Set-ExamLabMode

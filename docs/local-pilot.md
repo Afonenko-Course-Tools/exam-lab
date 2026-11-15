@@ -1,14 +1,15 @@
 # Локальный переключатель Windows
 
 Текущий кандидат упрощён до `prepare`, `check`, `exam`, `normal`. Он не делает
-снимков прежних настроек Windows и не восстанавливает их целиком. Нет экспорта
-или импорта firewall/GPO/registry, security templates, копий пользовательских
-hive и общего rollback. Чужие правила, настройки и ACL не исправляются.
+снимков прежних настроек Windows и не восстанавливает их целиком. Нет общего
+обратного импорта сохранённых firewall/GPO/registry, security templates, копий
+пользовательских hive и общего rollback. Адресная установка собственных GPO entries
+использует штатные средства. Чужие правила, настройки и ACL не исправляются.
 
-**Новая реализация ещё не прошла приёмку в Windows.** `FullReady=false`; `exam`
+**Совместная поставка USB/network ещё не прошла приёмку в Windows.** `FullReady=false`; `exam`
 отказывает до чтения конфигурации, создания lock/metadata и любых изменений.
 Причины: не приняты структурное ограничение файлового доступа Guest, сетевая
-изоляция, immediate Guest cleanup и обычные занятия при постоянном SharedPC.
+изоляция в совместной поставке и весь обычный учебный сценарий при постоянном SharedPC.
 Сейчас допускается только отмеченная standalone QEMU/KVM VM, Windows x64,
 Windows PowerShell 5.1 x64 и SYSTEM через административные задания. ARM исключён.
 Текущий стенд en-US; русская Windows остаётся отдельной проверкой.
@@ -31,6 +32,21 @@ Windows PowerShell 5.1 x64 и SYSTEM через административные
   ]
 }
 ```
+
+Необязательный `Network` в той же `pc.json` задаёт literal IPv4 proxy endpoint,
+порт и массив явного технического inbound TCP-доступа; пример —
+[pc.network.example.json](../examples/pc.network.example.json). Пустой
+`TechnicalAccess: []` допустим. Каждый элемент содержит только `RemoteIP` и
+`LocalPort`; имена сайтов, PL/Moodle destinations и произвольные firewall-поля
+в этот Windows config не входят. Конфигурация без `Network` остаётся допустимой.
+Добавление Network к уже подготовленному ПК не меняет его Revision автоматически.
+
+Установщик принимает также `-PolicyFileEditorPath`: offline-каталог исходного
+PolicyFileEditor3.0.1 из PowerShell Gallery. Он проверяет SHA256 всех15 известных
+файлов, включая LICENSE, и доставляет их в
+`%ProgramFiles%\ExamLab\PolicyFileEditor\3.0.1`. Пакеты в runtime не скачиваются.
+Новая поставка содержит фиксированные `ExamLab.Usb.psm1` и `ExamNetwork.psm1`;
+установка сама не применяет ограничения и не запускает задания.
 
 SID и имя должны точно соответствовать существующей локальной учётке. Это
 неизменная конфигурация подготовленного ПК, а не runtime-снимок всех пользователей.
@@ -93,7 +109,8 @@ ACL существующих объектов не сбрасываются. П�
 `GuestLifecycleValidated=false`, `FullReady=false`. SharedPC остаётся включённым
 при переключении normal/exam. Выбранный DeletionPolicy=0 по
 [SharedPC CSP](https://learn.microsoft.com/en-us/windows/client-management/mdm/sharedpc-csp)
-означает immediate deletion; это ещё не подтверждённая native очистка Guest.
+означает immediate deletion. В одной настоящей Guest-пробе очистка принята,
+но точное время удаления не наблюдалось; мгновенность не заявляется.
 Документация Microsoft описывает постоянные эффекты SharedPC и exemptions в
 [руководстве настройки](https://learn.microsoft.com/en-us/windows/configuration/shared-pc/set-up-shared-or-guest-pc).
 
@@ -103,21 +120,35 @@ filesystem setter нет. Обычный default Allow и чужие Allow-пр�
 Возможное будущее владение отдельными computer-GPO полями потребует начального
 NotConfigured, точного списка полей и нормального NotConfigured при снятии.
 
-`normal` не выключает SharedPC и не зависит от готовности filesystem/network.
-Сейчас собственных переключаемых USB/GPO/FS/network entries ещё нет: возвращается
-честный `Changed=false`/`OwnedEntriesRemoved=0`. Чужой Deny_Read не заменяется на0,
-чужие class keys/родители и GPO-деревья не удаляются. Будущий адресный USB setter
-потребует отдельной native проверки: normal = NotConfigured только собственных
-entries, сохранность других Registry.pol entries и effective снятие после входа.
-Любой partial статус не выдаётся за подтверждённый normal/exam.
-Этот no-op пока не является рабочим учительским завершением экзамена: нет
-принятого экзаменационного setter. Для `normal` новые неописанные SID не блокируют
-снятие только собственных entries: он возвращает `IdentityUnconfirmed=true`,
-список таких SID, предупреждение и `EffectiveMode=Unconfirmed`. Эти аккаунты не
-становятся ordinary roster, metadata не переписывается. Проверки известных
-SID/Name, конфигурации, кода, ACL и источников политик сохраняются; `prepare` и
-`check` используют прежний строгий roster. Полноценный offline-вызов с физически
-недоступной сетью ещё не испытан; проверка подписи LGPO остаётся включённой.
+`normal` не выключает SharedPC и не зависит от готовности файловой политики.
+Он под одним `operation.lock` заново читает конфигурацию и проверяет возможность
+снять собственные настройки обоих установленных компонентов. До успешного
+preflight обоих компонентов setters не вызываются; затем последовательно
+выполняются фиксированные USB Normal и Network Normal. Каждый компонент повторяет
+свои проверки перед записью. Ошибка второго не откатывает первый и возвращается
+как незавершённый частичный результат, а не успешный normal.
+
+USB снимает только точную собственную Non-Administrators MLGPO entry через
+PolicyFileEditor: NotConfigured, без DWORD0/DELETE/CLEAR, замены чужого дерева
+и сброса ACL. Это общее ограничение для nonadmin, включая ordinary, не Guest-only.
+Снятие source policy не доказывает effective USB-доступ: нужен настоящий повторный
+вход и чтение флешки. Сетевой компонент снимает только собственные проверенные
+правила и computer-GPO поля; PersistentStore не импортируется и не очищается.
+При отсутствующем Network и отсутствии сетевого intent его Normal — no-op;
+при существующем intent без подходящей конфигурации возвращается отказ.
+
+Статусы обоих компонентов присутствуют в `check`/`normal`; собственная Applied
+политика не называется пустым набором или обычным режимом. `FullReady=false`,
+публичный `exam` остаётся заблокированным. Прямые component Apply — отдельные
+эксперименты, их исходники и интеграционная доставка ещё требуют native-приёмки.
+Это не заявка на рабочее завершение всего экзамена.
+
+Для `normal` новые неописанные SID не блокируют снятие только собственных entries:
+возвращаются `IdentityUnconfirmed=true`, список SID, предупреждение и
+`EffectiveMode=Unconfirmed`. Аккаунты не усыновляются ordinary roster, main metadata
+не переписывается. Известные SID/Name, код/config/ACL и источники политик проверяются;
+`prepare` и `check` сохраняют строгий roster. Полноценный общий offline-вызов без
+сервера и Internet ещё не принят; проверка подписи LGPO остаётся включённой.
 
 Структурная файловая политика должна быть широкой, без хрупкого списка частных
 путей. Абсолютная home-only гарантия не заявляется; подмена системных файлов
@@ -125,6 +156,18 @@ SID/Name, конфигурации, кода, ACL и источников пол
 назначает массовые ACL/SACL/MIC labels.
 
 ## Проверки и границы результата
+
+На отдельном свежем стенде Windows10 19045 x64 en-US предыдущий минимальный
+SharedPC-кандидат прошёл независимые проверки установки, SYSTEM check, однократного
+prepare, повторного prepare/no-op normal и reboot. Target seven raw settings и
+exemptions explicit ordinary roster совпали; mode/config и два учебных файла
+сохранились. Под настоящим labstudent приняты javac/java/git и чтение USB.
+Затем через штатную Guest tile вошёл новый nonadmin; после GUI logout его exact SID,
+профиль, ProfileList/HKU, каталог и созданный GUI marker отсутствовали в независимом
+чтении. Logout был16:23:07UTC, отсутствие подтверждено к16:25:52UTC; точный момент
+удаления не наблюдался. Это один lifecycle на одной сборке, не полная приёмка
+экзамена или новой интеграционной поставки.
+
 
 В Linux выполняются `tests/parse-windows.ps1` и `tests/pilot-logic.ps1`:
 синтаксис, строгая конфигурация roster, ранний отказ exam и отсутствие старых

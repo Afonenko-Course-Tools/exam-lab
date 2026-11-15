@@ -237,12 +237,13 @@ standalone QEMU/KVM копии с заранее созданным маркер
 согласованной Guest/USB пробы.
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\setup\Install-LocalPilot.ps1 -LGPOPath 'D:\LGPO_30\LGPO.exe' -ConfigurationPath 'D:\ExamLab\pc.json'
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\setup\Install-LocalPilot.ps1 -LGPOPath 'D:\LGPO_30\LGPO.exe' -ConfigurationPath 'D:\ExamLab\pc.json' -PolicyFileEditorPath 'D:\PolicyFileEditor-3.0.1'
 ```
 
 LGPO3.0 берётся из официального [Security Compliance Toolkit](https://download.microsoft.com/download/8/5/c/85c25433-a1b0-4ffa-9429-7e023e7da8d8/LGPO.zip).
 Скрипт проверяет фиксированный SHA256 и Valid Microsoft Authenticode. В
-Program Files\ExamLab устанавливаются только модуль, входной PS1, LGPO.exe и четыре
+Program Files\ExamLab устанавливаются основной, USB и сетевой модули, входной PS1,
+LGPO.exe, точный offline PolicyFileEditor 3.0.1 с LICENSE и четыре
 фиксированных task-*.ps1 wrapper; у SYSTEM/Administrators полные права, у Users
 только чтение/выполнение. ProgramData\ExamLab доступен только SYSTEM/Administrators.
 Туда копируется явно переданный `pc.json`, например:
@@ -252,8 +253,11 @@ Program Files\ExamLab устанавливаются только модуль, 
 ```
 
 Замените пример на фактические SID и имена обычных локальных пользователей.
-Пустой список, повторы и дополнительные параметры отклоняются; автоматического
-выбора учётных записей нет. Если есть `mode.json`, SHA256 конфигурации должен
+Пустой список, повторы и неизвестные параметры отклоняются; автоматического
+выбора учётных записей нет. Необязательный `Network` описан в
+[договоре локального модуля](local-pilot.md); USB новых config keys не требует.
+Исходный offline пакет, адресное снятие USB source и действие Non-Administrators
+на обычные учётные записи описаны в [USB-компоненте](windows-usb-policy.md). Если есть `mode.json`, SHA256 конфигурации должен
 совпадать с его `Revision`: установщик не меняет roster молча и не перезаписывает
 metadata режима. `Revision` обозначает только собственную конфигурацию, не снимок
 настроек Windows. Повтор использует общий с действиями модуля exclusive lock.
@@ -276,9 +280,9 @@ SYSTEM/Administrators, работа на батарее разрешена. Ав
 Действия `prepare/check/exam/normal` администратор запускает отдельно по
 [договору локального модуля](local-pilot.md); журналы остаются приватными.
 
-Ранее проведённые настоящие установка, повтор и guard-пробы относились к прежней
-версии с тремя задачами. Они не подтверждают новую поставку четырёх действий;
-для неё ещё требуется отдельная Windows-проверка.
+Ранее проверенная доставка четырёх фиксированных действий относилась к payload
+до добавления USB, Network и offline PolicyFileEditor. Она не подтверждает новую
+общую поставку компонентов; для неё нужна отдельная Windows-проверка.
 
 Финальный Check общего setup также выполнен после узкого исправления catch:
 ранний отказ до основной инвентаризации больше не запускает её из обработчика

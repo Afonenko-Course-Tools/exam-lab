@@ -10,7 +10,8 @@ LGPO.exe передаётся отдельно из официального Mic
 param(
     [string]$SourceDirectory,
     [Parameter(Mandatory)][string]$LGPOPath,
-    [Parameter(Mandatory)][string]$ConfigurationPath
+    [Parameter(Mandatory)][string]$ConfigurationPath,
+    [Parameter(Mandatory)][string]$PolicyFileEditorPath
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2
@@ -19,6 +20,24 @@ $deliveryPending = $false
 $sources = [Collections.Generic.List[object]]::new()
 $actions = @('prepare','check','exam','normal')
 $legacyActions = @('enable','finish')
+$codeFiles = @('ExamLab.psm1','exam-lab.ps1','ExamLab.Usb.psm1','ExamNetwork.psm1')
+$pfeFiles = [ordered]@{
+    'Commands.ps1'='ca04433f2aaf20d8d7f3962337f075a3de599fafeb7d66b5a0af1bfaf80d44b9'
+    'Common.ps1'='31e69ad6f0c70883829fa376d9041026757e3819a426453fef14b5dac48d3d44'
+    'DscResources/PshOrg_AccountAdminTemplateSetting/PshOrg_AccountAdminTemplateSetting.psm1'='6a51eee6e948755acc0bf177d1ef7078b4af4733fa0189927793679e7befad12'
+    'DscResources/PshOrg_AccountAdminTemplateSetting/PshOrg_AccountAdminTemplateSetting.schema.mof'='f2a085be91bbcf58fa732d43310cbaa08094671abe119f01d1d53f67b02a2331'
+    'DscResources/PshOrg_AdminTemplateSetting/PshOrg_AdminTemplateSetting.psm1'='8ee42454f5cdd23e64100611a05be0ac9cccba263a575eba497ba7fa5afe7070'
+    'DscResources/PshOrg_AdminTemplateSetting/PshOrg_AdminTemplateSetting.schema.mof'='5e8c0bf82ba7376732aeb16eb0b08648168938faee9ff06ba28a4bcb4f733246'
+    'LICENSE'='a8ad31b1c3f40dca5a84119351b8fa8ddc868edd77fad8a8ebf6d8f2d16fa4ae'
+    'PolFileEditor.dll'='f4a33deebc499ae70e479ba75b6161cae9e1626d852af7a40b96c7d69207e607'
+    'PolicyFileEditor.nuspec'='3e7e48b99238e2b977d4f3238ca99ba7bc497c53fb6e9296f2030720e24cb44d'
+    'PolicyFileEditor.psd1'='e26456e3775665423051038358c25934dbe907b2ddce99cf558c5d708c4a3ce1'
+    'PolicyFileEditor.psm1'='2bfd389a380d40500d76a9e9c0f8238e093727a748a6702297de4520767aa732'
+    '[Content_Types].xml'='11b90ba057800c489a70a86167d7608f87b0b5d14a92343ba4f4c34781f73b96'
+    '_rels/.rels'='f612e870f6795ba005e45f93dc77d03013911dfb64d3ce47b3fc0733e6d2587c'
+    'en-US/about_RegistryValuesForAdminTemplates.Help.txt'='06f286bfa5d2dd9b16ad24c8dee8245948dd3f0b3033b65a5dcfacd851a83b5b'
+    'package/services/metadata/core-properties/445e8411c5804e3690b6e21eed01e358.psmdcp'='ad5ce893115e275622393531920d6e484d7ae3f2fa53af92765c9246a21e1d00'
+}
 $result = [ordered]@{ Installed=$false; ActionsExecuted=$false; PolicyActivationRequested=$false; Files=@(); Tasks=@() }
 
 function Assert-NoLegacyState([string]$Path) {
@@ -34,10 +53,10 @@ function Get-ConfigurationHash([string]$Path) {
     $inputFile.Position = 0
     $reader = [IO.StreamReader]::new($inputFile,[Text.Encoding]::UTF8,$true,4096,$true)
     try { $configuration = $reader.ReadToEnd() | ConvertFrom-Json } finally { $reader.Dispose() }
-    if ($configuration -isnot [pscustomobject] -or @($configuration.PSObject.Properties).Count -ne 1 -or
+    if ($configuration -isnot [pscustomobject] -or @($configuration.PSObject.Properties.Name | Where-Object {$_ -notin @('OrdinaryAccounts','Network')}).Count -or
         $configuration.PSObject.Properties.Name -notcontains 'OrdinaryAccounts' -or
         $configuration.OrdinaryAccounts -isnot [array] -or $configuration.OrdinaryAccounts.Count -eq 0) {
-        throw 'pc.json должен содержать только непустой массив OrdinaryAccounts'
+        throw 'pc.json: непустой OrdinaryAccounts и необязательный Network'
     }
     $sids = @{}; $names = @{}
     foreach ($account in $configuration.OrdinaryAccounts) {
@@ -51,10 +70,23 @@ function Get-ConfigurationHash([string]$Path) {
         if ($sids.ContainsKey($account.Sid) -or $names.ContainsKey($account.Name)) { throw 'Повторяющиеся Sid/Name в OrdinaryAccounts недопустимы' }
         $sids[$account.Sid] = $true; $names[$account.Name] = $true
     }
+    if ($configuration.PSObject.Properties.Name -contains 'Network') {
+        if ($null -eq $configuration.Network) { throw 'Явный Network:null недопустим; удалите необязательный раздел.' }
+        Test-ExamNetworkConfig $configuration.Network
+    }
     $hash
 }
 
 function Assert-ConfigurationRevision([string]$Path, [string]$Hash) {
+    foreach ($name in @('usb.json','network-owned.json')) {
+        $intentPath=Join-Path $Path $name
+        if (Test-Path -LiteralPath $intentPath) {
+            $intent=[IO.File]::ReadAllText($intentPath) | ConvertFrom-Json
+            if ($intent.ConfigRevision -isnot [string] -or $intent.ConfigRevision -ne $Hash) {
+                throw "Конфигурация компонента $name отличается: явная смена pc.json не выполняется установщиком"
+            }
+        }
+    }
     $modePath = Join-Path $Path 'mode.json'
     if (Test-Path -LiteralPath $modePath) {
         $mode = Get-Content -LiteralPath $modePath -Raw | ConvertFrom-Json
@@ -135,10 +167,22 @@ try {
         throw 'Экспериментальный пилот устанавливается только в отмеченную standalone QEMU/KVM копию. Маркер этим скриптом не создаётся'
     }
     $powershell = Join-Path ([Environment]::GetFolderPath('System')) 'WindowsPowerShell\v1.0\powershell.exe'
-    $configurationHash = Get-ConfigurationHash $ConfigurationPath
-    foreach ($name in @('ExamLab.psm1','exam-lab.ps1')) {
+    foreach ($name in $codeFiles) {
         $bytes = [IO.File]::ReadAllBytes((Join-Path $SourceDirectory $name))
         if ($bytes.Length -lt 3 -or $bytes[0] -ne 239 -or $bytes[1] -ne 187 -or $bytes[2] -ne 191) { throw "$name должен иметь UTF-8 BOM для PS5.1" }
+    }
+    # Только pure schema validation из доверенного source payload; Apply не вызывается.
+    Import-Module (Join-Path $SourceDirectory 'ExamNetwork.psm1') -Force
+    $configurationHash = Get-ConfigurationHash $ConfigurationPath
+    # Готовый offline PFE3.0.1: фиксированные исходные 15 файлов и LICENSE.
+    # Держим source handles до завершения доставки; runtime ничего не скачивает.
+    foreach ($name in $pfeFiles.Keys) {
+        $source=Join-Path $PolicyFileEditorPath $name
+        $handle=[IO.File]::Open($source,'Open','Read','Read')
+        $sources.Add($handle)
+        if ((Get-FileHash -InputStream $handle -Algorithm SHA256).Hash -ne $pfeFiles[$name]) {
+            throw "Не совпадает PolicyFileEditor3.0.1: $name"
+        }
     }
     $lgpoLock = [IO.File]::Open($LGPOPath,'Open','Read','Read')
     $sources.Add($lgpoLock)
@@ -164,9 +208,23 @@ try {
     }
     Assert-SafeDirectory $code -Readable
     $files = @()
-    foreach ($name in @('ExamLab.psm1','exam-lab.ps1')) { $files += Copy-Source (Join-Path $SourceDirectory $name) (Join-Path $code $name) }
+    foreach ($name in $codeFiles) { $files += Copy-Source (Join-Path $SourceDirectory $name) (Join-Path $code $name) }
     $files += Copy-Source $LGPOPath (Join-Path $code 'LGPO.exe') '0c97f29543418b30340c4ff5d930d31e6196dd59c2cc74b6b890fa7b90c910c7'
     $files += Copy-Source $ConfigurationPath (Join-Path $state 'pc.json') $configurationHash
+    $pfeTarget=Join-Path $code 'PolicyFileEditor\3.0.1'
+    Assert-SafeDirectory (Join-Path $code 'PolicyFileEditor') -Readable
+    Assert-SafeDirectory $pfeTarget -Readable
+    foreach ($name in $pfeFiles.Keys) {
+        $target=Join-Path $pfeTarget $name
+        # Все уровни — фиксированные пути готового dependency package.
+        $relative=Split-Path -Parent $name
+        $current=$pfeTarget
+        foreach ($segment in @($relative -split '[\\/]' | Where-Object {$_})) {
+            $current=Join-Path $current $segment
+            Assert-SafeDirectory $current -Readable
+        }
+        $files += Copy-Source (Join-Path $PolicyFileEditorPath $name) $target $pfeFiles[$name]
+    }
     $result.Files=$files
     $tasks = @()
     foreach ($action in $actions) {
