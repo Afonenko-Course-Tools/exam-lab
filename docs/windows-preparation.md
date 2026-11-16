@@ -230,11 +230,18 @@ WinRM используется только тестовой обвязкой с
 
 ## Установка экспериментального локального пилота
 
-`setup/Install-LocalPilot.ps1` предназначен пока исключительно для отдельной
-standalone QEMU/KVM копии с заранее созданным маркером
-`ProgramData\ExamLab-TestVM`. На обычном ПК и на эталоне он отказывает;
-маркер сам не создаёт. Это отдельный этап после проверки инструментов и
-согласованной Guest/USB пробы.
+`setup/Install-LocalPilot.ps1` доставляет переключатель на существующую standalone
+Windows client build19041+ с native AMD64 и повышенным административным token.
+QEMU, WinRM, определённый производитель и `ProgramData\ExamLab-TestVM` не требуются.
+Нижний предел компонентов отличается от software floor 17763 общего Check/Prepare.
+До доставки проверяются native x64 через `IsWow64Process2`, Windows PowerShell 5.1,
+client/build и отсутствие домена. Исходники, подписи, конфигурация и ACL сохраняют
+свои проверки. Это отдельный этап после проверки инструментов.
+
+Установка не означает допуска экспериментальных политик к рабочим ПК: их применение
+по-прежнему разрешено только на отдельной одноразовой VM. Прежняя native-приёмка
+относилась к отмеченному QEMU-стенду; путь без маркера и остальные Windows ещё
+требуют отдельного native-испытания.
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\setup\Install-LocalPilot.ps1 -LGPOPath 'D:\LGPO_30\LGPO.exe' -ConfigurationPath 'D:\ExamLab\pc.json' -PolicyFileEditorPath 'D:\PolicyFileEditor-3.0.1'

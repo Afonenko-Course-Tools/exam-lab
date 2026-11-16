@@ -16,9 +16,35 @@ function Test-ExistingFile {
     return $true
 }
 
+function Assert-NativeAMD64 {
+    # Тот же native API, что в Prepare-ExamLab; x64-эмуляция на ARM64 не подходит.
+    $build = [int](Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion').CurrentBuildNumber
+    $product = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\ProductOptions'
+    if ($build -lt 19041 -or $product.ProductType -ne 'WinNT') { throw 'Нужен Windows client build19041 или новее.' }
+    if (-not ('ExamLabNativePlatform' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class ExamLabNativePlatform {
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool IsWow64Process2(IntPtr process, out ushort processMachine, out ushort nativeMachine);
+}
+'@
+    }
+    [UInt16]$processMachine = 0; [UInt16]$nativeMachine = 0
+    $currentProcess = [Diagnostics.Process]::GetCurrentProcess()
+    try {
+        try { $detected = [ExamLabNativePlatform]::IsWow64Process2($currentProcess.Handle,[ref]$processMachine,[ref]$nativeMachine) }
+        catch { throw 'Не удалось определить native architecture Windows через IsWow64Process2.' }
+        if (-not $detected) { throw ('IsWow64Process2 не определил native architecture; Win32 error ' + [Runtime.InteropServices.Marshal]::GetLastWin32Error()) }
+        if ($nativeMachine -ne 0x8664) { throw ('Нужна native AMD64 Windows; NativeMachine=0x{0:X4}' -f $nativeMachine) }
+    } finally { $currentProcess.Dispose() }
+}
+
 function Assert-Host {
     if ($env:OS -ne 'Windows_NT' -or $PSVersionTable.PSEdition -ne 'Desktop' -or
-        -not [Environment]::Is64BitProcess -or $env:PROCESSOR_ARCHITECTURE -ne 'AMD64') {
+        -not [Environment]::Is64BitProcess -or $PSVersionTable.PSVersion.Major -ne 5) {
         throw 'Нужна Windows x64 и штатный Windows PowerShell 5.1 x64.'
     }
     if ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value -ne 'S-1-5-18') {
@@ -27,12 +53,11 @@ function Assert-Host {
     if ((Test-ExistingFile (Join-Path $script:DataRoot 'state.json'))) {
         throw 'Обнаружен state.json прежнего прототипа. Миграция и старый finish не выполняются.'
     }
-    if (-not (Test-ExistingFile (Join-Path $env:ProgramData 'ExamLab-TestVM'))) { throw 'Нет маркера одноразовой тестовой VM.' }
+    Assert-NativeAMD64
     $machine=Get-CimInstance Win32_ComputerSystem
-    if (($machine.Manufacturer+' '+$machine.Model) -notmatch 'QEMU|KVM|Red Hat' -or $machine.PartOfDomain) { throw 'Этот кандидат допускает только standalone QEMU/KVM VM.' }
     $os=Get-CimInstance Win32_OperatingSystem
-    if ([int]$os.BuildNumber -lt 19041) { throw 'Этот кандидат требует Windows 10 build19041 или новее.' }
-    if ((Get-CimInstance Win32_ComputerSystem).PartOfDomain) { throw 'Доменная политика пока не поддерживается.' }
+    if ([int]$os.BuildNumber -lt 19041 -or [int]$os.ProductType -ne 1) { throw 'Нужна Windows client build19041 или новее.' }
+    if ($machine.PartOfDomain) { throw 'Доменная политика пока не поддерживается.' }
 }
 
 function Assert-SafePath {

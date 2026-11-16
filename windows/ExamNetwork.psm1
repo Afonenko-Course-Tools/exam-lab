@@ -48,11 +48,38 @@ function Assert-NetPath([string]$Path,[switch]$Readable){
   if(-not $Readable -or ($ace.FileSystemRights -band $write)){throw 'Network path доступен чужому SID.'}
  }
 }
+function Assert-NativeAMD64 {
+    # Тот же native API, что в Prepare-ExamLab; x64-эмуляция на ARM64 не подходит.
+    $build = [int](Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion').CurrentBuildNumber
+    $product = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\ProductOptions'
+    if ($build -lt 19041 -or $product.ProductType -ne 'WinNT') { throw 'Нужен Windows client build19041 или новее.' }
+    if (-not ('ExamLabNativePlatform' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class ExamLabNativePlatform {
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool IsWow64Process2(IntPtr process, out ushort processMachine, out ushort nativeMachine);
+}
+'@
+    }
+    [UInt16]$processMachine = 0; [UInt16]$nativeMachine = 0
+    $currentProcess = [Diagnostics.Process]::GetCurrentProcess()
+    try {
+        try { $detected = [ExamLabNativePlatform]::IsWow64Process2($currentProcess.Handle,[ref]$processMachine,[ref]$nativeMachine) }
+        catch { throw 'Не удалось определить native architecture Windows через IsWow64Process2.' }
+        if (-not $detected) { throw ('IsWow64Process2 не определил native architecture; Win32 error ' + [Runtime.InteropServices.Marshal]::GetLastWin32Error()) }
+        if ($nativeMachine -ne 0x8664) { throw ('Нужна native AMD64 Windows; NativeMachine=0x{0:X4}' -f $nativeMachine) }
+    } finally { $currentProcess.Dispose() }
+}
+
 function Read-NetContext($Config,[string]$Revision){
  Test-ExamNetworkConfig $Config
- if($env:OS -ne 'Windows_NT' -or $PSVersionTable.PSEdition -ne 'Desktop' -or -not [Environment]::Is64BitProcess){throw 'Нужен Windows PowerShell 5.1 x64.'}
+ if($env:OS -ne 'Windows_NT' -or $PSVersionTable.PSEdition -ne 'Desktop' -or -not [Environment]::Is64BitProcess -or $PSVersionTable.PSVersion.Major -ne 5){throw 'Нужен Windows PowerShell 5.1 x64.'}
  $principal=New-Object Security.Principal.WindowsPrincipal ([Security.Principal.WindowsIdentity]::GetCurrent())
  if(-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){throw 'Нужен повышенный административный токен.'}
+ Assert-NativeAMD64
  if($PSScriptRoot -ine $script:CodeRoot -or (Get-FileHash -LiteralPath (Join-Path $script:CodeRoot 'ExamNetwork.psm1')).Hash -cne $script:LoadedHash){throw 'Network source не установлен либо изменился после загрузки.'}
  Assert-NetPath $script:CodeRoot -Readable;Assert-NetPath $script:DataRoot
  Assert-NetPath (Join-Path $script:CodeRoot 'ExamNetwork.psm1') -Readable
@@ -170,7 +197,7 @@ function Get-ExamNetworkStatus {
 }
 function Assert-NetApplyHost {
  $machine=Get-CimInstance Win32_ComputerSystem;$os=Get-CimInstance Win32_OperatingSystem
- if($machine.PartOfDomain -or [int]$os.BuildNumber -lt 19041 -or [int]$os.ProductType -ne 1 -or ($machine.Manufacturer+' '+$machine.Model) -notmatch 'QEMU|KVM|Red Hat' -or -not (Test-NetPathPresent (Join-Path $env:ProgramData 'ExamLab-TestVM'))){throw 'Экспериментальный Apply требует standalone Windows client 19041+ в подготовленной QEMU/KVM VM.'}
+ if($machine.PartOfDomain -or [int]$os.BuildNumber -lt 19041 -or [int]$os.ProductType -ne 1){throw 'Экспериментальный Apply требует standalone Windows client 19041+.'}
  $omadm=@()
  if(Test-NetPathPresent 'HKLM:\SOFTWARE\Microsoft\Provisioning\OMADM\Accounts'){$omadm=@(Get-ChildItem -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Provisioning\OMADM\Accounts' -ErrorAction Stop)}
  if($omadm.Count -or @(Get-ScheduledTask|Where-Object{$_.TaskPath -like '\Microsoft\Windows\EnterpriseMgmt\*'}).Count){throw 'Обнаружены MDM management artifacts.'}

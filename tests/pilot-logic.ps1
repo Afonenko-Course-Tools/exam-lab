@@ -109,6 +109,76 @@ try {
         if($name -in $commands){throw "FAIL global mutation/restore остался: $name"}
     }
     'PASS public module: global restore/FW/ACL reset/CSP root create calls отсутствуют'
+    # Source guards проверяются через AST, native observations Windows не подменяются.
+    function Get-ParsedSource([string]$RelativePath) {
+        $sourceTokens=$null; $sourceErrors=$null
+        $sourceAst=[Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot $RelativePath),[ref]$sourceTokens,[ref]$sourceErrors)
+        if ($sourceErrors.Count) { throw "FAIL parse $RelativePath" }
+        $sourceAst
+    }
+    function Get-FunctionNode($SourceAst,[string]$Name) {
+        $nodes=@($SourceAst.FindAll({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $Name},$true))
+        if ($nodes.Count -ne 1) { throw "FAIL single function $Name" }
+        $nodes[0]
+    }
+    function Get-CommandNodes($SourceAst,[string]$Name) {
+        @($SourceAst.FindAll({param($n) $n -is [Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq $Name},$true))
+    }
+    function Assert-CallBefore($SourceAst,[string]$Guard,[string[]]$Later) {
+        $guardCalls=@(Get-CommandNodes $SourceAst $Guard)
+        if ($guardCalls.Count -ne 1) { throw "FAIL one boundary call $Guard" }
+        foreach ($name in $Later) {
+            $laterCalls=@(Get-CommandNodes $SourceAst $name)
+            if (-not $laterCalls.Count -or @($laterCalls | Where-Object {$_.Extent.StartOffset -lt $guardCalls[0].Extent.EndOffset}).Count) {
+                throw "FAIL $Guard must precede $name"
+            }
+        }
+    }
+    $installAst=Get-ParsedSource '..\setup\Install-LocalPilot.ps1'
+    $mainAst=Get-ParsedSource '..\windows\ExamLab.psm1'
+    $netAst=Get-ParsedSource '..\windows\ExamNetwork.psm1'
+    $nativeSource=$null
+    foreach ($sourceAst in @($installAst,$mainAst,$netAst)) {
+        if ($sourceAst.Extent.Text -match 'QEMU|KVM|Red Hat|ExamLab-TestVM') { throw 'FAIL runtime must not depend on VM identity.' }
+        $guard=Get-FunctionNode $sourceAst 'Assert-NativeAMD64'
+        if ($null -eq $nativeSource) { $nativeSource=$guard.Extent.Text }
+        elseif ($nativeSource -cne $guard.Extent.Text) { throw 'FAIL native AMD64 guards must use the same reviewed API contract.' }
+        if ($guard.Extent.Text -notmatch '\[UInt16\]\$nativeMachine' -or $guard.Extent.Text -notmatch '\[UInt16\]\$processMachine') { throw 'FAIL native outputs require UInt16.' }
+        $nativeCalls=@($guard.FindAll({param($n)
+            $n -is [Management.Automation.Language.InvokeMemberExpressionAst] -and $n.Member.Value -eq 'IsWow64Process2'
+        },$true))
+        if ($nativeCalls.Count -ne 1) { throw 'FAIL exactly one native architecture observation.' }
+        foreach ($condition in @('$build -lt 19041 -or $product.ProductType -ne ''WinNT''','-not $detected','$nativeMachine -ne 0x8664')) {
+            $checks=@($guard.FindAll({param($n)
+                $n -is [Management.Automation.Language.IfStatementAst] -and $n.Clauses[0].Item1.Extent.Text -ceq $condition
+            },$true))
+            if ($checks.Count -ne 1 -or @($checks[0].Clauses[0].Item2.Statements | Where-Object {$_ -is [Management.Automation.Language.ThrowStatementAst]}).Count -ne 1) {
+                throw "FAIL failclosed native branch: $condition"
+            }
+            if ($condition -like '$build*' -and $checks[0].Extent.EndOffset -gt $nativeCalls[0].Extent.StartOffset) { throw 'FAIL client/build floor must precede native API.' }
+        }
+        $nativeCatch=@($guard.FindAll({param($n) $n -is [Management.Automation.Language.TryStatementAst] -and $n.CatchClauses.Count -gt 0},$true))
+        if ($nativeCatch.Count -ne 1 -or @($nativeCatch[0].CatchClauses[0].Body.Statements | Where-Object {$_ -is [Management.Automation.Language.ThrowStatementAst]}).Count -ne 1) { throw 'FAIL native API exception must fail closed.' }
+    }
+    $entry=@($installAst.EndBlock.Statements | Where-Object {$_ -is [Management.Automation.Language.TryStatementAst]})
+    if ($entry.Count -ne 1) { throw 'FAIL installer entry boundary.' }
+    Assert-CallBefore $entry[0].Body 'Assert-NativeAMD64' @('Import-Module','Assert-SafeDirectory','Disable-ScheduledTask','Register-ScheduledTask')
+    Assert-CallBefore (Get-FunctionNode $mainAst 'Assert-Host') 'Assert-NativeAMD64' @('Get-CimInstance')
+    Assert-CallBefore (Get-FunctionNode $mainAst 'Read-Context') 'Assert-Host' @('Assert-SafePath','Import-Module','Get-LocalUser')
+    Assert-CallBefore (Get-FunctionNode $netAst 'Read-NetContext') 'Assert-NativeAMD64' @('Assert-NetPath','Import-Module')
+    foreach ($sourceAst in @($mainAst,$netAst)) {
+        $topLevel=@($sourceAst.EndBlock.Statements | Where-Object {$_ -isnot [Management.Automation.Language.FunctionDefinitionAst]})
+        foreach ($statement in $topLevel) {
+            if (@(Get-CommandNodes $statement 'Assert-NativeAMD64').Count) { throw 'FAIL module import must remain pure.' }
+        }
+    }
+    $applyHost=Get-FunctionNode $netAst 'Assert-NetApplyHost'
+    foreach ($required in @('PartOfDomain','ProductType','19041','OMADM','dsregcmd.exe','AzureAdJoined','EnterpriseJoined','DomainJoined','WorkplaceJoined','MpsSvc','BFE')) {
+        if (-not $applyHost.Extent.Text.Contains($required)) { throw "FAIL retained network host guard: $required" }
+    }
+    if ((Get-FunctionNode $mainAst 'Assert-Host').Extent.Text -notmatch 'S-1-5-18' -or
+        $entry[0].Body.Extent.Text -notmatch 'IsInRole' -or $entry[0].Body.Extent.Text -notmatch 'PartOfDomain') { throw 'FAIL privilege/domain guards retained.' }
+    'PASS source portability: native AMD64 failclosed/client floor/order, pure imports, no VM identity, retained privilege/MDM/domain guards; Windows API НЕ испытывались.'
     'Windows SharedPC/USB/filesystem/network НЕ испытывались.'
 } finally {
     Remove-Module ExamLab -ErrorAction SilentlyContinue

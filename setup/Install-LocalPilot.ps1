@@ -3,7 +3,7 @@
 .SYNOPSIS
 Устанавливает защищённые файлы и фиксированные SYSTEM-задачи локального пилота.
 .DESCRIPTION
-Пока допускается только отмеченная одноразовая QEMU/KVM VM. Действия модуля не запускаются.
+Устанавливается на существующую standalone Windows x64. Действия модуля не запускаются.
 LGPO.exe передаётся отдельно из официального Microsoft Security Compliance Toolkit.
 #>
 [CmdletBinding()]
@@ -39,6 +39,32 @@ $pfeFiles = [ordered]@{
     'package/services/metadata/core-properties/445e8411c5804e3690b6e21eed01e358.psmdcp'='ad5ce893115e275622393531920d6e484d7ae3f2fa53af92765c9246a21e1d00'
 }
 $result = [ordered]@{ Installed=$false; ActionsExecuted=$false; PolicyActivationRequested=$false; Files=@(); Tasks=@() }
+
+function Assert-NativeAMD64 {
+    # Тот же native API, что в Prepare-ExamLab; x64-эмуляция на ARM64 не подходит.
+    $build = [int](Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion').CurrentBuildNumber
+    $product = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\ProductOptions'
+    if ($build -lt 19041 -or $product.ProductType -ne 'WinNT') { throw 'Нужен Windows client build19041 или новее.' }
+    if (-not ('ExamLabNativePlatform' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class ExamLabNativePlatform {
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool IsWow64Process2(IntPtr process, out ushort processMachine, out ushort nativeMachine);
+}
+'@
+    }
+    [UInt16]$processMachine = 0; [UInt16]$nativeMachine = 0
+    $currentProcess = [Diagnostics.Process]::GetCurrentProcess()
+    try {
+        try { $detected = [ExamLabNativePlatform]::IsWow64Process2($currentProcess.Handle,[ref]$processMachine,[ref]$nativeMachine) }
+        catch { throw 'Не удалось определить native architecture Windows через IsWow64Process2.' }
+        if (-not $detected) { throw ('IsWow64Process2 не определил native architecture; Win32 error ' + [Runtime.InteropServices.Marshal]::GetLastWin32Error()) }
+        if ($nativeMachine -ne 0x8664) { throw ('Нужна native AMD64 Windows; NativeMachine=0x{0:X4}' -f $nativeMachine) }
+    } finally { $currentProcess.Dispose() }
+}
 
 function Assert-NoLegacyState([string]$Path) {
     if (Test-Path -LiteralPath (Join-Path $Path 'state.json')) {
@@ -156,16 +182,17 @@ try {
     if (-not ([Security.Principal.WindowsPrincipal]$identity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
         throw 'Нужен повышенный административный UAC token'
     }
-    if (-not [Environment]::Is64BitProcess -or $PSVersionTable.PSEdition -ne 'Desktop') { throw 'Нужен native64 Windows PowerShell5.1' }
+    if ($env:OS -ne 'Windows_NT' -or -not [Environment]::Is64BitProcess -or $PSVersionTable.PSEdition -ne 'Desktop' -or $PSVersionTable.PSVersion.Major -ne 5) { throw 'Нужен native64 Windows PowerShell5.1' }
+    Assert-NativeAMD64
+    $machine = Get-CimInstance Win32_ComputerSystem
+    $os = Get-CimInstance Win32_OperatingSystem
+    if ($machine.PartOfDomain -or [int]$os.ProductType -ne 1 -or [int]$os.BuildNumber -lt 19041) {
+        throw 'Нужна standalone Windows client build19041 или новее.'
+    }
     $code = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'ExamLab'
     $state = Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'ExamLab'
     # Старый активный цикл отказывается до создания каталогов/lock и изменения задач.
     Assert-NoLegacyState $state
-    $machine = Get-CimInstance Win32_ComputerSystem
-    $marker = Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'ExamLab-TestVM'
-    if (($machine.Manufacturer+' '+$machine.Model) -notmatch 'QEMU|KVM|Red Hat' -or -not (Test-Path -LiteralPath $marker -PathType Leaf) -or $machine.PartOfDomain) {
-        throw 'Экспериментальный пилот устанавливается только в отмеченную standalone QEMU/KVM копию. Маркер этим скриптом не создаётся'
-    }
     $powershell = Join-Path ([Environment]::GetFolderPath('System')) 'WindowsPowerShell\v1.0\powershell.exe'
     foreach ($name in $codeFiles) {
         $bytes = [IO.File]::ReadAllBytes((Join-Path $SourceDirectory $name))
@@ -245,7 +272,7 @@ try {
         $principal = New-ScheduledTaskPrincipal -UserId 'S-1-5-18' -LogonType ServiceAccount -RunLevel Highest
         $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 10) -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Disable
         $name = 'ExamLab-Local-'+$action
-        Register-ScheduledTask -TaskName $name -Action $taskAction -Principal $principal -Settings $settings -Description 'ExamLab: локальный экспериментальный пилот VM' -Force | Out-Null
+        Register-ScheduledTask -TaskName $name -Action $taskAction -Principal $principal -Settings $settings -Description 'ExamLab: локальный экспериментальный пилот' -Force | Out-Null
         $scheduler.GetFolder('\').GetTask($name).SetSecurityDescriptor('D:P(A;;FA;;;SY)(A;;FA;;;BA)',0)
         $tasks += $name
         $result.Tasks=$tasks
