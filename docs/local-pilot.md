@@ -220,6 +220,13 @@ global restore/FW/ACL-reset команд. Они не подменяют Windows
 настоящим пользователем. Нужны заранее проверенные removable volume, путь и hash;
 отсутствующий файл не считается USB deny. Основная USB-проверка — Explorer.
 
+Для прямого TCP из Java есть `tests/NetworkProbe.java`: запуск исходного файла
+на JDK25 с двумя аргументами — literal IPv4/IPv6 и порт. Проба отключает JVM proxy
+для своего сокета, ждёт соединения до пяти секунд и выводит `CONNECTED` либо
+`CONNECT_FAILED` с типом ошибки. Отказ сам по себе не доказывает firewall:
+нужны положительный контроль до ограничения, живой контрольный сервер во время
+пробы и восстановление после normal. Это не проверка HTTPS, DNS или сертификатов.
+
 В прежнем отдельном прототипе на Windows10 Enterprise Evaluation 19045 root
 наблюдал настоящий SharedPC Guest1003/nonadmin, Explorer USB access denied и
 Java AccessDeniedException. В этом же Guest принята GUI-проба IDEA Community
