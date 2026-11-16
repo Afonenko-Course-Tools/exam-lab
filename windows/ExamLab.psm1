@@ -78,8 +78,28 @@ function Test-DeclaredConfig {
     return $Config
 }
 
+function Test-LiveRoster {
+    param($Config, [object[]]$LocalAccounts, [switch]$AllowDrift)
+    $missing=@(); $renamed=@()
+    foreach ($account in @($Config.OrdinaryAccounts)) {
+        $actual=@($LocalAccounts | Where-Object {$_.SID.Value -ceq $account.Sid})
+        if ($actual.Count -eq 0) {
+            $missing += [pscustomobject]@{Sid=$account.Sid; DeclaredName=$account.Name}
+        } elseif ($actual[0].Name -cne $account.Name) {
+            $renamed += [pscustomobject]@{Sid=$account.Sid; DeclaredName=$account.Name; ActualName=$actual[0].Name}
+        }
+    }
+    # Происхождение новых SID не угадывается; roster не дополняется автоматически.
+    $declared=@($Config.OrdinaryAccounts | ForEach-Object {$_.Sid})
+    $unlisted=@($LocalAccounts | Where-Object { [int]($_.SID.Value.Split('-')[-1]) -ge 1000 -and $_.SID.Value -notin $declared } |
+        ForEach-Object {[pscustomobject]@{Sid=$_.SID.Value; Name=$_.Name}})
+    $unconfirmed=($missing.Count -gt 0 -or $renamed.Count -gt 0 -or $unlisted.Count -gt 0)
+    if ($unconfirmed -and -not $AllowDrift) { throw 'Локальный roster изменён: отсутствует SID, изменено имя или есть неописанный SID. Нужна отдельная административная проверка; список не расширяется автоматически.' }
+    [pscustomobject]@{IdentityUnconfirmed=$unconfirmed; MissingAccounts=$missing; RenamedAccounts=$renamed; UnlistedAccounts=$unlisted}
+}
+
 function Read-Context {
-    param([switch]$AllowUnlistedOnlyForNormal)
+    param([switch]$AllowRosterDriftOnlyForNormal)
     Assert-Host
     if ($PSScriptRoot -ne $script:CodeRoot -or
         (Get-FileHash -LiteralPath (Join-Path $script:CodeRoot 'ExamLab.psm1') -Algorithm SHA256).Hash -cne $script:LoadedSourceHash) {
@@ -103,23 +123,17 @@ function Read-Context {
             $metadata.PSObject.Properties.Name -notcontains 'LastCompletedMode' -or
             $metadata.LastCompletedMode -notin @($null,'normal','exam')) { throw 'Конфигурация/metadata изменена. Нужна отдельная административная подготовка, не runtime roster update.' }
     }
-    foreach ($account in @($config.OrdinaryAccounts)) {
-        $actual=Get-LocalUser -SID $account.Sid
-        if ($actual.Name -cne $account.Name -or $actual.SID.Value -cne $account.Sid) { throw "Ordinary SID/Name изменён: $($account.Sid)" }
-    }
-    # Не принимаем новый ordinary/неопознанный SID даже при повторном check/prepare.
-    # SharedPC происхождение не угадывается по имени; roster не дополняется автоматически.
-    $declared=@($config.OrdinaryAccounts | ForEach-Object {$_.Sid})
-    $unlisted=@(Get-LocalUser | Where-Object { [int]($_.SID.Value.Split('-')[-1]) -ge 1000 -and $_.SID.Value -notin $declared })
-    if ($unlisted.Count -and -not $AllowUnlistedOnlyForNormal) { throw 'Есть неописанные локальные SID. Нужна отдельная подготовка roster/проверка identity; список не расширяется автоматически.' }
+    # Ошибка чтения SAM остаётся отказом; только успешная enumeration даёт drift.
+    $localAccounts=@(Get-LocalUser -ErrorAction Stop)
+    $roster=Test-LiveRoster $config $localAccounts -AllowDrift:$AllowRosterDriftOnlyForNormal
     $lgpo=Join-Path $script:CodeRoot 'LGPO.exe'
     if ((Get-FileHash -LiteralPath $lgpo -Algorithm SHA256).Hash -ne '0C97F29543418B30340C4FF5D930D31E6196DD59C2CC74B6B890FA7B90C910C7') { throw 'Неизвестный LGPO.exe.' }
     $signature=Get-AuthenticodeSignature -LiteralPath $lgpo
     if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') { throw 'Подпись Microsoft LGPO не подтверждена.' }
     [pscustomobject]@{
         Config=$config; Revision=$revision; Metadata=$metadata; LGPO=$lgpo
-        IdentityUnconfirmed=($unlisted.Count -gt 0)
-        UnlistedAccounts=@($unlisted | ForEach-Object {[pscustomobject]@{Sid=$_.SID.Value;Name=$_.Name}})
+        IdentityUnconfirmed=$roster.IdentityUnconfirmed
+        MissingAccounts=$roster.MissingAccounts; RenamedAccounts=$roster.RenamedAccounts; UnlistedAccounts=$roster.UnlistedAccounts
     }
 }
 
@@ -187,8 +201,9 @@ function Get-Status {
         Prepared=($null -ne $Context.Metadata -and $Context.Metadata.Prepared -and $configured)
         LastCompletedMode=if ($Context.Metadata) { $Context.Metadata.LastCompletedMode } else { $null }
         EffectiveMode=if ($Context.Metadata -and $Context.Metadata.Prepared -and $configured -and $conflicts.Count -eq 0 -and $sourceNormal -and -not $components.Usb.EffectiveReadbackPending -and -not $Context.IdentityUnconfirmed) { 'normal' } else { 'Unconfirmed' }
-        IdentityUnconfirmed=$Context.IdentityUnconfirmed; UnlistedAccounts=$Context.UnlistedAccounts
-        IdentityWarning=if ($Context.IdentityUnconfirmed) { 'Новые SID не распознаны. Ordinary roster не изменён; normal снимает только собственные ограничения.' } else { $null }
+        IdentityUnconfirmed=$Context.IdentityUnconfirmed
+        MissingAccounts=$Context.MissingAccounts; RenamedAccounts=$Context.RenamedAccounts; UnlistedAccounts=$Context.UnlistedAccounts
+        IdentityWarning=if ($Context.IdentityUnconfirmed) { 'Локальный roster изменён: проверьте MissingAccounts, RenamedAccounts и UnlistedAccounts. Ordinary roster не изменён; normal снимает только собственные ограничения.' } else { $null }
         Components=$components; OwnSourceNormal=$sourceNormal; Conflicts=$conflicts
         SourceMode=if ($sourceNormal) {'normal'} else {'Unconfirmed'}
         SharedPCState=$shared.State; SharedPCReason=$shared.Reason; SharedPCSettings=$settings; SharedPCTargetMatches=$configured
@@ -314,12 +329,12 @@ function Set-ExamLabMode {
     # ВАЖНО: этот отказ предшествует чтению config, lock/metadata и любым Windows writes.
     if ($Mode -eq 'exam') { throw 'Экзамен заблокирован до native-проверки структурного файлового ограничения и сети. Windows не изменена.' }
     # Read-only preflight до создания lock; после acquire контекст читается заново.
-    $null=Read-Context -AllowUnlistedOnlyForNormal
+    $null=Read-Context -AllowRosterDriftOnlyForNormal
     $lockPath=Join-Path $script:DataRoot 'operation.lock'
     if ((Test-ExistingFile $lockPath)) { Assert-SafePath $lockPath }
     $lock=[IO.File]::Open($lockPath,'OpenOrCreate','ReadWrite','None')
     try {
-        $context=Read-Context -AllowUnlistedOnlyForNormal
+        $context=Read-Context -AllowRosterDriftOnlyForNormal
         $components=Get-ComponentStatus $context
         $blockers=@($components.Usb.NormalBlockers)+@($components.Network.Blockers)
         if (-not $components.Usb.NormalAllowed -or -not $components.Network.NormalAllowed) {

@@ -36,6 +36,39 @@ try {
     Test-Config 'TechnicalAccess explicit address/local port' ($withNetwork.Replace('[]','[{"RemoteIP":"192.0.2.20","LocalPort":5985}]')) $true
     Test-Config 'TechnicalAccess arbitrary direction refused' ($withNetwork.Replace('[]','[{"RemoteIP":"192.0.2.20","LocalPort":5985,"Direction":"Inbound"}]')) $false
     Test-Config 'TechnicalAccess duplicate refused' ($withNetwork.Replace('[]','[{"RemoteIP":"192.0.2.20","LocalPort":5985},{"RemoteIP":"192.0.2.20","LocalPort":5985}]')) $false
+    # Чистые входные данные classifier, не подмена Get-LocalUser/Windows API.
+    function New-AccountData([string]$Sid,[string]$Name) {
+        [pscustomobject]@{SID=[pscustomobject]@{Value=$Sid}; Name=$Name}
+    }
+    $rosterConfig=$valid | ConvertFrom-Json
+    $student=New-AccountData 'S-1-5-21-1-2-3-1001' 'Обычный студент'
+    $builtin=New-AccountData 'S-1-5-21-1-2-3-500' 'Administrator'
+    function Test-RosterCase([string]$Name,[object[]]$Actual,[int]$Missing,[int]$Renamed,[int]$Unlisted) {
+        $before=@($rosterConfig,$Actual) | ConvertTo-Json -Depth 5 -Compress
+        $result=& $module {param($c,$a) Test-LiveRoster $c $a -AllowDrift} $rosterConfig $Actual
+        $drift=($Missing+$Renamed+$Unlisted) -gt 0
+        if ($result.IdentityUnconfirmed -ne $drift -or @($result.MissingAccounts).Count -ne $Missing -or
+            @($result.RenamedAccounts).Count -ne $Renamed -or @($result.UnlistedAccounts).Count -ne $Unlisted) { throw "FAIL normal roster: $Name" }
+        foreach ($account in @($result.MissingAccounts)+@($result.RenamedAccounts)) {
+            if ($account.Sid -cne $student.SID.Value -or $account.DeclaredName -cne $student.Name) { throw "FAIL declared identity: $Name" }
+        }
+        foreach ($account in @($result.RenamedAccounts)) {
+            if ($account.ActualName -cne @($Actual | Where-Object {$_.SID.Value -ceq $student.SID.Value})[0].Name) { throw "FAIL renamed actual name: $Name" }
+        }
+        $rejected=$false
+        try { & $module {param($c,$a) Test-LiveRoster $c $a} $rosterConfig $Actual | Out-Null }
+        catch { if ($_.Exception.Message -notlike 'Локальный roster изменён*') { throw }; $rejected=$true }
+        if ($rejected -ne $drift) { throw "FAIL strict roster: $Name" }
+        if ((@($rosterConfig,$Actual) | ConvertTo-Json -Depth 5 -Compress) -cne $before) { throw "FAIL roster inputs changed: $Name" }
+        "PASS pure roster strict/normal: $Name"
+    }
+    Test-RosterCase 'совпадающий SID/Name и builtin' @($student,$builtin) 0 0 0
+    Test-RosterCase 'отсутствующий declared SID' @($builtin) 1 0 0
+    Test-RosterCase 'переименование того же SID' @((New-AccountData $student.SID.Value 'new-name')) 0 1 0
+    Test-RosterCase 'смена только регистра имени' @((New-AccountData $student.SID.Value 'обычный студент')) 0 1 0
+    Test-RosterCase 'новый неописанный SID' @($student,(New-AccountData 'S-1-5-21-1-2-3-1002' 'new-user')) 0 0 1
+    Test-RosterCase 'старое имя у нового SID не подменяет declared SID' @((New-AccountData 'S-1-5-21-1-2-3-1002' $student.Name)) 1 0 1
+    Test-RosterCase 'успешно прочитанный пустой список' @() 1 0 0
     $unset=[pscustomobject]@{EnableSharedPCMode=$null;EnableAccountManager=$null;AccountModel=$null;DeletionPolicy=$null;SetEduPolicies=$null;SetPowerPolicies=$null;RestrictLocalStorage=$null}
     if (-not (& $module {param($s) Test-SharedPCUnset $s} $unset)) { throw 'FAIL all-null SharedPC должен быть unset.' }
     $unset.DeletionPolicy=0
@@ -63,9 +96,9 @@ try {
     $commands=@($ast.FindAll({param($n) $n -is [Management.Automation.Language.CommandAst]},$true) | ForEach-Object {$_.GetCommandName()})
     $exceptions=@($ast.FindAll({param($n)
         $n -is [Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Read-Context' -and
-        @($n.CommandElements | Where-Object {$_ -is [Management.Automation.Language.CommandParameterAst] -and $_.ParameterName -eq 'AllowUnlistedOnlyForNormal'}).Count -gt 0
+        @($n.CommandElements | Where-Object {$_ -is [Management.Automation.Language.CommandParameterAst] -and $_.ParameterName -eq 'AllowRosterDriftOnlyForNormal'}).Count -gt 0
     },$true))
-    if ($exceptions.Count -ne 2) { throw 'FAIL unlisted SID exception должен иметь два вызова: до и после общего lock.' }
+    if ($exceptions.Count -ne 2) { throw 'FAIL roster drift exception должен иметь два вызова: до и после общего lock.' }
     foreach ($exception in $exceptions) {
     $caller=$exception.Parent
     while ($caller -and $caller -isnot [Management.Automation.Language.FunctionDefinitionAst]) { $caller=$caller.Parent }
