@@ -31,12 +31,20 @@ try {
     @('mode=admin','launcher64=1','updatePATH=1','updateContextMenu=0','.java=0','.groovy=0','.kt=0') | Set-Content "$root\idea-silent.config" -Encoding ASCII
     $process = Start-Process (Join-Path $source 'ideaIC.exe') -Wait -PassThru -ArgumentList @('/S', "/CONFIG=$root\idea-silent.config", "/LOG=$root\idea-install.log", '/D=C:\Program Files\JetBrains\IntelliJ IDEA Community Edition 2025.2.6.4')
     if ($process.ExitCode -ne 0) { throw "IDEA installer exit $($process.ExitCode)" }
-    # Community включает локальную генеративную Full Line. Убираем плагин до
-    # первого запуска IDE; общий шаблон профилей пользователей не изменяется.
+    # Community включает локальную генеративную Full Line. Убираем плагин и
+    # сохранённый bundled descriptor до первого запуска; IDEA штатно просканирует
+    # оставшиеся каталоги. Общий шаблон профилей пользователей не изменяется.
     $plugins = 'C:\Program Files\JetBrains\IntelliJ IDEA Community Edition 2025.2.6.4\plugins'
-    if (Test-Path "$plugins\fullLine") {
-        New-Item -ItemType Directory -Path "$root\excluded-plugins" -Force | Out-Null
-        Move-Item "$plugins\fullLine" "$root\excluded-plugins\fullLine" -Force
+    $excluded = @(@('plugin-classpath.txt','fullLine') | ForEach-Object { Join-Path $plugins $_ } |
+        Where-Object { Test-Path -LiteralPath $_ })
+    if ($excluded.Count) {
+        if (@(Get-Process -Name idea64 -ErrorAction SilentlyContinue).Count) { throw 'Закройте IDEA перед исключением Full Line.' }
+        # $root заранее закрыт bootstrap.ps1 для SYSTEM/Administrators.
+        # Новое имя не присваивает и не перезаписывает прежние резервные копии.
+        $backup = Join-Path $root ('excluded-plugins-' + [Guid]::NewGuid().ToString('N'))
+        if (Test-Path -LiteralPath $backup) { throw 'Каталог резервной копии уже существует.' }
+        New-Item -ItemType Directory -Path $backup | Out-Null
+        foreach ($path in $excluded) { Move-Item -LiteralPath $path -Destination (Join-Path $backup (Split-Path $path -Leaf)) }
     }
     $lgpo = Join-Path $source 'LGPO.exe'
     $lgpoSignature = Get-AuthenticodeSignature $lgpo

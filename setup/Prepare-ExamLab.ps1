@@ -441,7 +441,10 @@ function Get-IDEPlugins($Tool) {
     $pluginRoot = Join-Path $Tool.Selected.Path 'plugins'
     $known = @(Get-ChildItem -LiteralPath $pluginRoot -Directory -ErrorAction SilentlyContinue |
         Where-Object Name -match '^(fullLine|llm|ai-assistant|copilot|junie)$' | Select-Object -ExpandProperty Name)
-    [pscustomobject]@{ KnownGenerativeDirectories=$known; UserPluginsAndOtherAssistants='Требуют ручной проверки в IDE и профилях обычного пользователя/Guest';
+    [pscustomobject]@{ KnownGenerativeDirectories=$known;
+        BundledPluginClasspathPresent=(Test-Path -LiteralPath (Join-Path $pluginRoot 'plugin-classpath.txt'));
+        GenerativePluginAbsence='Не подтверждено: отсутствие каталогов не исключает сохранённый bundled descriptor; нужны проверка плагинов и чистый запуск IDEA';
+        UserPluginsAndOtherAssistants='Требуют ручной проверки в IDE и профилях обычного пользователя/Guest';
         OrdinaryCompletionInspectionRefactoringDebug='Не проверены этим инструментом' }
 }
 
@@ -484,7 +487,7 @@ try {
         foreach ($name in $pending) {
             if (Test-Path -LiteralPath $destinations[$name]) { throw "Conflict: занят каталог $($destinations[$name]); разрешите конфликт вручную" }
         }
-        if ($pending.Count -or $DisableBundledGenerativePlugins) {
+        if ($pending.Count) {
             $script:WorkingDirectory = New-ProtectedDirectory
             $report.WorkingDirectory = $script:WorkingDirectory
         }
@@ -498,14 +501,27 @@ try {
         $inventory = Get-Inventory
         if ($inventory.IDEA.State -eq 'Compatible') {
             $freshIdea = $installers.ContainsKey('IDEA')
-            $fullLine = Join-Path $inventory.IDEA.Selected.Path 'plugins\fullLine'
-            if (($freshIdea -or $DisableBundledGenerativePlugins) -and (Test-Path -LiteralPath $fullLine)) {
-                if (-not (Test-TrustedExecutable $fullLine)) { throw 'Каталог плагина не защищён от записи обычным пользователем; автоматическое перемещение запрещено' }
+            $pluginRoot = Join-Path $inventory.IDEA.Selected.Path 'plugins'
+            $excluded = @(@('plugin-classpath.txt','fullLine') | ForEach-Object { Join-Path $pluginRoot $_ } |
+                Where-Object { Test-Path -LiteralPath $_ })
+            if (($freshIdea -or $DisableBundledGenerativePlugins) -and $excluded.Count) {
+                foreach ($path in $excluded) {
+                    if (-not (Test-TrustedExecutable $path)) { throw 'Путь плагина или bundled descriptor не защищён от записи обычным пользователем; автоматическое перемещение запрещено' }
+                }
                 if (@(Get-Process -Name idea64 -ErrorAction SilentlyContinue).Count) { throw 'Закройте IDEA перед исключением Full Line; работающие IDE не останавливаются автоматически' }
-                $backup = Join-Path $script:WorkingDirectory ('excluded-plugins\fullLine-' + [Guid]::NewGuid().ToString('N'))
-                New-Item -ItemType Directory -Path (Split-Path $backup -Parent) -Force | Out-Null
-                Move-Item -LiteralPath $fullLine -Destination $backup
-                $script:Changes.Add([pscustomobject]@{ Tool='IDEA'; Operation='FullLineExcluded'; Backup=$backup })
+                if (-not $script:WorkingDirectory) { $script:WorkingDirectory = New-ProtectedDirectory; $report.WorkingDirectory = $script:WorkingDirectory }
+                # Bundled descriptors содержат plugin.xml даже после переноса fullLine.
+                # Сначала переносим descriptor: при частичном отказе останется штатное
+                # сканирование каталогов вместо ссылки на уже перенесённый плагин.
+                $backup = Join-Path $script:WorkingDirectory ('excluded-plugins-' + [Guid]::NewGuid().ToString('N'))
+                if (Test-Path -LiteralPath $backup) { throw 'Conflict: каталог резервной копии уже существует' }
+                New-Item -ItemType Directory -Path $backup | Out-Null
+                foreach ($path in $excluded) {
+                    $destination = Join-Path $backup (Split-Path $path -Leaf)
+                    Move-Item -LiteralPath $path -Destination $destination
+                    $operation = if ((Split-Path $path -Leaf) -eq 'fullLine') { 'FullLineExcluded' } else { 'BundledPluginClasspathExcluded' }
+                    $script:Changes.Add([pscustomobject]@{ Tool='IDEA'; Operation=$operation; Source=$path; Backup=$destination })
+                }
             }
         }
     }
