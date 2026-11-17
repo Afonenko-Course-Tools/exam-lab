@@ -87,6 +87,7 @@ class IdeaAppContainer {
         foreach(string key in new string[]{"JAVA_TOOL_OPTIONS","_JAVA_OPTIONS","JDK_JAVA_OPTIONS","JDK_JAVAC_OPTIONS","CLASSPATH","IDEA_VM_OPTIONS","IDEA_PROPERTIES","IDEA_JDK"})if(!String.IsNullOrEmpty(Environment.GetEnvironmentVariable(key)))throw new Exception("Inherited environment override "+key);
         var vars=new SortedDictionary<string,string>(StringComparer.OrdinalIgnoreCase);foreach(DictionaryEntry row in Environment.GetEnvironmentVariables())vars[(string)row.Key]=(string)row.Value;
         vars["IDEA_PROPERTIES"]=Path.Combine(root,"idea.properties");vars["TEMP"]=Path.Combine(root,"temp");vars["TMP"]=vars["TEMP"];
+        string roaming=Path.Combine(root,"roaming");Directory.CreateDirectory(roaming);NoReparse(roaming);vars["APPDATA"]=roaming;
         var text=new StringBuilder();foreach(var row in vars)text.Append(row.Key).Append('=').Append(row.Value).Append('\0');text.Append('\0');return Marshal.StringToHGlobalUni(text.ToString());
     }
     static void Launch(string name,string user,int session,string package,bool smoke) {
@@ -99,7 +100,7 @@ class IdeaAppContainer {
             IntPtr bytes=IntPtr.Zero;InitializeProcThreadAttributeList(IntPtr.Zero,1,0,ref bytes);if(Marshal.GetLastWin32Error()!=122)throw new Win32Exception(Marshal.GetLastWin32Error());list=Marshal.AllocHGlobal(bytes);Check(InitializeProcThreadAttributeList(list,1,0,ref bytes));initialized=true;
             Check(UpdateProcThreadAttribute(list,0,(IntPtr)0x20009,sc,(IntPtr)Marshal.SizeOf(typeof(SC)),IntPtr.Zero,IntPtr.Zero));env=EnvironmentBlock(root);
             SIX startup=new SIX();startup.si.cb=Marshal.SizeOf(typeof(SIX));startup.list=list;
-            string command=smoke?Q(exe)+" selfwrite "+Q(user)+" "+session+" "+Q(name)+" "+Q(package):Q(exe)+" "+Q(Path.Combine(root,"workspace"));
+            string command=smoke?Q(exe)+" selfwrite "+Q(user)+" "+session+" "+Q(name)+" "+Q(package)+" "+Q(root):Q(exe)+" "+Q(Path.Combine(root,"workspace"));
             Check(CreateProcess(exe,new StringBuilder(command),IntPtr.Zero,IntPtr.Zero,false,0x00080404|(smoke?0x08000000u:0),env,root,ref startup,out pi));
             var evidence=Read(pi.process,(int)pi.pid);Gate(evidence,user,session,true,package);evidence["Profile"]=name;evidence["Root"]=root;evidence["Mode"]=smoke?"smoke":"IDEA";Emit("SuspendedActualToken",evidence);
             if(ResumeThread(pi.thread)==UInt32.MaxValue)throw new Win32Exception(Marshal.GetLastWin32Error());resumed=true;
@@ -122,14 +123,17 @@ class IdeaAppContainer {
         try {if(a.Length<4)throw new Exception("prepare SID SESSION NAME; smoke|launch|cleanup SID SESSION NAME ACSID; inspect SID SESSION NAME ACSID PID BIRTHUTC EXE");
             string mode=a[0],user=a[1],name=a[3];int session=int.Parse(a[2]);if(!System.Text.RegularExpressions.Regex.IsMatch(name,"^ExamLabIdea-[a-f0-9]{32}$"))throw new Exception("Fresh private profile name required");
             var self=Read(GetCurrentProcess(),Process.GetCurrentProcess().Id);
-            if(mode=="selfwrite"){if(a.Length!=5)throw new Exception("selfwrite args");Gate(self,user,session,true,a[4]);string root=OwnRoot(name,user,a[4]);FreshText(Path.Combine(root,"workspace","actual-ac-write.txt"),"actual AppContainer write\n");Emit("ActualAppContainerWrite",self);return 0;}
+            if(mode=="selfwrite"){if(a.Length!=6)throw new Exception("selfwrite args");Gate(self,user,session,true,a[4]);string root=a[5];FreshText(Path.Combine(root,"workspace","actual-ac-write.txt"),"actual AppContainer write\n");Emit("ActualAppContainerWrite",self);return 0;}
             Gate(self,user,session,false,null);Emit("CallerActualToken",self);
             if(mode=="prepare"&&a.Length==4)Prepare(name,user);
             else if((mode=="launch"||mode=="smoke")&&a.Length==5)Launch(name,user,session,a[4],mode=="smoke");
             else if(mode=="inspect"&&a.Length==8){OwnRoot(name,user,a[4]);Inspect(user,session,a[4],int.Parse(a[5]),a[6],a[7]);}
             else if(mode=="cleanup"&&a.Length==5)Cleanup(name,user,session,a[4]);
             else throw new Exception("Wrong mode/argument count");return 0;
-        }catch(Exception error){Emit("Failure",new Dictionary<string,object>{{"Type",error.GetType().FullName},{"Message",error.Message},{"HResult",error.HResult}});return 2;}
+        }catch(Exception error){
+            if(a.Length>0&&a[0]=="selfwrite")try{FreshText(Path.Combine(Environment.GetEnvironmentVariable("TEMP"),"selfwrite-error-"+Process.GetCurrentProcess().Id+".txt"),error.ToString()+"\nHResult="+error.HResult);}catch{}
+            Emit("Failure",new Dictionary<string,object>{{"Type",error.GetType().FullName},{"Message",error.Message},{"HResult",error.HResult}});return 2;
+        }
     }
     [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
     [DllImport("kernel32.dll",SetLastError=true)] static extern IntPtr OpenProcess(uint rights,bool inherit,int pid);
