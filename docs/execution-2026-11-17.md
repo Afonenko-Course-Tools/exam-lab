@@ -487,4 +487,15 @@ IDEA использует заранее сохранённый маленьки
 отдельными нерешёнными границами. С21:40 начаты обязательные export/cleanup,
 ordinary recovery и выключение своей VM. Сохранены9 собственных файлов и manifest,
 GUI штатно закрыл неудачный запуск; перед API cleanup свои процессы отсутствовали.
-Удаление профиля, ordinary и OFF на момент записи ещё выполняются.
+Удаление профиля AppContainer завершилось18:43:58UTC тем же ограниченным Guest;
+API-папка отсутствует, точный package RX снят с своего diagnostic stage, временные
+задачи убраны. Это не удаление всего Windows Guest: SAM1005 пока остаётся disabled,
+его автоматическое удаление после signout не принято и вручную не форсируется.
+
+В18:53:58UTC прошёл actual ordinary CLI recovery: SID1001/session3/nonadmin,
+его настоящий home, четыре .NET и Java READ с исходными хешами, собственная запись/
+чтение31B и Git init/status0. Использован тот же frozen reader c92cc85a; название
+его поля ExpectedGuest историческое, эта проверка относится к ordinary, не Guest.
+Report SHA256 `b413b480092ed7ba780e13dbc7d32506332c898bffb113ed5c17064d4a35ab3b`.
+Обычный графический вход принят, но first-login Preparing Windows задержал рабочий
+стол; GUI read/save, финальный независимый getter и OFF завершаются отдельно.
