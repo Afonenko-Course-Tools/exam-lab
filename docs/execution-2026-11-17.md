@@ -11,7 +11,7 @@
 | Направление | Подтверждено | Что остаётся |
 | --- | --- | --- |
 | Установка | Native без VM-маркера, безопасный повтор, offline Normal на чистом наборе | Русская ОС и реальный ПК; снятие Applied набора полностью offline |
-| Файлы | Partial writer/Normal; полный Apply на четырёх файлах, Guest Java/.NET DENY, Notepad и Explorer copy DENY | Полный Normal после удаления этого Guest, ordinary recovery и широкий scope |
+| Файлы | Четыре file-only DENY, Guest API/Notepad/copy DENY; отдельная SID-typed очистка после удаления Guest, точные metadata сохранены | Actual ordinary recovery в финале; широкий ACL-scope не развивается, выбран AppContainer |
 | IDEA | Исправлен Full Line descriptor; у нового Guest с 8 GiB подтверждены Run42, breakpoint/step/Resume и повторный Run после Close/Recent reopen при четырёх DENY | Причина начального SDK-сбоя не изолирована; широкой политики ещё нет |
 | Gateway | UID/имя/IP, выбранный launch CIDR-gate, настоящая локальная TLS-цепочка | Включение на сервере, Moodle/PL и контроль обхода через обычную PL-сессию |
 
@@ -219,6 +219,30 @@ owner/group/flags/соседние ACE/fileID/хеши и два ordinary-фай
 Это проверка read/copy на двух небольших корнях, **не** всего диска и не будущих
 файлов. Основной exam по-прежнему отказывает, FullReady=false.
 
+После штатного signout Windows удалила Guest1004 из SAM/CIM/ProfileList/HKU и
+его каталог. Frozen648 Normal вызвал icacls /remove:d с numeric*SID и получил1332
+NoneMapped. Fresh readback показал все четыре собственных DENY и неизменные
+metadata: неудачная команда ничего не сняла. Документация icacls разрешает numeric
+SID; внутренняя причина отказа именно этого CLI не установлена. Варианты CLI наугад
+не перебирались.
+
+Отдельный reviewed cleanup-only helper6ee21e9a использовал текущий FileSecurity,
+GetAccessRules с типом SecurityIdentifier, RemoveAccessRuleSpecific точного
+собственного DENY и File.SetAccessControl. Saved ACL не импортировалась, owner/group
+не переписывались, имя исчезнувшего пользователя не требовалось. Добавлен явный
+UTF-8 reader. Первый внешний caller завершился UserNotFound в последующей
+диагностике, поэтому его exit не объявлен успехом очистки. Fresh readback и затем
+один repeat0 подтвердили завершение; frozen648 отрицательный результат сохранён.
+
+Независимый native getter17:21:07UTC принял14 проверок: четыре файла и два каталога
+побайтно совпали с metadata baseline15:04, включая AI/flags/owner/group/порядок ACE;
+четыре fileID/хеша прежние, ownACE0, Normal/pending0, Guest1004 отсутствует,
+два ordinary-хеша и старый диагностический tmp сохранены. Receipt SHA256:
+`fafad3eeabd47ce37226ae11fd2713cbbbba6c68418b4555defd8770cd923408`.
+Это завершение четырёхфайлового опыта отдельным helper, не исправленный успех
+прежнего CLI и не широкая ACL-поставка. Actual ordinary GUI/reader перенесены
+в финал после AppContainer, до выключения VM.
+
 ### IDEA Run и Debug при действующих файловых запретах
 
 У нового Guest начальная ошибка String сохранялась и после завершения индексации.
@@ -299,6 +323,17 @@ launcher. Предпочтителен готовый OSS-инструмент �
 пока не измерены. Настоящий малый AppContainer-процесс уже использован в отдельной
 сетевой пробе; это не проверка IDEA или файлового охвата.
 
+Исходник launcher154 строки, README и MIT license опубликованы в коммите9ca97c0:
+[воспроизводимая проба](../vm/experiments/appcontainer-idea/README.md).
+Независимый source review принят. Native Framework64 csc4.8.4084 собрал тот же
+исходникdbc0ec8c на Windows17:12:07UTC; exe20480байт, SHA256
+`98f8e3358f178f305bc64a6c87a73b66100e7793a859e1f0a99ec2fe03dc6ed8`.
+Это только сборка: API профиля и IDEA к этому моменту не запускались.
+Обычный tiny project и одна таблица SDK могут быть перенесены в новый собственный
+workroot/config со сверкой хешей. Это явное решение для проверки изоляции с уже
+настроенным JDK; кеши и остальная конфигурация не импортируются, автоматический
+первый запуск полностью чистой IDEA не заявляется.
+
 ### Сопоставление студента и IP: код и проверенный серверный путь
 
 Gateway `2692e56` (основной `ddf3ad1`) сохранён в
@@ -325,3 +360,131 @@ mTLS/Windowscredential/аппаратныйотпечаток отложены. 
 готовый networkexam путь требует PrairieTestlocation/reservation, не включённых
 в этот пилот. Не добавляем собственную вторую auth-систему ради сокрытия этого
 пробела. Production/restart/DB/studentlogin на действующем сервере не выполнялись.
+
+## Последующие проверки AppContainer и сети
+
+На отдельной копии15996 настоящий Guest1003 запустил реальный AppContainer child
+через штатные Win32 API. Перед политикой nonce TCP18084 прошёл как из обычного
+Guest-процесса, так и из AC. Подтверждены actual token UserSID/session/nonElev/
+IsAppContainer/точный AC SID и полный одинаковый набор capability attrs1=4/3=4.
+Название процесса или обычный Edge NetworkService не подменяют эти проверки.
+
+Публичный Network Apply исходника4eb204f запретил новые соединения обоим процессам:
+Connect вернул SocketError AccessDenied/Native10013. Разрешённый TCP18080 и WinRM
+сохранились. Исходный SYSTEM Normal и его повтор завершились0; свежие AC/direct
+получили nonce ACK. Конфигурация между фазами не менялась. TCP18080 здесь обслуживал
+обычный socat: это контроль маршрута, **не** HTTPS/allowlist/TLS-проверка прокси.
+На этой копии настроен статический адрес как предусловие Network-компонента;
+работа целевого аудиторного DHCP этим не подтверждена.
+
+Первая проба уже открытого соединения пропустила своё240s окно до сигнала Apply
+и закончилась ожиданием marker: результат непроверен, не сетевой отказ. Поэтому
+второй узкий цикл применил тот же публичный код с сигналом сразу после Applied.
+Тот же Guest process/socket имел H1 ACK, затем прочитал точный новый marker и получил
+ConnectionReset10054 при H2; переподключения не было. Host fixture не получил H2,
+оба контрольных сервера продолжали работать. Это наблюдение сброса после Apply,
+не отдельное доказательство причины внутри WFP. После исходного Normal снова
+прошли свежие AC/direct/allowed контроли.
+
+Независимый финал16:54:33UTC подтвердил NotConfigured/SourceNormal/GPO0/ownrules0,
+исходную SYSTEM Normal task Ready/result0, неизменные source/config/mode, два
+учебных хеша, выбранные6 полей493 PersistentStore правил и9 полей трёх профилей
+в Persistent/GPO/Active относительно baseline после входа Guest. Это сохранность
+выбранных полей, не буквальный снимок всей firewall-конфигурации. Receipt SHA256:
+`5180d6d487e6895e66064b53c2704dfeb6bc9b054f7d682a71cdc5274dc57153`.
+Адресное удаление собственных AC profiles/helpers и выключение этой копии
+завершены: два own profiles удалены тем же Guest,19 частных задач и два helper-root
+убраны, Guest удалён штатным signout, собственные listeners остановлены.
+422 исходных до Guest правила после logout снова совпали по выбранным6 полям;
+семь исходных accounts, профили и два учебных хеша сохранены. Это наблюдение
+lifecycle493→422, не доказательство причины всех изменений firewall.
+Копия штатно выключена, диск сохранён; sealed reference0400/size/inode/mtime
+неизменны. Итоговый receipt:
+`c1f1ad5d1a92a8c3db09e655e1a94da6cdf62c343447a2d86f8993ead544bfed`.
+
+## Разовая WPR-диагностика обычной IDEA
+
+Stock WPR GeneralProfile+FileIO записывал собственную именованную сессию с пределом75s.
+Коллектор работал повышенным администратором, IDEA оставалась прежним Guest1004.
+ADK, Application Verifier, shims и отдельный драйвер не устанавливались.
+Запись началась16:48:28UTC. При остановке status показал0 dropped events, но
+финализация ETL превысила45s. После ограниченного ожидания own stop выполнен
+только cancel собственной named session; финальный status16:50:43 — idle.
+Чужие WPR-сессии не останавливались. Complete=false: готовой принятой трассы нет.
+
+GUI завершил обычный Run42/exit0 позже окна записи. Время включало взаимодействие
+инструментов и координацию; по нему нельзя вывести время чистого запуска IDEA.
+Не выдаём этот Run за попавший в трассу и не создаём разрешительный список из
+неполной записи. Повторная запись не запускается; приоритет — адресное завершение
+ACL-пробы и первый AppContainer IDEA. Сырые артефакты остаются приватными.
+
+## Возможное ограничение остальных запусков Guest
+
+Source-only ревизия нашла небольшой штатный кандидат: Custom User Interface
+заменяет Explorer фиксированной оболочкой; Shell Launcher добавляет наблюдение,
+но требует Enterprise/Education/IoT. Это **не** выполненные Windows-пробы.
+Сама замена Shell не запрещает все иные способы запуска программ.
+[CustomShell](https://learn.microsoft.com/en-us/windows/client-management/mdm/policy-csp-admx-winlogon),
+[Shell Launcher](https://learn.microsoft.com/en-us/windows/configuration/shell-launcher/).
+
+Для нового Shared PC SID запись Shell после первого входа слишком поздняя, а
+signout удаляет аккаунт. Возможная штатная схема без нового logon broker —
+Non-Administrators MLGPO с fixed AC launcher и более приоритетные User-Specific
+Explorer overrides объявленных ordinary SID. Нужны проверка первого Guest,
+отказ при чужой политике, сохранность ordinary и адресный Normal.
+[Порядок MLGPO](https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-server-2012-r2-and-2012/dn789197%28v%3Dws.11%29).
+DisableTaskMgr/NoRun могут уменьшить интерфейс запуска, но не образуют общего
+AC-only контроля. Браузер вне AC оставляет файловый путь; этот вопрос нельзя
+считать решённым одной boxed IDEA. Реализация оболочки в текущей фазе не начата.
+
+## AppContainer: фактический запуск и причины остановки IDEA
+
+После завершённой ACL-очистки новый Shared PC Guest1005 вошёл без перезагрузки,
+в session2. SID/home/session получены фактически; старый session1 не подставлялся.
+Перед AC все четыре контроля прочитались новым unboxed Guest из .NET и Java,
+собственная запись и Git прошли. Создан уникальный собственный профиль AppContainer:
+рабочие каталоги Low, запись разрешена только package SID, Guest, SYSTEM и BA.
+На защищённом собственном каталоге диагностического exe добавлен только RX этому
+точному package SID; ACL Windows/IDEA/JDK и чужих данных не менялись.
+
+Первая selfwrite-проба дошла до настоящего suspended AC token, но завершилась2
+до записи: child ошибочно повторял проверку всех предков собственного пути.
+Небольшой diagnostic v2 сохранил настоящий exception в stock API Temp: Windows
+перенаправила TEMP/TMP туда, несмотря на переданный custom TEMP. Stack точно показал
+GetFileAttributes/NoReparse на родителе API AC-папки, за пределами доступной области.
+Это отказ диагностической предпосылки, не установленный запрет записи внутри AC.
+
+В v3 только внутренний selfwrite получает проверенный родителем root. Родительские
+Folder/receipt/NoReparse до CreateProcess, actual token gate и capabilities сохранены.
+Native17:59:49UTC: настоящий AC child1936, новый Guest/session2/nonElev/exact package/
+capabilities1+3 attrs4, exit0 и точный новый файл. Source8f518d0f, exe SHA256
+`b10ca18bc25559b502a5944f48d101c4d2030f1be4716b022307a16f3e249751`.
+
+В18:00:38UTC создан настоящий idea64.exe1260 с тем же AC token до и после Resume.
+Однако GUI не дошёл до редактора: Permission denied bind в DirectoryLock.
+Точный pinned bytecode объяснил ветку: system/.port длиной118 символов переносился
+в hard-coded WindowsTemp; собственный system/.port содержал именно эту ссылку.
+Поддержанного force-TCP свойства в этой версии нет. Проверяемое исправление —
+только штатный idea.system.path в короткий API AC/s: .port ровно100 символов/UTF-8 байт.
+ACL WindowsTemp и firewall не расширялись. Следующий запуск прошёл этот этап,
+но остановился в PathManager.getCommonDataPath при чтении обычного APPDATA/Roaming.
+
+Pinned PathManager читает APPDATA; свойства idea.common.data.path у него нет.
+Последний v4 переносит только child APPDATA в собственный root/roaming, сохраняя
+штатную загрузку соглашения и consent. Глобальная среда, capabilities и ACL прежние.
+Source f733e206 независимо принят. В18:31:09UTC новый единственный idea64.exe6776
+снова имел настоящий прежний AC token до/после Resume. Однако GUI85 показал Start
+Failed/AccessDenied в getCommonDataPath/EndUserAgreement: editor/consent/Run не достигнуты.
+Полный путь в UI обрезан, собственный idea.log содержит только предыдущую ошибку
+v3 и не содержит свежего v4 timestamp. Поэтому полный путь/эффективное APPDATA
+и причина отказа v4 остаются неизвестными; запись значения в env block не объявляется
+доказанным переносом данных работающей IDEA. Новых обходов или исправлений нет.
+
+IDEA использует заранее сохранённый маленький проект и только таблицу JDK,
+без импорта кешей или полного профиля. Run/Debug/read barrier внутри AC пока
+не приняты; прежние положительные проверки обычной IDEA не переносятся сюда.
+Изоляция остального Guest, браузер и конечный экзаменационный путь остаются
+отдельными нерешёнными границами. С21:40 начаты обязательные export/cleanup,
+ordinary recovery и выключение своей VM. Сохранены9 собственных файлов и manifest,
+GUI штатно закрыл неудачный запуск; перед API cleanup свои процессы отсутствовали.
+Удаление профиля, ordinary и OFF на момент записи ещё выполняются.
