@@ -27,6 +27,9 @@ try {
     $network=',"Network":{"ProxyEndpointIP":"192.0.2.10","ProxyEndpointPort":3128,"TechnicalAccess":[]}'
     $withNetwork=$valid.Substring(0,$valid.Length-1)+$network+'}'
     Test-Config 'optional Network literal IPv4/empty technical access' $withNetwork $true
+    $withDhcp=$withNetwork.Replace('"TechnicalAccess":[]','"TechnicalAccess":[],"DhcpServerIP":"192.0.2.30"')
+    Test-Config 'Network with a unicast DHCP server' $withDhcp $true
+    Test-Config 'Network broadcast DHCP server refused' ($withDhcp.Replace('192.0.2.30','255.255.255.255')) $false
     Test-Config 'Network hostname refused' ($withNetwork.Replace('192.0.2.10','proxy.example')) $false
     Test-Config 'Network loopback refused' ($withNetwork.Replace('192.0.2.10','127.0.0.1')) $false
     Test-Config 'Network shorthand IP refused' ($withNetwork.Replace('192.0.2.10','127.1')) $false

@@ -10,11 +10,19 @@ $script:Profiles=@('Domain','Private','Public')
 $script:Fields=[ordered]@{Enabled='True';DefaultInboundAction='Block';DefaultOutboundAction='Block';AllowInboundRules='True';AllowLocalFirewallRules='False';AllowLocalIPsecRules='False'}
 $script:Group='ExamLab Network v1'
 
+function Assert-NetEndpointIP($Value){
+ $ip=$null
+ if($Value -isnot [string] -or $Value -notmatch '^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$' -or -not [Net.IPAddress]::TryParse($Value,[ref]$ip) -or $ip.AddressFamily -ne 'InterNetwork' -or $ip.ToString() -cne $Value){throw 'Network требует literal IPv4.'}
+ $b=$ip.GetAddressBytes()
+ if($b[0] -in @(0,127) -or $b[0] -ge 224 -or ($b[0] -eq 169 -and $b[1] -eq 254)){throw 'Network endpoint должен быть unicast IPv4 вне loopback/link-local.'}
+}
 function Test-ExamNetworkConfig {
  [CmdletBinding()]param([AllowNull()]$Config)
  if($null -eq $Config){return}
  $names=@($Config.PSObject.Properties.Name)
- if($Config -isnot [pscustomobject] -or $names.Count -ne 3 -or @($names|Where-Object{$_ -notin @('ProxyEndpointIP','ProxyEndpointPort','TechnicalAccess')}).Count){throw 'Network: только ProxyEndpointIP, ProxyEndpointPort, TechnicalAccess.'}
+ $required=@('ProxyEndpointIP','ProxyEndpointPort','TechnicalAccess')
+ if($Config -isnot [pscustomobject] -or @($required|Where-Object{$_ -notin $names}).Count -or @($names|Where-Object{$_ -notin ($required+@('DhcpServerIP'))}).Count){throw 'Network: нужны ProxyEndpointIP, ProxyEndpointPort, TechnicalAccess; DhcpServerIP необязателен.'}
+ if('DhcpServerIP' -in $names){Assert-NetEndpointIP $Config.DhcpServerIP}
  if($Config.TechnicalAccess -isnot [array]){throw 'TechnicalAccess должен быть массивом, включая пустой.'}
  $pairs=@([pscustomobject]@{IP=$Config.ProxyEndpointIP;Port=$Config.ProxyEndpointPort})
  $seen=@{}
@@ -25,10 +33,8 @@ function Test-ExamNetworkConfig {
   if($seen.ContainsKey($key)){throw 'Повтор TechnicalAccess.'};$seen[$key]=$true
  }
  foreach($pair in $pairs){
-  $ip=$null
-  if($pair.IP -isnot [string] -or $pair.IP -notmatch '^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$' -or -not [Net.IPAddress]::TryParse($pair.IP,[ref]$ip) -or $ip.AddressFamily -ne 'InterNetwork' -or $ip.ToString() -cne $pair.IP -or ($pair.Port -isnot [int] -and $pair.Port -isnot [long]) -or $pair.Port -lt 1 -or $pair.Port -gt 65535){throw 'Network требует literal IPv4 и целые порты 1..65535.'}
-  $b=$ip.GetAddressBytes()
-  if($b[0] -in @(0,127) -or $b[0] -ge 224 -or ($b[0] -eq 169 -and $b[1] -eq 254)){throw 'Network endpoint должен быть unicast IPv4 вне loopback/link-local.'}
+  Assert-NetEndpointIP $pair.IP
+  if(($pair.Port -isnot [int] -and $pair.Port -isnot [long]) -or $pair.Port -lt 1 -or $pair.Port -gt 65535){throw 'Network требует целые порты 1..65535.'}
  }
 }
 function Test-NetPathPresent([string]$Path){
@@ -95,14 +101,30 @@ function Read-NetContext($Config,[string]$Revision){
 }
 function Get-NetSpecs($Config){
  if($null -eq $Config){return}
- [pscustomobject]@{Name='ExamLab.Network.Proxy.Out';Direction='Outbound';LocalAddress='Any';RemoteAddress=$Config.ProxyEndpointIP;LocalPort='Any';RemotePort=[string]$Config.ProxyEndpointPort}
+ [pscustomobject]@{Name='ExamLab.Network.Proxy.Out';Direction='Outbound';Protocol='TCP';RemoteAddress=$Config.ProxyEndpointIP;LocalPort='Any';RemotePort=[string]$Config.ProxyEndpointPort;Program='Any';Service='Any'}
  $index=0
- foreach($a in $Config.TechnicalAccess){[pscustomobject]@{Name=('ExamLab.Network.Technical.'+$index+'.In');Direction='Inbound';LocalAddress='Any';RemoteAddress=$a.RemoteIP;LocalPort=[string]$a.LocalPort;RemotePort='Any'};$index++}
+ foreach($a in $Config.TechnicalAccess){[pscustomobject]@{Name=('ExamLab.Network.Technical.'+$index+'.In');Direction='Inbound';Protocol='TCP';RemoteAddress=$a.RemoteIP;LocalPort=[string]$a.LocalPort;RemotePort='Any';Program='Any';Service='Any'};$index++}
+ if('DhcpServerIP' -in $Config.PSObject.Properties.Name){
+  $client=Join-Path $env:SystemRoot 'System32\svchost.exe'
+  [pscustomobject]@{Name='ExamLab.Network.Dhcp.Out';Direction='Outbound';Protocol='UDP';RemoteAddress=@($Config.DhcpServerIP,'255.255.255.255');LocalPort='68';RemotePort='67';Program=$client;Service='Dhcp'}
+  [pscustomobject]@{Name='ExamLab.Network.Dhcp.In';Direction='Inbound';Protocol='UDP';RemoteAddress=$Config.DhcpServerIP;LocalPort='68';RemotePort='67';Program=$client;Service='Dhcp'}
+ }
 }
-function Get-NetLocalAddress {
- $addresses=@(Get-NetIPAddress -AddressFamily IPv4|Where-Object{$_.PrefixOrigin -eq 'Manual' -and $_.AddressState -eq 'Preferred' -and $_.IPAddress -notmatch '^(127\.|169\.254\.)'})
- if($addresses.Count -ne 1){throw 'Apply требует заранее подготовленный единственный static Manual/Preferred IPv4.'}
- [string]$addresses[0].IPAddress
+function Assert-NetApplyAddress($Config){
+ if('DhcpServerIP' -notin $Config.PSObject.Properties.Name){
+  $manual=@(Get-NetIPAddress -AddressFamily IPv4|Where-Object{$_.PrefixOrigin -eq 'Manual' -and $_.AddressState -eq 'Preferred' -and $_.IPAddress -notmatch '^(127\.|169\.254\.)'})
+  if($manual.Count -ne 1){throw 'Apply без DhcpServerIP требует единственный static Manual/Preferred IPv4.'}
+  return
+ }
+ $addresses=@(Find-NetRoute -RemoteIPAddress $Config.ProxyEndpointIP | Where-Object {$_.CimClass.CimClassName -eq 'MSFT_NetIPAddress'})
+ if($addresses.Count -ne 1 -or $addresses[0].AddressState -ne 'Preferred') {throw 'Apply требует Preferred IPv4 на маршруте к proxy.'}
+ $address=$addresses[0]
+ Assert-NetEndpointIP $address.IPAddress
+ if($address.PrefixOrigin -ne 'Dhcp' -or (Get-Service Dhcp).Status -ne 'Running'){throw 'Для DhcpServerIP нужны DHCP-адрес на маршруте к proxy и служба Dhcp.'}
+ $leases=@(Get-CimInstance Win32_NetworkAdapterConfiguration -Filter ('InterfaceIndex = '+[uint32]$address.InterfaceIndex))
+ if($leases.Count -ne 1){throw 'Не найдена конфигурация адаптера на маршруте DHCP к proxy.'}
+ $lease=$leases[0]
+ if(-not $lease.DHCPEnabled -or $lease.DHCPServer -cne $Config.DhcpServerIP -or $address.IPAddress -notin $lease.IPAddress -or -not $lease.DHCPLeaseExpires -or $lease.DHCPLeaseExpires -le (Get-Date)){throw 'Актуальная DHCP-аренда на маршруте к proxy не подтверждена для указанного DhcpServerIP.'}
 }
 function Join-Values($value){(@($value)|ForEach-Object{[string]$_}|Sort-Object) -join ','}
 function Default-Any($value){$text=Join-Values $value;if($text -in @('','Any')){'Any'}else{$text}}
@@ -121,7 +143,7 @@ function Read-RuleSignature($rule){
   LocalAddress=(Join-Values $address.LocalAddress);RemoteAddress=(Join-Values $address.RemoteAddress)
   Protocol=[string]$port.Protocol;LocalPort=(Join-Values $port.LocalPort);RemotePort=(Join-Values $port.RemotePort)
   DynamicTarget=[string]$port.DynamicTarget;IcmpType=(Default-Any $port.IcmpType)
-  Program=(Default-Any $app.Program);Package=(Default-Any $app.Package);Service=(Default-Any $service.Service)
+  Program=[Environment]::ExpandEnvironmentVariables((Default-Any $app.Program)).ToLowerInvariant();Package=(Default-Any $app.Package);Service=(Default-Any $service.Service).ToLowerInvariant()
   InterfaceAlias=(Default-Any $interface.InterfaceAlias);InterfaceType=[string]$interfaceType.InterfaceType
   Authentication=[string]$security.Authentication;Encryption=[string]$security.Encryption;OverrideBlockRules=[string]$security.OverrideBlockRules
   LocalUser=(Default-Any $security.LocalUser);RemoteUser=(Default-Any $security.RemoteUser);RemoteMachine=(Default-Any $security.RemoteMachine)
@@ -132,8 +154,8 @@ function Expected-RuleSignature($spec,[string]$runId){
   Name=$spec.Name;DisplayName=$spec.Name;Description=('ExamLab Network '+$runId);Group=$script:Group
   Enabled='True';Profile='Any';Direction=$spec.Direction;Action='Allow'
   EdgeTraversalPolicy='Block';LooseSourceMapping='False';LocalOnlyMapping='False'
-  LocalAddress=$spec.LocalAddress;RemoteAddress=$spec.RemoteAddress;Protocol='TCP';LocalPort=$spec.LocalPort;RemotePort=$spec.RemotePort
-  DynamicTarget='Any';IcmpType='Any';Program='Any';Package='Any';Service='Any';InterfaceAlias='Any';InterfaceType='Any'
+  LocalAddress='Any';RemoteAddress=(Join-Values $spec.RemoteAddress);Protocol=$spec.Protocol;LocalPort=$spec.LocalPort;RemotePort=$spec.RemotePort
+  DynamicTarget='Any';IcmpType='Any';Program=$spec.Program.ToLowerInvariant();Package='Any';Service=$spec.Service.ToLowerInvariant();InterfaceAlias='Any';InterfaceType='Any'
   Authentication='NotRequired';Encryption='NotRequired';OverrideBlockRules='False';LocalUser='Any';RemoteUser='Any';RemoteMachine='Any'
  }|ConvertTo-Json -Compress
 }
@@ -155,16 +177,16 @@ function Read-NetView($Config,[string]$Revision){
    if($value -ceq 'NotConfigured'){$complete=$false;continue}
    if(-not $state -or $value -cne $script:Fields[$name]){$applyIssues+=('Чужое/изменённое GPO поле '+$p.Name+'.'+$name);if($state){$issues+=$applyIssues[-1]}}
   }
-  foreach($name in @('AllowUserApps','AllowUserPorts')){if([string]$p.$name -cne 'NotConfigured'){$applyIssues+=('Чужое legacy GPO поле '+$p.Name+'.'+$name);if($state){$issues+=$applyIssues[-1]}}}
+  foreach($name in @('AllowUserApps','AllowUserPorts')){if([string]$p.$name -cne 'NotConfigured'){$applyIssues+=('Чужое legacy GPO поле '+$p.Name+'.'+$name)}}
   $disabled=@($p.DisabledInterfaceAliases|Where-Object{$null -ne $_ -and [string]$_ -cne ''})
-  if($disabled.Count -and -not($disabled.Count -eq 1 -and [string]$disabled[0] -ceq 'NotConfigured')){$applyIssues+=('Чужой DisabledInterfaceAliases '+$p.Name);if($state){$issues+=$applyIssues[-1]}}
+  if($disabled.Count -and -not($disabled.Count -eq 1 -and [string]$disabled[0] -ceq 'NotConfigured')){$applyIssues+=('Чужой DisabledInterfaceAliases '+$p.Name)}
  }
  if($gpoProfiles.Count -ne 3){$issues+='Не получены три GPO profiles';$applyIssues+=$issues[-1]}
  foreach($rule in $gpoRules){
   $spec=@($specs|Where-Object{$_.Name -ceq $rule.Name})
   if(-not $state -or $spec.Count -ne 1){
    $applyIssues+=('Чужое local GPO правило '+$rule.Name)
-   if($state -or $rule.Name -like 'ExamLab.Network.*'){$issues+=$applyIssues[-1]};continue
+   if($rule.Name -like 'ExamLab.Network.*'){$issues+=$applyIssues[-1]};continue
   }
   if((Read-RuleSignature $rule) -cne (Expected-RuleSignature $spec[0] $state.RunId)){$issues+=('Изменены собственные filters '+$rule.Name)}
   $present+=[string]$rule.Name
@@ -177,25 +199,47 @@ function Update-NetPolicy {
  try{$ErrorActionPreference='Continue';& "$env:SystemRoot\System32\gpupdate.exe" /target:computer /force /wait:30 2>&1|Out-Null;$code=$LASTEXITCODE}finally{$ErrorActionPreference=$old}
  if($code -ne 0){throw 'gpupdate отказал; own intent сохранён, Normal отдельно.'}
 }
-function Assert-NetActive($View,[switch]$ManagementOnly){
+function Assert-NetActive($View,[switch]$RulesOnly){
  foreach($spec in $View.Specs){
-  if($ManagementOnly -and $spec.Direction -ne 'Inbound'){continue}
   $active=@(Get-NetFirewallRule -PolicyStore ActiveStore -TracePolicyStore -Name $spec.Name)
-  if($active.Count -ne 1 -or [string]$active[0].PolicyStoreSourceType -cne 'GroupPolicy' -or (Read-RuleSignature $active[0]) -cne (Expected-RuleSignature $spec $View.Intent.RunId)){throw 'Нет exact active GPO allow.'}
+  if($active.Count -ne 1 -or [string]$active[0].PolicyStoreSourceType -cne 'GroupPolicy' -or (Read-RuleSignature $active[0]) -cne (Expected-RuleSignature $spec $View.Intent.RunId)){throw ('ActiveStore не подтвердил собственное правило '+$spec.Name)}
  }
- if(-not $ManagementOnly){
+ if(-not $RulesOnly){
   $profiles=@(Get-NetFirewallProfile -PolicyStore ActiveStore -Name $script:Profiles)
   if($profiles.Count -ne 3){throw 'Нет трёх ActiveStore profiles.'}
   foreach($p in $profiles){foreach($name in $script:Fields.Keys){if([string]$p.$name -cne $script:Fields[$name]){throw 'ActiveStore не подтвердил собственные поля.'}}}
  }
 }
 function Get-ExamNetworkStatus {
- [CmdletBinding()]param([AllowNull()]$Config,[Parameter(Mandatory=$true)][string]$ConfigRevision)
+ [CmdletBinding()]param([AllowNull()]$Config,[Parameter(Mandatory=$true)][string]$ConfigRevision,[switch]$CheckApplyHost)
  $view=Read-NetView $Config $ConfigRevision
- $state=if($view.Issues.Count){'Conflict'}elseif(-not $view.Intent){'NotConfigured'}elseif($view.Complete){'Applied'}else{'Applying'}
- [pscustomobject]@{State=$state;SourceNormal=($state -eq 'NotConfigured');NormalAllowed=($view.Issues.Count -eq 0);Blockers=@($view.Issues);ApplyAllowed=($null -ne $Config -and -not $view.Intent -and -not $view.ApplyIssues.Count -and -not $view.Issues.Count);ApplyBlockers=@($view.ApplyIssues);RunId=if($view.Intent){$view.Intent.RunId}else{$null};OwnRules=@($view.Present);ConfigRevision=$ConfigRevision;FullReady=$false;PersistentStoreWritten=$false}
+ Get-NetStatusFromView $view $Config $ConfigRevision -CheckApplyHost:$CheckApplyHost
 }
-function Assert-NetApplyHost {
+function Get-NetStatusFromView($View,$Config,[string]$ConfigRevision,[switch]$CheckApplyHost){
+ $state=if($View.Issues.Count){'Conflict'}elseif(-not $View.Intent){'NotConfigured'}elseif($View.Complete){'Applied'}else{'Applying'}
+ $policyBlockers=@(($View.ApplyIssues + $View.Issues) | Select-Object -Unique)
+ $applyBlockers=$policyBlockers
+ if($CheckApplyHost -and $null -ne $Config -and $state -eq 'NotConfigured' -and -not $applyBlockers.Count){
+  try{Assert-NetApplyHost $Config}catch{$applyBlockers+=$_.Exception.Message}
+ }elseif($CheckApplyHost -and $state -eq 'Applied' -and -not $applyBlockers.Count -and 'DhcpServerIP' -in $Config.PSObject.Properties.Name){
+  try{Assert-NetApplyAddress $Config}catch{$applyBlockers+=$_.Exception.Message}
+ }
+ $effectiveApplied=$false;$effectiveBlockers=@()
+ if($state -eq 'Applied'){
+  $effectiveBlockers=$policyBlockers
+  if(-not $effectiveBlockers.Count){
+   try{Assert-NetActive $View;$effectiveApplied=$true}catch{$effectiveBlockers+=$_.Exception.Message}
+  }
+ }
+ [pscustomobject]@{
+  State=$state;SourceNormal=($state -eq 'NotConfigured');NormalAllowed=($View.Issues.Count -eq 0)
+  Blockers=@($View.Issues);NormalBlockers=@($View.Issues)
+  ApplyAllowed=($null -ne $Config -and $state -eq 'NotConfigured' -and -not $applyBlockers.Count);ApplyBlockers=$applyBlockers
+  EffectiveApplied=$effectiveApplied;EffectiveBlockers=$effectiveBlockers
+  RunId=if($View.Intent){$View.Intent.RunId}else{$null};OwnRules=@($View.Present);ConfigRevision=$ConfigRevision;FullReady=$false;PersistentStoreWritten=$false
+ }
+}
+function Assert-NetApplyHost($Config){
  $machine=Get-CimInstance Win32_ComputerSystem;$os=Get-CimInstance Win32_OperatingSystem
  if($machine.PartOfDomain -or [int]$os.BuildNumber -lt 19041 -or [int]$os.ProductType -ne 1){throw 'Экспериментальный Apply требует standalone Windows client 19041+.'}
  $omadm=@()
@@ -205,6 +249,7 @@ function Assert-NetApplyHost {
  try{$ErrorActionPreference='Continue';$dsreg=(& "$env:SystemRoot\System32\dsregcmd.exe" /status 2>&1|Out-String);$code=$LASTEXITCODE}finally{$ErrorActionPreference=$old}
  foreach($flag in @('AzureAdJoined','EnterpriseJoined','DomainJoined','WorkplaceJoined')){if($code -ne 0 -or $dsreg -notmatch ('(?m)^\s*'+$flag+'\s*:\s*NO\s*$')){throw 'Unmanaged Windows precondition не подтверждён.'}}
  foreach($service in @('MpsSvc','BFE')){if((Get-Service $service).Status -ne 'Running'){throw 'Firewall services не готовы.'}}
+ Assert-NetApplyAddress $Config
 }
 function Invoke-ExamNetworkUnderLock {
  [CmdletBinding()]param([Parameter(Mandatory=$true)][ValidateSet('Apply','Normal')][string]$Action,[AllowNull()]$Config,[Parameter(Mandatory=$true)][string]$ConfigRevision,[Parameter(Mandatory=$true)][IO.FileStream]$OperationLock)
@@ -213,25 +258,36 @@ function Invoke-ExamNetworkUnderLock {
  if($view.Issues.Count){throw ($view.Issues -join '; ')}
  if($Action -eq 'Apply'){
   if($null -eq $Config){throw 'Network не описан в pc.json.'}
-  if($view.Intent){if($view.Complete){Assert-NetActive $view;return Get-ExamNetworkStatus $Config $ConfigRevision};throw 'Частичный собственный Apply: только Normal; автоматического продолжения нет.'}
   if($view.ApplyIssues.Count){throw ($view.ApplyIssues -join '; ')}
-  Assert-NetApplyHost
-  $null=Get-NetLocalAddress
+  if($view.Intent){
+   if(-not $view.Complete){throw 'После частичного Apply требуется Normal.'}
+   $status=Get-NetStatusFromView $view $Config $ConfigRevision -CheckApplyHost
+   if($status.ApplyBlockers.Count){throw ($status.ApplyBlockers -join '; ')}
+   if(-not $status.EffectiveApplied){throw ($status.EffectiveBlockers -join '; ')}
+   return $status
+  }
+  Assert-NetApplyHost $Config
   $specs=@(Get-NetSpecs $Config)
   $state=[ordered]@{Schema=1;RunId=[Guid]::NewGuid().ToString('D');ComputerIdentity=$view.Identity;ConfigRevision=$ConfigRevision}
   $file=[IO.File]::Open($script:MetaPath,'CreateNew','Write','None')
   try{$bytes=[Text.Encoding]::UTF8.GetBytes(($state|ConvertTo-Json -Compress));$file.Write($bytes,0,$bytes.Length);$file.Flush($true)}finally{$file.Dispose()}
   $acl=New-Object Security.AccessControl.FileSecurity;$acl.SetSecurityDescriptorSddlForm('O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)');Set-Acl -LiteralPath $script:MetaPath -AclObject $acl
-  foreach($spec in $specs){New-NetFirewallRule -PolicyStore localhost -Name $spec.Name -DisplayName $spec.Name -Description ('ExamLab Network '+$state.RunId) -Group $script:Group -Enabled True -Profile Any -Direction $spec.Direction -Action Allow -Protocol TCP -LocalAddress $spec.LocalAddress -RemoteAddress $spec.RemoteAddress -LocalPort $spec.LocalPort -RemotePort $spec.RemotePort|Out-Null}
+  foreach($spec in $specs){
+   $filters=@{Direction=$spec.Direction;Protocol=$spec.Protocol;LocalAddress='Any';RemoteAddress=$spec.RemoteAddress;LocalPort=$spec.LocalPort;RemotePort=$spec.RemotePort}
+   if($spec.Service -ne 'Any'){$filters.Program=$spec.Program;$filters.Service=$spec.Service}
+   New-NetFirewallRule -PolicyStore localhost -Name $spec.Name -DisplayName $spec.Name -Description ('ExamLab Network '+$state.RunId) -Group $script:Group -Enabled True -Profile Any -Action Allow @filters|Out-Null
+  }
   Update-NetPolicy
   $view=Read-NetView $Config $ConfigRevision
-  if($view.Issues.Count -or $view.Present.Count -ne $specs.Count){throw 'Собственные GPO rules не подтверждены до no-merge.'}
-  Assert-NetActive $view -ManagementOnly
+  if($view.Issues.Count -or $view.ApplyIssues.Count -or $view.Present.Count -ne $specs.Count){throw 'Собственные GPO rules не подтверждены до no-merge.'}
+  Assert-NetActive $view -RulesOnly
   foreach($profileName in $script:Profiles){Set-NetFirewallProfile -PolicyStore localhost -Name $profileName -ThrottleLimit 1 -Enabled True -DefaultInboundAction Block -DefaultOutboundAction Block -AllowInboundRules True -AllowLocalFirewallRules False -AllowLocalIPsecRules False}
   Update-NetPolicy
   $view=Read-NetView $Config $ConfigRevision
   if($view.Issues.Count -or -not $view.Complete){throw 'GPO Apply не подтверждён; Normal отдельно.'}
-  Assert-NetActive $view
+  $status=Get-NetStatusFromView $view $Config $ConfigRevision
+  if(-not $status.EffectiveApplied){throw ($status.EffectiveBlockers -join '; ')}
+  return $status
  }elseif($view.Intent){
   foreach($profileName in $script:Profiles){Set-NetFirewallProfile -PolicyStore localhost -Name $profileName -ThrottleLimit 1 -Enabled NotConfigured -DefaultInboundAction NotConfigured -DefaultOutboundAction NotConfigured -AllowInboundRules NotConfigured -AllowLocalFirewallRules NotConfigured -AllowLocalIPsecRules NotConfigured}
   Update-NetPolicy
