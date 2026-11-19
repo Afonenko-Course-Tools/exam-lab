@@ -22,10 +22,15 @@ $installedScript = Join-Path $code 'Install-ExamLabWazuh.ps1'
 $agent = Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) 'ossec-agent'
 $exe = Join-Path $agent 'wazuh-agent.exe'
 $config = Join-Path $agent 'ossec.conf'
+$internalOptions = Join-Path $agent 'local_internal_options.conf'
 $clientKeys = Join-Path $agent 'client.keys'
 $response = Join-Path $agent 'active-response\bin\exam-lab-alert.cmd'
 $serviceName = 'WazuhSvc'
 $msiHash = '54F83C01DD35573D8501EAB553EBDD72AD4DE75383636EFB25F01E782521E83281065F8075A369239C13A5A5E3F3599A754EB3204FF56CFCE2B2AFD9AE911152'
+$knownResponses = @('5204BFBE48B4AD6846133ADC40D96544B717F9B0887B406DC5766F9040C49CBD',
+    'D1A4E87C6A154C7888D5847E9C2D5958AACE45A31DBFCB2C7AF23BC58AD95F64')
+$adminSids = @('S-1-5-18', 'S-1-5-32-544')
+$trustedSids = $adminSids + @(Get-LocalGroupMember -SID 'S-1-5-32-544' | ForEach-Object { $_.SID.Value })
 $utf8 = [Text.UTF8Encoding]::new($false)
 
 function Assert-NoReparse([string]$Path) {
@@ -33,6 +38,23 @@ function Assert-NoReparse([string]$Path) {
         if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
             throw 'В пути собственной установки найдено перенаправление файловой системы.'
         }
+    }
+}
+
+function Assert-AdministrativePath([string]$Path, [switch]$Private) {
+    Assert-NoReparse $Path
+    $acl = Get-Acl -LiteralPath $Path
+    if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -notin $trustedSids) {
+        throw "Чужой владелец пути Wazuh: $Path."
+    }
+    $writeAccess = [Security.AccessControl.FileSystemRights]::Write -bor [Security.AccessControl.FileSystemRights]::Delete -bor
+        [Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor [Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+        [Security.AccessControl.FileSystemRights]::TakeOwnership
+    foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+        if ($rule.AccessControlType -ne 'Allow' -or $rule.IdentityReference.Value -in $trustedSids) { continue }
+        if ($rule.IdentityReference.Value -eq 'S-1-3-0' -and
+            ($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly)) { continue }
+        if ($Private -or ($rule.FileSystemRights -band $writeAccess)) { throw "Небезопасный доступ: $Path." }
     }
 }
 
@@ -47,6 +69,15 @@ function Assert-AgentService($Service) {
     }
 }
 
+function Assert-NoExistingAgent {
+    $uninstall = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
+        Where-Object { $_.PSObject.Properties['DisplayName'] -and $_.DisplayName -like 'Wazuh*' }
+    if ((Get-AgentService) -or $uninstall -or (Test-Path -LiteralPath $agent)) {
+        throw 'Найдена существующая установка Wazuh. Сначала разберите конфликт.'
+    }
+}
+
 function Assert-OwnedInstallation($State, [switch]$CheckCollection) {
     if ($State.InstallState -cne 'Installed') {
         throw 'Подготовка Wazuh прервана. Проверьте состояние MSI и службы перед повтором.'
@@ -58,15 +89,18 @@ function Assert-OwnedInstallation($State, [switch]$CheckCollection) {
         @{ Path = $installedScript; Hash = $State.SourceSha256 },
         @{ Path = $exe; Hash = $State.AgentSha256 }
     )
+    Assert-AdministrativePath $agent
     if ($CheckCollection) {
+        Assert-AdministrativePath (Split-Path -Parent $response)
         $files += @(
             @{ Path = $config; Hash = $State.ConfigSha256 },
+            @{ Path = $internalOptions; Hash = $State.OptionsSha256 },
             @{ Path = $response; Hash = $State.ResponseSha256 },
             @{ Path = $clientKeys; Hash = $State.ClientKeySha256 }
         )
     }
     foreach ($file in $files) {
-        Assert-NoReparse $file.Path
+        Assert-AdministrativePath $file.Path
         if ((Get-FileHash -LiteralPath $file.Path -Algorithm SHA256).Hash -cne $file.Hash) {
             throw "Изменён файл выделенной установки Wazuh: $($file.Path)."
         }
@@ -86,11 +120,38 @@ function Get-AgentKeyLine([string]$Path) {
     }
 }
 
-$mutex = [Threading.Mutex]::new($false, 'Global\ExamLabWazuhPilot')
-$held = $false
+if ($Action -eq 'Install') {
+    $address = $null
+    if (-not $MsiPath -or -not $AgentKeyPath -or -not [Net.IPAddress]::TryParse($ManagerIPv4, [ref]$address) -or
+        $address.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetwork -or $address.ToString() -cne $ManagerIPv4) {
+        throw 'Укажите MsiPath, AgentKeyPath и IPv4 локального менеджера в десятичной записи.'
+    }
+    $keyLine = Get-AgentKeyLine $AgentKeyPath
+    $msi = (Get-Item -LiteralPath $MsiPath).FullName
+    $sourceHash = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash
+    $responseSource = Join-Path $PSScriptRoot '..\windows\alert\exam-lab-alert.cmd'
+    $responseHash = (Get-FileHash -LiteralPath $responseSource -Algorithm SHA256).Hash
+    if ($responseHash -cnotin $knownResponses) { throw 'Неизвестная команда Active Response из комплекта.' }
+    if (-not (Test-Path -LiteralPath $code)) {
+        if (Test-Path -LiteralPath $marker) { throw 'Отсутствует каталог ранее установленного Wazuh.' }
+        Assert-NoExistingAgent
+        Assert-NoReparse (Split-Path -Parent $code)
+        $folderAcl = [Security.AccessControl.DirectorySecurity]::new()
+        $folderAcl.SetAccessRuleProtection($true, $false)
+        foreach ($value in $adminSids) {
+            $sid = [Security.Principal.SecurityIdentifier]::new($value)
+            $folderAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+                $sid, 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow'))
+        }
+        [void][IO.Directory]::CreateDirectory($code, $folderAcl)
+    }
+}
+Assert-AdministrativePath $code -Private
+$lockPath = Join-Path $code 'service.lock'
+if (Test-Path -LiteralPath $lockPath) { Assert-AdministrativePath $lockPath -Private }
+try { $lock = [IO.File]::Open($lockPath, 'OpenOrCreate', 'ReadWrite', 'None') }
+catch { throw 'Не удалось получить исключительный доступ к выделенной установке Wazuh.' }
 try {
-    try { $held = $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $held = $true }
-    if (-not $held) { throw 'Установка или изменение службы Wazuh уже выполняется.' }
     $state = if (Test-Path -LiteralPath $marker) { Get-ItemProperty -LiteralPath $marker }
     if ($Action -ne 'Install') {
         if ($null -eq $state -or $PSCommandPath -ine $installedScript) {
@@ -98,6 +159,13 @@ try {
         }
         if ($Action -eq 'StartCollection') {
             Assert-OwnedInstallation $state -CheckCollection
+            Assert-AdministrativePath $clientKeys -Private
+            $alertCode = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'ExamLabAlert'
+            Assert-AdministrativePath $alertCode
+            Assert-AdministrativePath (Join-Path $alertCode 'ExamLabAlert.ps1')
+            if (-not (Test-Path -LiteralPath 'HKLM:\SOFTWARE\ExamLabAlertPilot')) {
+                throw 'Сначала инициализируйте локальный приёмник оповещения.'
+            }
             $expectedStatus = 'Running'
             Start-Service -Name $serviceName
         } else {
@@ -113,16 +181,6 @@ try {
         return
     }
 
-    $address = $null
-    if (-not $MsiPath -or -not $AgentKeyPath -or -not [Net.IPAddress]::TryParse($ManagerIPv4, [ref]$address) -or
-        $address.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetwork -or $address.ToString() -cne $ManagerIPv4) {
-        throw 'Укажите MsiPath, AgentKeyPath и IPv4 локального менеджера в десятичной записи.'
-    }
-    $keyLine = Get-AgentKeyLine $AgentKeyPath
-    $msi = (Get-Item -LiteralPath $MsiPath).FullName
-    $sourceHash = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash
-    $responseSource = Join-Path $PSScriptRoot '..\windows\alert\exam-lab-alert.cmd'
-    $responseHash = (Get-FileHash -LiteralPath $responseSource -Algorithm SHA256).Hash
     if ($null -ne $state) {
         Assert-OwnedInstallation $state -CheckCollection
         if ($state.ManagerIPv4 -cne $ManagerIPv4 -or $state.SourceSha256 -cne $sourceHash -or
@@ -133,29 +191,21 @@ try {
         return
     }
 
-    $uninstall = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
-        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
-        Where-Object { $_.PSObject.Properties['DisplayName'] -and $_.DisplayName -like 'Wazuh*' }
-    if ((Get-AgentService) -or $uninstall -or (Test-Path -LiteralPath $agent) -or (Test-Path -LiteralPath $code)) {
-        throw 'Найдены существующая установка Wazuh или служебный каталог. Сначала разберите конфликт.'
+    Assert-NoExistingAgent
+    if (@(Get-ChildItem -LiteralPath $code -Force | Where-Object Name -ne 'service.lock').Count) {
+        throw 'Служебный каталог содержит файлы предыдущей подготовки Wazuh.'
     }
-    Assert-NoReparse (Split-Path -Parent $code)
     Assert-NoReparse (Split-Path -Parent $agent)
 
-    $adminSids = @('S-1-5-18', 'S-1-5-32-544')
-    $folderAcl = [Security.AccessControl.DirectorySecurity]::new()
-    $folderAcl.SetAccessRuleProtection($true, $false)
     $keyAcl = [Security.AccessControl.FileSecurity]::new()
     $keyAcl.SetAccessRuleProtection($true, $false)
     foreach ($value in $adminSids) {
         $sid = [Security.Principal.SecurityIdentifier]::new($value)
-        $folderAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
-            $sid, 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow'))
         $keyAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid, 'FullControl', 'Allow'))
     }
-    [void][IO.Directory]::CreateDirectory($code, $folderAcl)
-    Assert-NoReparse $code
     $staged = Join-Path $code 'wazuh-agent-4.14.10-1.msi'
+    $msiAttempted = $false
+    $complete = $false
     try {
         [IO.File]::Copy($msi, $staged)
         if ((Get-FileHash -LiteralPath $staged -Algorithm SHA512).Hash -cne $msiHash) {
@@ -168,6 +218,7 @@ try {
         [void](New-Item -Path $marker)
         Set-ItemProperty -LiteralPath $marker -Name InstallState -Value 'Preparing'
         $installer = Join-Path $env:SystemRoot 'System32\msiexec.exe'
+        $msiAttempted = $true
         $install = Start-Process -FilePath $installer -ArgumentList ('/i "{0}" /qn /norestart' -f $staged) -Wait -PassThru
         if ($install.ExitCode -ne 0) { throw "MSI Wazuh завершился кодом $($install.ExitCode)." }
         Assert-AgentService (Get-AgentService)
@@ -176,8 +227,9 @@ try {
             Stop-Service -Name $serviceName
             throw 'MSI неожиданно запустил службу Wazuh. Служба остановлена.'
         }
-        Assert-NoReparse $config
-        Assert-NoReparse (Split-Path -Parent $response)
+        Assert-AdministrativePath $agent
+        Assert-AdministrativePath $config
+        Assert-AdministrativePath (Split-Path -Parent $response)
         if (Test-Path -LiteralPath $response) { throw 'Команда Active Response уже существует.' }
         if (Test-Path -LiteralPath $clientKeys) {
             Assert-NoReparse $clientKeys
@@ -186,7 +238,6 @@ try {
             [IO.File]::Create($clientKeys).Dispose()
         }
         Set-Acl -LiteralPath $clientKeys -AclObject $keyAcl
-        [IO.File]::WriteAllText($clientKeys, "$keyLine`n", $utf8)
         $agentConfig = @"
 <ossec_config>
   <client>
@@ -218,6 +269,8 @@ try {
 </ossec_config>
 "@
         [IO.File]::WriteAllText($config, $agentConfig, $utf8)
+        if (Test-Path -LiteralPath $internalOptions) { Assert-AdministrativePath $internalOptions }
+        [IO.File]::WriteAllText($internalOptions, "agent.remote_conf=0`n", $utf8)
         [IO.File]::Copy((Get-Item -LiteralPath $responseSource).FullName, $response)
         [IO.File]::Copy($PSCommandPath, $installedScript)
         if ((Get-FileHash -LiteralPath $installedScript).Hash -cne $sourceHash -or
@@ -228,15 +281,19 @@ try {
         Set-ItemProperty -LiteralPath $marker -Name ResponseSha256 -Value $responseHash
         Set-ItemProperty -LiteralPath $marker -Name AgentSha256 -Value (Get-FileHash -LiteralPath $exe).Hash
         Set-ItemProperty -LiteralPath $marker -Name ConfigSha256 -Value (Get-FileHash -LiteralPath $config).Hash
+        Set-ItemProperty -LiteralPath $marker -Name OptionsSha256 -Value (Get-FileHash -LiteralPath $internalOptions).Hash
+        Assert-AdministrativePath $clientKeys -Private
+        [IO.File]::WriteAllText($clientKeys, "$keyLine`n", $utf8)
         Set-ItemProperty -LiteralPath $marker -Name ClientKeySha256 -Value (Get-FileHash -LiteralPath $clientKeys).Hash
         Set-ItemProperty -LiteralPath $marker -Name ManagerIPv4 -Value $ManagerIPv4
         Set-ItemProperty -LiteralPath $marker -Name InstallState -Value 'Installed'
+        $complete = $true
     } finally {
-        if (Test-Path -LiteralPath $staged) { Remove-Item -LiteralPath $staged }
-        if (-not (Test-Path -LiteralPath $marker)) { Remove-Item -LiteralPath $code }
+        if (($complete -or -not $msiAttempted) -and (Test-Path -LiteralPath $staged)) {
+            Remove-Item -LiteralPath $staged
+        }
     }
     [pscustomobject]@{ Installed = $true; Changed = $true; Service = $serviceName }
 } finally {
-    if ($held) { $mutex.ReleaseMutex() }
-    $mutex.Dispose()
+    $lock.Dispose()
 }
