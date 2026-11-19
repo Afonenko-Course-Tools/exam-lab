@@ -143,6 +143,21 @@ function Set-FixtureSecurity($Item, $Acl) {
     else { [IO.File]::SetAccessControl($Item.Path,$Acl) }
 }
 
+function Initialize-FixtureAcl([string]$Path, [bool]$Directory) {
+    # Вызов только на новых синтетических объектах до фиксации исходного состояния.
+    $inheritance = 'None'
+    if ($Directory) { $inheritance = 'ObjectInherit,ContainerInherit' }
+    $acl = Get-Security $Path $Directory
+    $acl.SetAccessRule((New-Rule $users ReadAndExecute $inheritance None Allow))
+    Set-FixtureSecurity ([pscustomobject]@{Path=$Path; Directory=$Directory}) $acl
+    $persisted = Get-Security $Path $Directory
+    $descriptor = [Security.AccessControl.RawSecurityDescriptor]::new($persisted.GetSecurityDescriptorSddlForm($sections))
+    if (-not $persisted.AreAccessRulesProtected -or
+        -not ($descriptor.ControlFlags -band [Security.AccessControl.ControlFlags]::DiscretionaryAclAutoInherited)) {
+        throw "Windows не подтвердила исходные флаги DACL нового объекта: $Path"
+    }
+}
+
 function Write-Result([string]$Result, $Detail) {
     [pscustomobject]@{RunId=$RunId; Action=$Action; Result=$Result; Utc=[DateTime]::UtcNow.ToString('o');
         ElapsedMs=$timer.ElapsedMilliseconds; Detail=$Detail} | ConvertTo-Json -Depth 8
@@ -178,11 +193,14 @@ if ($Action -eq 'Prepare') {
     $existing = [ordered]@{SystemRoot=$rootMarker}
     $future = [ordered]@{}
     New-Marker $rootMarker $false
+    Initialize-FixtureAcl $rootMarker $false
     foreach ($key in $folders.Keys) {
         $path = $folders[$key]
         [void][IO.Directory]::CreateDirectory($path,(New-FixtureAcl $true $true))
+        Initialize-FixtureAcl $path $true
         $existing[$key] = Join-Path $path 'existing.txt'
         New-Marker $existing[$key] $false
+        Initialize-FixtureAcl $existing[$key] $false
         $future[$key] = Join-Path $path 'new.txt'
     }
     $items = @($existing.Values | ForEach-Object { Get-Metadata $_ $false }) +
@@ -190,7 +208,8 @@ if ($Action -eq 'Prepare') {
     $plan = [pscustomobject]@{RunId=$RunId; LocalSids=@($local | ForEach-Object { $_.SID.Value });
         Existing=$existing; Future=$future; Items=$items}
     Write-PrivateJson $planPath $plan
-    Write-Result 'Prepared' @{Existing=$existing; Future=$future; Parents=$parents; DataVolume=([bool]$DataRoot)}
+    Write-Result 'Prepared' @{Existing=$existing; Future=$future; Parents=$parents;
+        DataVolume=([bool]$DataRoot); AutoInheritedFixtureCount=$items.Count}
     return
 }
 
