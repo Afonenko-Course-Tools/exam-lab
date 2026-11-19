@@ -1,7 +1,7 @@
 ﻿#Requires -Version 5.1
 [CmdletBinding()]
 param(
-    [ValidateSet('Install', 'StartCollection', 'StopCollection')]
+    [ValidateSet('Install', 'UpdateInstalledRunner', 'StartCollection', 'StopCollection')]
     [string]$Action = 'Install',
     [string]$MsiPath,
     [string]$ManagerIPv4,
@@ -31,6 +31,8 @@ $knownResponses = @('5204BFBE48B4AD6846133ADC40D96544B717F9B0887B406DC5766F9040C
     'D1A4E87C6A154C7888D5847E9C2D5958AACE45A31DBFCB2C7AF23BC58AD95F64')
 $adminSids = @('S-1-5-18', 'S-1-5-32-544')
 $trustedSids = $adminSids + @(Get-LocalGroupMember -SID 'S-1-5-32-544' | ForEach-Object { $_.SID.Value })
+$trustedInstallerSid = 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464'
+$previousRunnerSha256 = 'EE78FF7A7C7997FEB7BE809AC8AC4D6FF84BCFD8E4A4DE9C7EAF5507D32A3AB3'
 $utf8 = [Text.UTF8Encoding]::new($false)
 
 function Assert-NoReparse([string]$Path) {
@@ -41,7 +43,7 @@ function Assert-NoReparse([string]$Path) {
     }
 }
 
-function Assert-AdministrativePath([string]$Path, [switch]$Private) {
+function Assert-AdministrativePath([string]$Path, [switch]$Private, [switch]$AllowTrustedInstaller) {
     Assert-NoReparse $Path
     $acl = Get-Acl -LiteralPath $Path
     if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -notin $trustedSids) {
@@ -52,6 +54,7 @@ function Assert-AdministrativePath([string]$Path, [switch]$Private) {
         [Security.AccessControl.FileSystemRights]::TakeOwnership
     foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
         if ($rule.AccessControlType -ne 'Allow' -or $rule.IdentityReference.Value -in $trustedSids) { continue }
+        if ($AllowTrustedInstaller -and $rule.IsInherited -and $rule.IdentityReference.Value -eq $trustedInstallerSid) { continue }
         if ($rule.IdentityReference.Value -eq 'S-1-3-0' -and
             ($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly)) { continue }
         if ($Private -or ($rule.FileSystemRights -band $writeAccess)) { throw "Небезопасный доступ: $Path." }
@@ -78,20 +81,22 @@ function Assert-NoExistingAgent {
     }
 }
 
-function Assert-OwnedInstallation($State, [switch]$CheckCollection) {
+function Assert-OwnedInstallation($State, [switch]$CheckCollection, [string]$RunnerSha256) {
     if ($State.InstallState -cne 'Installed') {
         throw 'Подготовка Wazuh прервана. Проверьте состояние MSI и службы перед повтором.'
     }
     $service = Get-AgentService
     Assert-AgentService $service
     if ($service.StartMode -ne 'Manual') { throw 'Изменён режим запуска WazuhSvc.' }
+    if (-not $RunnerSha256) { $RunnerSha256 = $State.SourceSha256 }
     $files = @(
-        @{ Path = $installedScript; Hash = $State.SourceSha256 },
+        @{ Path = $installedScript; Hash = $RunnerSha256 },
         @{ Path = $exe; Hash = $State.AgentSha256 }
     )
     Assert-AdministrativePath $agent
     if ($CheckCollection) {
         Assert-AdministrativePath (Split-Path -Parent $response)
+        Assert-AdministrativePath $clientKeys -Private
         $files += @(
             @{ Path = $config; Hash = $State.ConfigSha256 },
             @{ Path = $internalOptions; Hash = $State.OptionsSha256 },
@@ -153,16 +158,53 @@ try { $lock = [IO.File]::Open($lockPath, 'OpenOrCreate', 'ReadWrite', 'None') }
 catch { throw 'Не удалось получить исключительный доступ к выделенной установке Wazuh.' }
 try {
     $state = if (Test-Path -LiteralPath $marker) { Get-ItemProperty -LiteralPath $marker }
+    if ($Action -eq 'UpdateInstalledRunner') {
+        $service = Get-AgentService
+        if ($null -eq $state -or $state.InstallState -cne 'Installed' -or $null -eq $service -or $service.State -ne 'Stopped') {
+            throw 'Обновление сценария требует завершённой установки и остановленного WazuhSvc.'
+        }
+        Assert-AdministrativePath $installedScript -Private
+        $incomingHash = (Get-FileHash -LiteralPath $PSCommandPath).Hash
+        $installedHash = (Get-FileHash -LiteralPath $installedScript).Hash
+        if ($state.SourceSha256 -ceq $incomingHash -and $installedHash -ceq $incomingHash) {
+            Assert-OwnedInstallation $state -CheckCollection
+            [pscustomobject]@{ Installed = $true; Changed = $false; SourceSha256 = $incomingHash }
+            return
+        }
+        # Точный переход с прогона eec71eb. Старый маркер с новым файлом допустим после прерывания замены.
+        if ($state.SourceSha256 -cne $previousRunnerSha256 -or
+            ($installedHash -cne $previousRunnerSha256 -and $installedHash -cne $incomingHash)) {
+            throw 'Версия установленного сценария не соответствует этой поправке Wazuh.'
+        }
+        Assert-OwnedInstallation $state -CheckCollection -RunnerSha256 $installedHash
+        if ($installedHash -cne $incomingHash) {
+            $temp = Join-Path $code ('runner-{0}.tmp' -f [Guid]::NewGuid())
+            $backup = [IO.Path]::ChangeExtension($temp, '.bak')
+            try {
+                [IO.File]::Copy($PSCommandPath, $temp)
+                if ((Get-FileHash -LiteralPath $temp).Hash -cne $incomingHash) { throw 'Файл обновления изменился.' }
+                [IO.File]::Replace($temp, $installedScript, $backup)
+            } finally {
+                [IO.File]::Delete($temp)
+                [IO.File]::Delete($backup)
+            }
+        }
+        if ((Get-FileHash -LiteralPath $installedScript).Hash -cne $incomingHash) { throw 'Не совпал хеш после замены.' }
+        Set-ItemProperty -LiteralPath $marker -Name SourceSha256 -Value $incomingHash
+        Assert-OwnedInstallation (Get-ItemProperty -LiteralPath $marker) -CheckCollection
+        if ((Get-AgentService).State -ne 'Stopped') { throw 'Служба изменилась во время обновления.' }
+        [pscustomobject]@{ Installed = $true; Changed = $true; SourceSha256 = $incomingHash }
+        return
+    }
     if ($Action -ne 'Install') {
         if ($null -eq $state -or $PSCommandPath -ine $installedScript) {
             throw 'Действие доступно из установленного сценария выделенного агента Wazuh.'
         }
         if ($Action -eq 'StartCollection') {
             Assert-OwnedInstallation $state -CheckCollection
-            Assert-AdministrativePath $clientKeys -Private
             $alertCode = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'ExamLabAlert'
-            Assert-AdministrativePath $alertCode
-            Assert-AdministrativePath (Join-Path $alertCode 'ExamLabAlert.ps1')
+            Assert-AdministrativePath $alertCode -AllowTrustedInstaller
+            Assert-AdministrativePath (Join-Path $alertCode 'ExamLabAlert.ps1') -AllowTrustedInstaller
             if (-not (Test-Path -LiteralPath 'HKLM:\SOFTWARE\ExamLabAlertPilot')) {
                 throw 'Сначала инициализируйте локальный приёмник оповещения.'
             }
