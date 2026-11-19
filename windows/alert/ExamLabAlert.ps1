@@ -1,11 +1,15 @@
 ﻿[CmdletBinding()]
 param(
     [Parameter(Mandatory)]
-    [ValidateSet('Initialize','Arm','Signal','Receive','Acknowledge','Disarm')]
+    [ValidateSet('Initialize','Arm','Signal','SignalFromAudit','Receive','Acknowledge','Disarm')]
     [string]$Action,
     [string]$GuestSid,
     [int]$GuestSessionId,
-    [guid]$RunId
+    [guid]$RunId,
+    [long]$AuditRecordId,
+    [long]$AuditBaseline,
+    [string]$CanaryPath,
+    [string]$GuestLogonId
 )
 
 $ErrorActionPreference = 'Stop'
@@ -153,6 +157,7 @@ try {
             $state = [ordered]@{
                 RunId = [guid]::NewGuid().ToString('D')
                 Phase = 'Armed'
+                ArmedUtc = [DateTimeOffset]::UtcNow.ToString('o')
                 GuestSid = $sid.Value
                 SessionId = $GuestSessionId
                 EventRecordId = 0L
@@ -170,12 +175,31 @@ try {
                 throw
             }
         }
-        'Signal' {
-            if ($null -eq $state -or $state.Phase -ne 'Armed' -or $state.EventRecordId -ne 0) {
+        { $_ -in 'Signal', 'SignalFromAudit' } {
+            if ($null -eq $state -or $state.Phase -ne 'Armed' -or
+                $state.EventRecordId -ne 0 -or $state.SecurityReadRecordId) {
                 throw 'Ожидается одна новая проба в фазе Armed.'
             }
             if (-not (Test-GuestDesktop $state.GuestSid $state.SessionId)) {
                 throw 'Сеанс Guest для контрольного события больше не открыт.'
+            }
+            if ($Action -eq 'SignalFromAudit') {
+                if ($state.RunId -ne $RunId.ToString('D') -or -not $state.ArmedUtc -or $AuditBaseline -le 0 -or
+                    $AuditRecordId -le $AuditBaseline -or $GuestLogonId -notmatch '^0x[0-9a-f]+$' -or
+                    $CanaryPath -notmatch '^[A-Z]:\\') {
+                    throw 'Укажите текущий запуск, полный путь, журнал до пробы, новую запись и идентификатор входа Guest.'
+                }
+                $audit = Get-WinEvent -LogName Security -FilterXPath (
+                    "*[System[Provider[@Name='Microsoft-Windows-Security-Auditing'] and EventID=4663 and EventRecordID=$AuditRecordId]]"
+                ) -MaxEvents 1
+                . (Join-Path $PSScriptRoot 'Test-ExamLabFileReadAudit.ps1')
+                if (-not (Test-ExamLabFileReadAudit -EventXml ([xml]$audit.ToXml()) -Path $CanaryPath -Sid $state.GuestSid -LogonId $GuestLogonId -ArmedUtc ([DateTimeOffset]$state.ArmedUtc) -NowUtc ([DateTimeOffset]::UtcNow))) {
+                    throw 'Запись Security не подтверждает недавнее чтение контрольного файла текущим Guest.'
+                }
+                $state | Add-Member -NotePropertyName SecurityReadRecordId -NotePropertyValue $AuditRecordId -Force
+                # Зафиксировать попытку до записи 6101. После сбоя этот запуск
+                # нельзя повторить, даже если EventRecordId ещё не сохранён.
+                Save-State $state
             }
             $nonce = [guid]::NewGuid().ToString('D')
             Write-EventLog -LogName Application -Source $source -EventId $signalEventId -EntryType Warning -Message $nonce
