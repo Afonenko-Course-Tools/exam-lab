@@ -1,0 +1,44 @@
+#cloud-config
+hostname: exam-lab-pilot
+manage_etc_hosts: true
+ssh_pwauth: false
+disable_root: true
+users:
+  - name: examadmin
+    groups: [sudo]
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    lock_passwd: true
+    ssh_authorized_keys:
+      - REPLACE_WITH_OPERATOR_PUBLIC_KEY
+write_files:
+  - path: /etc/nftables.conf
+    permissions: '0600'
+    content: |
+      #!/usr/sbin/nft -f
+      destroy table inet exam_ingress
+      table inet exam_ingress {
+        chain published_ingress {
+          type filter hook prerouting priority -150; policy accept;
+          iifname "eth0" fib daddr type local jump allow_pilot
+        }
+        chain input {
+          type filter hook input priority filter; policy drop;
+          iifname "lo" accept
+          jump allow_pilot
+        }
+        chain allow_pilot {
+          ct state established,related accept
+          ip saddr 192.0.2.10 tcp dport 22 accept
+          ip saddr 192.0.2.10 icmp type echo-request accept
+          drop
+        }
+      }
+runcmd:
+  - |
+      set -eu
+      /usr/sbin/nft -c -f /etc/nftables.conf
+      systemctl enable --now nftables
+      /usr/sbin/nft list table inet exam_ingress >/dev/null
+      printf 'EXAMLAB_FIREWALL_READY\n' >/dev/ttyS0
+      printf 'EXAMLAB_HOSTKEY: %s\n' "$(cut -d ' ' -f1,2 /etc/ssh/ssh_host_ed25519_key.pub)" >/dev/ttyS0
