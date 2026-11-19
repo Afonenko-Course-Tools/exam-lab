@@ -33,20 +33,45 @@
    Проверьте прочитанное правило перед началом. После пробы прочтите
    свежий ACL, вызовите `RemoveAuditRuleSpecific($auditRule)` и запишите ACL.
    Сверьте удаление пробной ACE и сохранение остальных записей.
-4. В настоящем Guest запишите SID, номер сеанса и шестнадцатеричный
-   идентификатор входа, который сопоставляется с `SubjectLogonId` события
-   Security. Считайте все три значения в одном PowerShell, запущенном
-   с рабочего стола Guest, и повторите их получение после смены входа.
-   Используйте этот же PowerShell для контрольного чтения:
+4. В настоящем Guest прочтите SID пользователя и номер сеанса в обычном
+   PowerShell. Оставьте этот PowerShell открытым и выполните контрольное
+   чтение файла именно в нём, без смены пользователя или повышения прав.
 
    ```powershell
    [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
    [Diagnostics.Process]::GetCurrentProcess().SessionId
-   $logonSid = [regex]::Match((whoami /logonid | Out-String), 'S-1-5-5-(\d+)-(\d+)')
-   if (-not $logonSid.Success) { throw 'Идентификатор входа Guest не найден.' }
-   $hex = ('{0:x8}{1:x8}' -f [uint32]$logonSid.Groups[1].Value, [uint32]$logonSid.Groups[2].Value)
-   '0x' + $hex.TrimStart('0')
    ```
+
+   Идентификатор для `SubjectLogonId` возьмите из `AuthenticationId`
+   токена этого консольного входа. Для этого используйте установленный
+   модуль контроллера из той же проверенной поставки. Администратор
+   сохраняет следующий одноразовый сценарий в защищённом
+   `C:\Program Files\ExamLabAlert\Private` и запускает его штатным
+   планировщиком от LocalSystem (`S-1-5-18`) в 64-битном Windows
+   PowerShell 5.1. Файл сценария и новый файл результата должны быть
+   доступны для записи только SYSTEM и администраторам. Предыдущий
+   файл результата перед запуском удалите.
+
+   ```powershell
+   $ErrorActionPreference = 'Stop'
+   Import-Module 'C:\Program Files\ExamLab\ExamLab.Controller.psm1' -Force
+   $console = Get-ControllerConsoleLogon
+   if (-not $console -or -not $console.AuthenticationId) {
+       throw 'Не получен токен текущего консольного входа.'
+   }
+   [pscustomobject]@{
+       Sid = $console.Sid
+       SessionId = $console.SessionId
+       LogonId = '0x{0:x}' -f [uint64]$console.AuthenticationId
+   } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $PSScriptRoot 'canary-console-logon.json') -Encoding UTF8
+   ```
+
+   Убедитесь, что задача завершилась с кодом 0 и SID с номером сеанса
+   в свежем файле совпали с выводом PowerShell Guest. Передайте `LogonId`
+   как `$guestLogonId` наблюдателю из шага 5. При смене входа получите
+   значения заново. После считывания удалите одноразовую задачу, сценарий
+   и файл результата. Вывод `whoami /logonid` в пробе не совпал с
+   `SubjectLogonId` события Security и для этой сверки не используется.
 
 5. Администратор выполняет `Arm` для SID и сеанса, проверяет подключение
    выделенного агента Wazuh и фиксирует текущий номер записи Security.
@@ -86,3 +111,13 @@
 истечения указанного времени. Такой режим предназначен для контролируемой
 пробы. Подтверждение преподавателя использует существующий сценарий
 оповещения и его требования к защищённому запросу UAC.
+
+## Результат на изолированной VM 19 ноября 2026 года
+
+Две первые попытки зарегистрировали успешное `ReadData` в Security.
+Значение из `whoami /logonid` отличалось от `SubjectLogonId`.
+Сценарий отклонил обе записи, и событий 6101 не было. С идентификатором
+из токена консольного входа настоящее чтение Guest дало запись Security
+4663 №3324, затем Application 6101 №222 и ровно одну тревогу Wazuh
+110610 у агента 001. Полноэкранное окно открылось в том же Guest и осталось
+на переднем плане при `Alt+Tab`.
