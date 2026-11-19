@@ -14,6 +14,7 @@ $assignment=ConvertTo-ControllerAssignment $exam 'lab-01'
 $normal=ConvertTo-ControllerAssignment '{"deviceId":"lab-01","revision":3,"mode":"normal","examId":null}' 'lab-01'
 if ($assignment.revision -ne 2 -or $assignment.examId -cne 'Run-A' -or $null -ne $normal.examId) { throw 'FAIL: корректные ответы' }
 Assert-Rejected 'повторяющийся JSON-ключ' { ConvertTo-ControllerAssignment ($exam.Replace('"revision":2','"revision":1,"revision":2')) 'lab-01' }
+Assert-Rejected 'запятая после последнего значения' { ConvertTo-ControllerAssignment ($exam.TrimEnd('}')+',}') 'lab-01' }
 Assert-Rejected 'массив вместо объекта' { ConvertTo-ControllerAssignment "[$exam]" 'lab-01' }
 Assert-Rejected 'другой регистр идентификатора ПК' { ConvertTo-ControllerAssignment $exam 'LAB-01' }
 Assert-Rejected 'строка на месте целой ревизии' { ConvertTo-ControllerAssignment ($exam.Replace(':2,',':"2",')) 'lab-01' }
@@ -30,6 +31,15 @@ if ((Compare-ControllerAssignment $assignment $assignment) -cne 'repeat' -or
 $temporary=Join-Path ([IO.Path]::GetTempPath()) ('exam-lab-controller-'+[Guid]::NewGuid().ToString('N'))
 try {
     New-Item -ItemType Directory -Path $temporary | Out-Null
+    $registration=Join-Path $temporary 'enrollment.json'
+    $token='a'*43
+    $validRegistration='{"url":"https://controller.test:21650/exam/v1/poll","deviceId":"lab-01","token":"'+$token+'"}'
+    [IO.File]::WriteAllText($registration,$validRegistration)
+    if ((Read-ControllerConfiguration $registration).deviceId -cne 'lab-01') { throw 'FAIL: файл регистрации' }
+    [IO.File]::WriteAllText($registration,$validRegistration.Replace('"url"','"url":"https://other.test/exam/v1/poll","url"'))
+    Assert-Rejected 'двусмысленный адрес в приватной регистрации' { Read-ControllerConfiguration $registration }
+    [IO.File]::WriteAllText($registration,($validRegistration.TrimEnd('}')+',}'))
+    Assert-Rejected 'лишняя запятая в приватной регистрации' { Read-ControllerConfiguration $registration }
     $path=Join-Path $temporary 'controller-state.json'
     $state=Read-ControllerState $path
     if ($null -ne $state.Assignment -or $null -ne $state.Result) { throw 'FAIL: начальное состояние' }

@@ -18,15 +18,49 @@ function ConvertFrom-ControllerJson([string]$Json) {
     return $value
 }
 
+function Read-ControllerFlatFields([string]$Json, [string[]]$Names) {
+    # JSON reader .NET допускает запятую после последнего свойства.
+    # Контракт принимает плоский объект только с объявленными свойствами.
+    if ($Json -cmatch ',[ \t\r\n]*}[ \t\r\n]*\z') { throw 'invalid-object' }
+    if (-not ('System.Runtime.Serialization.Json.JsonReaderWriterFactory' -as [type])) {
+        Add-Type -AssemblyName System.Runtime.Serialization
+    }
+    $bytes = [Text.Encoding]::UTF8.GetBytes($Json)
+    $quotas = [Xml.XmlDictionaryReaderQuotas]::new()
+    $quotas.MaxDepth = 3
+    $reader = [Runtime.Serialization.Json.JsonReaderWriterFactory]::CreateJsonReader($bytes, $quotas)
+    try {
+        $document = [Xml.XmlDocument]::new()
+        $document.Load($reader)
+    } finally { $reader.Dispose() }
+    $root = $document.DocumentElement
+    if ($root.GetAttribute('type') -cne 'object' -or $root.ChildNodes.Count -ne $Names.Count) { throw 'invalid-assignment' }
+    # Обычный ConvertFrom-Json теряет повторяющиеся ключи; сохраняем их для проверки.
+    $fields = [Collections.Generic.Dictionary[string,Xml.XmlElement]]::new([StringComparer]::Ordinal)
+    foreach ($node in $root.ChildNodes) { $fields.Add($node.Name, $node) }
+    foreach ($name in $Names) {
+        if (-not $fields.ContainsKey($name)) { throw 'invalid-object' }
+    }
+    return ,$fields
+}
+
 function Read-ControllerConfiguration([string]$Path) {
     try {
         $file = Get-Item -LiteralPath $Path
         if ($file -isnot [IO.FileInfo] -or $file.Length -gt 4096) { throw 'Некорректный файл' }
-        $configuration = ConvertFrom-ControllerJson ([IO.File]::ReadAllText($file.FullName))
-        if (-not (Test-ControllerFields $configuration @('url','deviceId','token')) -or
-            $configuration.deviceId -isnot [string] -or $configuration.deviceId -cnotmatch '\A[A-Za-z0-9._-]{1,64}\z' -or
-            $configuration.token -isnot [string] -or $configuration.token -cnotmatch '\A[A-Za-z0-9_-]{43}\z' -or
-            $configuration.url -isnot [string] -or $configuration.url -cnotmatch '\Ahttps://[^/?#@\s\\]+/exam/v1/poll\z') {
+        $names = @('url','deviceId','token')
+        $fields = Read-ControllerFlatFields ([IO.File]::ReadAllText($file.FullName)) $names
+        foreach ($name in $names) {
+            if ($fields[$name].GetAttribute('type') -cne 'string') { throw 'Некорректный тип поля' }
+        }
+        $configuration = [pscustomobject]@{
+            url=$fields['url'].InnerText
+            deviceId=$fields['deviceId'].InnerText
+            token=$fields['token'].InnerText
+        }
+        if ($configuration.deviceId -cnotmatch '\A[A-Za-z0-9._-]{1,64}\z' -or
+            $configuration.token -cnotmatch '\A[A-Za-z0-9_-]{43}\z' -or
+            $configuration.url -cnotmatch '\Ahttps://[^/?#@\s\\]+/exam/v1/poll\z') {
             throw 'Некорректные поля'
         }
         $uri = [Uri]::new($configuration.url, [UriKind]::Absolute)
@@ -43,22 +77,7 @@ function Read-ControllerConfiguration([string]$Path) {
 
 function ConvertTo-ControllerAssignment([string]$Json, [string]$DeviceId) {
     try {
-        if (-not ('System.Runtime.Serialization.Json.JsonReaderWriterFactory' -as [type])) {
-            Add-Type -AssemblyName System.Runtime.Serialization
-        }
-        $bytes = [Text.Encoding]::UTF8.GetBytes($Json)
-        $quotas = [Xml.XmlDictionaryReaderQuotas]::new()
-        $quotas.MaxDepth = 3
-        $reader = [Runtime.Serialization.Json.JsonReaderWriterFactory]::CreateJsonReader($bytes, $quotas)
-        try {
-            $document = [Xml.XmlDocument]::new()
-            $document.Load($reader)
-        } finally { $reader.Dispose() }
-        $root = $document.DocumentElement
-        if ($root.GetAttribute('type') -cne 'object' -or $root.ChildNodes.Count -ne 4) { throw 'invalid-assignment' }
-        # Обычный ConvertFrom-Json теряет повторяющиеся ключи; сохраняем их для проверки.
-        $fields = [Collections.Generic.Dictionary[string,Xml.XmlElement]]::new([StringComparer]::Ordinal)
-        foreach ($node in $root.ChildNodes) { $fields.Add($node.Name, $node) }
+        $fields = Read-ControllerFlatFields $Json @('deviceId','revision','mode','examId')
         $mode = $fields['mode'].InnerText
         $examType = $fields['examId'].GetAttribute('type')
         $examId = $fields['examId'].InnerText
