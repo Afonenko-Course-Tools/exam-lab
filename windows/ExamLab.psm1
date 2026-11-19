@@ -628,20 +628,27 @@ function Set-ExamLabMode {
 
 function Get-ExamLabActiveGuest([DateTime]$Boot) {
     $logon = Get-ControllerConsoleLogon
-    if (-not $logon -or $logon.Sid -cnotmatch '\AS-1-5-21-[0-9]+-[0-9]+-[0-9]+-[0-9]+\z') { return }
+    if (-not $logon -or $logon.Sid -cnotmatch '\AS-1-5-21-[0-9]+-[0-9]+-[0-9]+-[0-9]+\z') {
+        return [pscustomobject]@{Logon=$null; Status='ConsoleLogonUnconfirmed'}
+    }
     $account = Get-LocalUser -SID ([Security.Principal.SecurityIdentifier]::new($logon.Sid))
     # Префикс наблюдался у временных учётных записей на эталонной Windows.
     # Запись аудита дополнительно связывает имя и SID с созданием от SYSTEM.
     if (-not $account.Enabled -or $account.Name -cnotmatch '\Ashpctac[0-9a-f]{5}\z' -or
-        $logon.Sid -cin @(Get-LocalGroupMember -SID 'S-1-5-32-544' | ForEach-Object {$_.SID.Value})) { return }
+        $logon.Sid -cin @(Get-LocalGroupMember -SID 'S-1-5-32-544' | ForEach-Object {$_.SID.Value})) {
+        return [pscustomobject]@{Logon=$null; Status='GuestAccountUnconfirmed'}
+    }
     $filter = "*[System[Provider[@Name='Microsoft-Windows-Security-Auditing'] and EventID=4720] and " +
         "EventData[Data[@Name='TargetSid']='$($logon.Sid)' and Data[@Name='TargetUserName']='$($account.Name)' and Data[@Name='SubjectUserSid']='S-1-5-18']]"
     $created = Get-WinEvent -LogName Security -FilterXPath $filter -MaxEvents 1 -ErrorAction SilentlyContinue
-    if ($created -and $created.TimeCreated.ToUniversalTime() -ge $Boot) { return $logon }
+    if (-not $created -or $created.TimeCreated.ToUniversalTime() -lt $Boot) {
+        return [pscustomobject]@{Logon=$null; Status='GuestCreationUnconfirmed'}
+    }
+    return [pscustomobject]@{Logon=$logon; Status='GuestCandidate'}
 }
 
 function Get-ExamLabControllerObservation($Configuration, $Snapshot, [DateTime]$Boot, [string]$BootUtc) {
-    $observation = [pscustomobject]@{Result=$Snapshot.Result; Readiness=$null}
+    $observation = [pscustomobject]@{Result=$Snapshot.Result; Readiness=$null; GuestObservation=$null}
     if (-not $Snapshot.Result) { return $observation }
     $readiness = [pscustomobject]@{
         revision=$Snapshot.Result.revision; bootUtc=$BootUtc; observedUtc=(Get-ControllerUtc)
@@ -669,7 +676,11 @@ function Get-ExamLabControllerObservation($Configuration, $Snapshot, [DateTime]$
         Assert-SafePath $script:ControllerProbeOptIn
         if ([IO.File]::ReadAllText($script:ControllerProbeOptIn) -cne 'true') { return $observation }
         $guest = $null
-        try { $guest = Get-ExamLabActiveGuest $Boot } catch { }
+        try {
+            $guestCandidate = Get-ExamLabActiveGuest $Boot
+            $guest = $guestCandidate.Logon
+            $observation.GuestObservation = $guestCandidate.Status
+        } catch { $observation.GuestObservation = 'GuestObservationUnavailable' }
         $guestSid = if ($guest) { $guest.Sid }
         $context = Read-Context -ObservedGuestSid $guestSid
         $status = Get-Status $context
@@ -680,14 +691,19 @@ function Get-ExamLabControllerObservation($Configuration, $Snapshot, [DateTime]$
         }
 
         $guestSessionId = $null
-        if ($guest -and $guestSid -cnotin @($context.Config.OrdinaryAccounts.Sid)) {
-            try {
-                $current = Get-ControllerConsoleLogon
-                if ($current -and $current.Sid -ceq $guest.Sid -and $current.SessionId -eq $guest.SessionId -and
-                    $current.AuthenticationId -eq $guest.AuthenticationId) {
-                    $guestSessionId = Get-ControllerGuestSessionId $Configuration.token $BootUtc $current
-                }
-            } catch { }
+        if ($guest) {
+            if ($guestSid -cin @($context.Config.OrdinaryAccounts.Sid)) {
+                $observation.GuestObservation = 'GuestListedAsOrdinary'
+            } else {
+                try {
+                    $current = Get-ControllerConsoleLogon
+                    if ($current -and $current.Sid -ceq $guest.Sid -and $current.SessionId -eq $guest.SessionId -and
+                        $current.AuthenticationId -eq $guest.AuthenticationId) {
+                        $guestSessionId = Get-ControllerGuestSessionId $Configuration.token $BootUtc $current
+                        $observation.GuestObservation = 'GuestObserved'
+                    } else { $observation.GuestObservation = 'ConsoleLogonChanged' }
+                } catch { $observation.GuestObservation = 'GuestObservationUnavailable' }
+            }
         }
         $observed = Get-ControllerUtc
         if ([StringComparer]::Ordinal.Compare($observed, $BootUtc) -lt 0) { return $observation }
@@ -716,7 +732,7 @@ function Invoke-ExamLabControllerLoop {
     $health = [pscustomobject]@{
         BootUtc=$bootUtc; FirstAttemptUtc=$null; LastAttemptUtc=$null
         FirstValidContactUtc=$null; LastValidContactUtc=$null; Status='Starting'; Reason=$null; ActionDetail=$null
-        Readiness=$null
+        Readiness=$null; GuestObservation=$null
     }
     if (Test-ExistingFile $script:ControllerHealthFile) {
         Assert-SafePath $script:ControllerHealthFile
@@ -733,6 +749,7 @@ function Invoke-ExamLabControllerLoop {
             $health.LastAttemptUtc = Get-ControllerUtc
             $health.ActionDetail = $null
             $health.Readiness = $null
+            $health.GuestObservation = $null
             if (-not $health.FirstAttemptUtc) { $health.FirstAttemptUtc = $health.LastAttemptUtc }
             Write-ControllerJson $script:ControllerHealthFile $health
             try {
@@ -754,6 +771,7 @@ function Invoke-ExamLabControllerLoop {
                 $health.Reason=$null
                 if ($observation.Readiness -and $observation.Readiness.revision -eq $assignment.revision) {
                     $health.Readiness = $observation.Readiness
+                    $health.GuestObservation = $observation.GuestObservation
                 }
                 Write-ControllerJson $script:ControllerHealthFile $health
                 try {
