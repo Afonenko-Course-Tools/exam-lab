@@ -212,8 +212,8 @@ try {
             throw 'SHA-512 MSI Wazuh 4.14.10-1 не совпадает.'
         }
         $signature = Get-AuthenticodeSignature -LiteralPath $staged
-        if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.GetNameInfo('SimpleName', $false) -ne 'Wazuh Inc.') {
-            throw 'Ожидается действительная подпись Wazuh Inc. на MSI.'
+        if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.GetNameInfo('SimpleName', $false) -cne 'Wazuh, Inc') {
+            throw 'Ожидается действительная подпись Wazuh, Inc на MSI.'
         }
         [void](New-Item -Path $marker)
         Set-ItemProperty -LiteralPath $marker -Name InstallState -Value 'Preparing'
