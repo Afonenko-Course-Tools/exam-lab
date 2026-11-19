@@ -2,6 +2,7 @@ import argparse
 from contextlib import closing
 from datetime import datetime, timezone
 import hashlib
+from html import escape
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -10,9 +11,12 @@ from pathlib import Path
 import re
 import secrets
 import sqlite3
+import stat
 
 
 POLL_PATH = "/exam/v1/poll"
+TEACHER_PATH = "/exam/teacher/readiness"
+TEACHER_PROXY_HEADER = "X-Exam-Teacher-Proxy"
 MAX_BODY = 4096
 MAX_REVISION = 2_147_483_647
 READINESS_TIMEOUT = 45
@@ -21,6 +25,7 @@ IDENTIFIER = re.compile(r"[A-Za-z0-9._-]{1,64}")
 REASON = re.compile(r"[a-z0-9-]{1,64}")
 UTC_MILLIS = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z")
 BEARER = re.compile(r"Bearer ([A-Za-z0-9_-]{43})", re.IGNORECASE | re.ASCII)
+TEACHER_PROXY_TOKEN = re.compile(r"[0-9a-f]{64}")
 OUTCOMES = ("applied", "source-applied", "blocked", "error", "overridden")
 ASSIGNMENT_FIELDS = {"revision", "mode", "examId"}
 RESULT_FIELDS = ASSIGNMENT_FIELDS | {"outcome", "reason", "fullReady", "observedUtc"}
@@ -150,8 +155,10 @@ def parse_poll(payload):
     return device_id, result, readiness
 
 
-def connect(path, create=False):
+def connect(path, create=False, *, read_only=False):
     mode = "rwc" if create else "rw"
+    if read_only:
+        mode = "ro"
     db = sqlite3.connect(f"{path.as_uri()}?mode={mode}", uri=True)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA foreign_keys=ON")
@@ -382,16 +389,21 @@ def status(db, device_id, stale_after):
     return device_status(db, device, utc_now(), stale_after)
 
 
-def readiness_table(db):
+def readiness_snapshots(db, now):
     db.execute("BEGIN")
-    now = utc_now()
+    return [
+        device_status(db, device, now, READINESS_TIMEOUT)
+        for device in db.execute("SELECT * FROM devices ORDER BY device_id")
+    ]
+
+
+def readiness_table(db):
     rows = [(
         "ПК", "Назначение", "Ревизия", "Связь", "Можно входить", "Можно начинать", "Загрузка UTC", "Guest",
         "Машинная сверка UTC", "Проверка Guest UTC",
     )]
     connection = {"never": "не было", "fresh": "есть", "stale": "устарела"}
-    for device in db.execute("SELECT * FROM devices ORDER BY device_id"):
-        snapshot = device_status(db, device, now, READINESS_TIMEOUT)
+    for snapshot in readiness_snapshots(db, utc_now()):
         readiness = snapshot["readiness"]
         machine = readiness["lastMachineConfirmation"]
         guest = readiness["lastGuestConfirmation"]
@@ -404,6 +416,50 @@ def readiness_table(db):
         ))
     widths = [max(map(len, column)) for column in zip(*rows)]
     return "\n".join("  ".join(value.ljust(width) for value, width in zip(row, widths)).rstrip() for row in rows)
+
+
+def readiness_html(snapshots, now):
+    headings = (
+        "ПК", "Назначение", "Ревизия", "Связь", "Можно входить", "Можно начинать",
+        "Последний опрос UTC", "Последняя машинная сверка UTC", "Последняя проверка Guest UTC",
+    )
+    headers = "".join(f'<th scope="col">{escape(label)}</th>' for label in headings)
+    connection = {"never": "Опросов ещё не было", "fresh": "Есть", "stale": "Нет связи"}
+    rows = []
+    for snapshot in snapshots:
+        active = snapshot["assignment"]
+        readiness = snapshot["readiness"]
+        machine = readiness["lastMachineConfirmation"]
+        guest = readiness["lastGuestConfirmation"]
+        values = (
+            active["examId"] or "Обычный режим", str(active["revision"]), connection[snapshot["connection"]],
+            "Да" if readiness["machineReady"] else "Нет", "Да" if readiness["guestReady"] else "Нет",
+            snapshot["lastSeenUtc"] or "—", machine["receivedUtc"] if machine else "—", guest["confirmedUtc"] if guest else "—",
+        )
+        cells = "".join(f"<td>{escape(value)}</td>" for value in values)
+        rows.append(f'<tr><th scope="row">{escape(snapshot["deviceId"])}</th>{cells}</tr>')
+    table = "".join(rows) or f'<tr><td colspan="{len(headings)}">Нет зарегистрированных ПК</td></tr>'
+    return f"""<!doctype html>
+<html lang="ru">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="5">
+<title>Готовность экзаменационных ПК</title>
+<style>
+  body {{ font: 1rem/1.5 system-ui, sans-serif; margin: 2rem; }}
+  .table {{ overflow-x: auto; }}
+  table {{ border-collapse: collapse; width: 100%; }}
+  td, th {{ border-bottom: 1px solid #a0a8b2; padding: .55rem; text-align: left; }}
+  tbody th {{ overflow-wrap: anywhere; }}
+</style>
+<main>
+  <h1>Готовность экзаменационных ПК</h1>
+  <p>Сводка на <time>{escape(iso_utc(now))}</time></p>
+  <div class="table" role="region" aria-label="Статусы рабочих мест" tabindex="0">
+    <table><thead><tr>{headers}</tr></thead><tbody>{table}</tbody></table>
+  </div>
+</main>
+</html>"""
 
 
 def confirm_guest(db, device_id, revision, boot_utc, guest_session_id):
@@ -440,6 +496,34 @@ class PollHandler(BaseHTTPRequestHandler):
         self.send_response(status_code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        token = getattr(self.server, "teacher_proxy_token", None)
+        proof = self.headers.get_all(TEACHER_PROXY_HEADER, [])
+        if (
+            self.path != TEACHER_PATH or token is None or len(proof) != 1
+            or not valid_code(TEACHER_PROXY_TOKEN, proof[0]) or not secrets.compare_digest(token, proof[0])
+        ):
+            self.reply(HTTPStatus.NOT_FOUND, {"error": "not-found"})
+            return
+        now = utc_now()
+        try:
+            with closing(connect(self.server.db_path, read_only=True)) as db, db:
+                snapshots = readiness_snapshots(db, now)
+        except sqlite3.Error:
+            self.reply(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "database-unavailable"})
+            return
+        body = readiness_html(snapshots, now).encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Language", "ru")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -490,6 +574,21 @@ def private_db_path(path):
     return path
 
 
+def read_teacher_proxy_token(path):
+    flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW
+    with os.fdopen(os.open(path, flags), "rb") as token_file:
+        metadata = os.fstat(token_file.fileno())
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o077 or metadata.st_uid != os.geteuid():
+            raise ValueError("Владелец файла секрета должен совпадать с учётной записью контроллера, права 0600 или строже")
+        try:
+            token = token_file.read(66).decode("ascii").removesuffix("\n")
+        except UnicodeDecodeError:
+            raise ValueError("Недопустимый формат секрета Nginx") from None
+    if not valid_code(TEACHER_PROXY_TOKEN, token):
+        raise ValueError("Недопустимый формат секрета Nginx")
+    return token
+
+
 def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser(description="Контроллер локального стенда exam-lab")
@@ -497,6 +596,7 @@ def main():
     commands = parser.add_subparsers(dest="command", required=True)
     serve_cmd = commands.add_parser("serve", help="Запустить HTTP за локальным Nginx")
     serve_cmd.add_argument("--port", default=21651, type=int, metavar="PORT")
+    serve_cmd.add_argument("--teacher-proxy-token-file", type=Path, metavar="PATH")
     for command in ("register", "rotate-token", "assign", "status", "confirm-guest"):
         commands.add_parser(command).add_argument("device_id")
     commands.add_parser("readiness", help="Показать готовность зарегистрированных ПК")
@@ -545,8 +645,16 @@ def main():
             else:
                 result = status(db, args.device_id, args.stale_after)
         if command == "serve":
+            teacher_proxy_token = None
+            if args.teacher_proxy_token_file:
+                try:
+                    teacher_proxy_token = read_teacher_proxy_token(args.teacher_proxy_token_file)
+                except (OSError, ValueError):
+                    # Ошибка настройки панели оставляет доступным опрос Windows.
+                    pass
             with ThreadingHTTPServer(("127.0.0.1", args.port), PollHandler) as server:
                 server.db_path = path
+                server.teacher_proxy_token = teacher_proxy_token
                 server.serve_forever()
         else:
             print(result if isinstance(result, str) else json.dumps(result, indent=2))

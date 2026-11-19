@@ -10,8 +10,8 @@ import unittest
 from unittest.mock import patch
 
 from server import (
-    MAX_BODY, POLL_PATH, SCHEMA, PollHandler,
-    assign, confirm_guest, connect, iso_utc, parse_utc, readiness_table, register, status, utc_now,
+    MAX_BODY, POLL_PATH, SCHEMA, TEACHER_PATH, TEACHER_PROXY_HEADER, PollHandler,
+    assign, confirm_guest, connect, iso_utc, parse_utc, read_teacher_proxy_token, readiness_table, register, status, utc_now,
 )
 
 
@@ -52,6 +52,16 @@ class ControllerTest(unittest.TestCase):
         if readiness is not None:
             payload["readiness"] = readiness
         return self.send(json.dumps(payload), token or self.token)
+
+    def get(self, path=TEACHER_PATH, *, headers=None):
+        with closing(HTTPConnection(*self.server.server_address, timeout=2)) as client:
+            client.request("GET", path, headers=headers or {})
+            response = client.getresponse()
+            return response.status, dict(response.getheaders()), response.read().decode("utf-8")
+
+    def enable_teacher_panel(self):
+        self.server.teacher_proxy_token = "a" * 64
+        return {TEACHER_PROXY_HEADER: self.server.teacher_proxy_token}
 
     def assign(self, exam_id):
         with closing(connect(self.path)) as db, db:
@@ -353,6 +363,86 @@ class ControllerTest(unittest.TestCase):
         self.assertFalse(stale["machineReady"])
         self.assertFalse(stale["guestReady"])
         self.assertEqual(confirmation, stale["lastGuestConfirmation"])
+
+    def test_teacher_panel_shows_status_and_last_confirmation(self):
+        proof = self.enable_teacher_panel()
+        clock = self.clock("2026-11-19T14:00:15.000Z")
+        exam = self.assign("exam-a")
+        report = {
+            **exam, "outcome": "source-applied", "reason": "machine-policies-only", "fullReady": False,
+            "observedUtc": "2026-11-19T14:00:05.000Z",
+        }
+        evidence = {
+            "revision": exam["revision"], "bootUtc": "2026-11-19T14:00:00.000Z",
+            "observedUtc": "2026-11-19T14:00:15.000Z", "machineReady": True, "guestSessionId": "opaque-guest-id",
+        }
+        self.assertEqual(200, self.poll(report, readiness=evidence)[0])
+        status_code, headers, panel = self.get(headers={**proof, "Authorization": f"Bearer {self.token}"})
+        self.assertEqual(200, status_code)
+        self.assertEqual("text/html; charset=utf-8", headers["Content-Type"])
+        self.assertEqual("ru", headers["Content-Language"])
+        self.assertEqual("no-store", headers["Cache-Control"])
+        self.assertIn("frame-ancestors 'none'", headers["Content-Security-Policy"])
+        self.assertIn('<meta http-equiv="refresh" content="5">', panel)
+        self.assertIn("Можно входить", panel)
+        self.assertIn("Можно начинать", panel)
+        self.assertIn("<td>Есть</td><td>Да</td><td>Нет</td>", panel)
+        self.assertNotIn(self.token, panel)
+        self.assertNotIn(proof[TEACHER_PROXY_HEADER], panel)
+        self.assertNotIn(evidence["guestSessionId"], panel)
+
+        confirmation = self.confirm(evidence)
+        self.assertIn("<td>Есть</td><td>Да</td><td>Да</td>", self.get(headers=proof)[2])
+        clock.return_value += timedelta(seconds=45)
+        panel = self.get(headers=proof)[2]
+        self.assertIn("<td>Нет связи</td><td>Нет</td><td>Нет</td>", panel)
+        self.assertIn(confirmation["confirmedUtc"], panel)
+        self.assertEqual(404, self.send(b"{}", self.token, path=TEACHER_PATH)[0])
+        self.assertEqual(404, self.get(POLL_PATH)[0])
+        self.assertEqual(404, self.get(TEACHER_PATH + "/")[0])
+
+    def test_teacher_panel_escapes_stored_label(self):
+        # Старая БД может содержать метку, записанную вне интерфейса контроллера.
+        unsafe = '<a href="https://example.invalid">ссылка</a>'
+        with closing(connect(self.path)) as db, db:
+            db.execute("UPDATE assignments SET exam_id = ?", (unsafe,))
+        status_code, _, panel = self.get(headers=self.enable_teacher_panel())
+        self.assertEqual(200, status_code)
+        self.assertNotIn(unsafe, panel)
+        self.assertIn("&lt;a href=&quot;https://example.invalid&quot;&gt;ссылка&lt;/a&gt;", panel)
+
+    def test_teacher_panel_requires_exact_proxy_proof_even_on_loopback(self):
+        proof = {TEACHER_PROXY_HEADER: "a" * 64}
+        self.assertEqual(404, self.get(headers=proof)[0])
+        self.enable_teacher_panel()
+        for headers in (None, {TEACHER_PROXY_HEADER: "b" * 64}, {"Authorization": f"Bearer {self.token}"}):
+            self.assertEqual(404, self.get(headers=headers)[0])
+        query = TEACHER_PATH + "?token=" + proof[TEACHER_PROXY_HEADER]
+        status_code, _, response = self.get(query, headers=proof)
+        self.assertEqual(404, status_code)
+        self.assertEqual({"error": "not-found"}, json.loads(response))
+        with closing(HTTPConnection(*self.server.server_address, timeout=2)) as client:
+            client.putrequest("GET", TEACHER_PATH)
+            client.putheader(TEACHER_PROXY_HEADER, proof[TEACHER_PROXY_HEADER])
+            client.putheader(TEACHER_PROXY_HEADER, proof[TEACHER_PROXY_HEADER])
+            client.endheaders()
+            self.assertEqual(404, client.getresponse().status)
+        self.assertEqual(200, self.get(headers=proof)[0])
+        self.assertEqual(200, self.poll()[0])
+
+    def test_teacher_proxy_token_requires_private_file_and_exact_format(self):
+        path = self.path.parent / "teacher-proxy-token"
+        token = "a" * 64
+        path.write_text(token + "\n", encoding="ascii")
+        path.chmod(0o600)
+        self.assertEqual(token, read_teacher_proxy_token(path))
+        path.chmod(0o640)
+        with self.assertRaises(ValueError):
+            read_teacher_proxy_token(path)
+        path.chmod(0o600)
+        path.write_text(token + "\n\n", encoding="ascii")
+        with self.assertRaises(ValueError):
+            read_teacher_proxy_token(path)
 
 
 if __name__ == "__main__":
