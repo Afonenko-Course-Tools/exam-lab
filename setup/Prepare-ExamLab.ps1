@@ -17,7 +17,8 @@ param(
     [string]$GitPath,
     [switch]$InstallAlongside,
     [switch]$SoftwareOnly,
-    [switch]$DisableBundledGenerativePlugins
+    [switch]$DisableBundledGenerativePlugins,
+    [string]$GradlePath
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2
@@ -36,6 +37,9 @@ $pins = @{
     Git = @{ File='Git-2.56.1-64-bit.exe'; Version='2.56.1'; Publisher='O=Johannes Schindelin';
         Uri='https://github.com/git-for-windows/git/releases/download/v2.56.1.windows.1/Git-2.56.1-64-bit.exe';
         Hash='c330c72e10b408cc39994bfefdb63542b0d93d21699325c3e0bd874af8a5a559' }
+    Gradle = @{ File='gradle-9.8.2-bin.zip'; Version='9.8.2';
+        Uri='https://services.gradle.org/distributions/gradle-9.8.2-bin.zip';
+        Hash='21bd5da2de49b642904077f38c0efdc7778e92b3ed0889392dca61b97e389607' }
 }
 
 function Invoke-Native([string]$Executable, [string[]]$Arguments, [string]$WorkingDirectory) {
@@ -81,7 +85,7 @@ function Get-UninstallEntries {
     }
 }
 
-function Test-TrustedExecutable([string]$Path) {
+function Test-TrustedExecutable([string]$Path, [switch]$ParentTrusted) {
     if (-not $script:IsAdmin) { return $true }
     # Elevated inventory не выполняет код из доступных обычному пользователю путей.
     $trusted = @('S-1-5-18','S-1-5-32-544',
@@ -101,6 +105,7 @@ function Test-TrustedExecutable([string]$Path) {
             if ($rule.AccessControlType -ne 'Allow' -or $rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) { continue }
             if (($rule.FileSystemRights -band $write) -and $rule.IdentityReference.Value -notin $trusted) { return $false }
         }
+        if ($ParentTrusted) { return $true }
         if ($current -is [IO.FileInfo]) { $current = $current.Directory } else { $current = $current.Parent }
     }
     # На корне тома обычное CreateDirectories допустимо, DeleteChild/смена ACL — нет.
@@ -114,20 +119,43 @@ function Test-TrustedExecutable([string]$Path) {
     return $true
 }
 
+function New-SetupDirectory([string]$Directory, [switch]$AllowUserExecute) {
+    $acl = New-Object Security.AccessControl.DirectorySecurity
+    $acl.SetAccessRuleProtection($true,$false)
+    $access = @{ 'S-1-5-18'='FullControl'; 'S-1-5-32-544'='FullControl' }
+    if ($AllowUserExecute) {
+        $access['S-1-5-32-545'] = 'ReadAndExecute'
+        $access['S-1-5-32-546'] = 'ReadAndExecute'
+    }
+    foreach ($sid in $access.Keys) {
+        $rule = New-Object Security.AccessControl.FileSystemAccessRule ((New-Object Security.Principal.SecurityIdentifier($sid)), $access[$sid], 'ContainerInherit,ObjectInherit', 'None', 'Allow')
+        $acl.AddAccessRule($rule)
+    }
+    [IO.Directory]::CreateDirectory($Directory, $acl) | Out-Null
+}
+
 function New-ProtectedDirectory {
-    # Program Files защищает даже момент между созданием имени и установкой ACL.
     $base = [Environment]::GetFolderPath('ProgramFiles')
     if (-not (Test-TrustedExecutable $base)) { throw 'Program Files не имеет ожидаемых защищённых ACL; staging не создаётся' }
     $directory = Join-Path $base ('ExamLab-Setup-' + [Guid]::NewGuid().ToString('N'))
-    New-Item -ItemType Directory -Path $directory | Out-Null
-    $acl = New-Object Security.AccessControl.DirectorySecurity
-    $acl.SetAccessRuleProtection($true,$false)
-    foreach ($sid in @('S-1-5-18','S-1-5-32-544')) {
-        $rule = New-Object Security.AccessControl.FileSystemAccessRule ((New-Object Security.Principal.SecurityIdentifier($sid)), 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
-        $acl.AddAccessRule($rule)
-    }
-    Set-Acl -LiteralPath $directory -AclObject $acl
+    New-SetupDirectory $directory
     $directory
+}
+
+function Get-GradleDestination {
+    Join-Path $env:ProgramFiles "gradle-$($pins.Gradle.Version)"
+}
+
+function Assert-TrustedGradleTree([string]$Path) {
+    if (-not (Test-TrustedExecutable $Path)) { throw "Незащищённый каталог Gradle: $Path" }
+    $directories = [Collections.Generic.Stack[string]]::new()
+    $directories.Push($Path)
+    while ($directories.Count) {
+        foreach ($item in Get-ChildItem -LiteralPath ($directories.Pop()) -Force) {
+            if (-not (Test-TrustedExecutable $item.FullName -ParentTrusted)) { throw "Незащищённый файл или каталог Gradle: $($item.FullName)" }
+            if ($item.PSIsContainer) { $directories.Push($item.FullName) }
+        }
+    }
 }
 
 function Get-Tool([string]$Kind, [string]$ExplicitPath, [object[]]$Entries) {
@@ -179,6 +207,19 @@ function Get-Tool([string]$Kind, [string]$ExplicitPath, [object[]]$Entries) {
                 $key = Get-ItemProperty 'HKLM:\SOFTWARE\GitForWindows' -ErrorAction SilentlyContinue | Select-Object InstallPath
                 if ($key -and $key.InstallPath) { $paths.Add([string]$key.InstallPath) }
             }
+            Gradle {
+                $paths.Add((Get-GradleDestination))
+                foreach ($base in @($env:ProgramFiles, (Join-Path $env:ProgramFiles 'Gradle'))) {
+                    if (Test-Path -LiteralPath $base -PathType Container) {
+                        Get-ChildItem -LiteralPath $base -Filter 'gradle-*' -Directory |
+                            ForEach-Object { $paths.Add($_.FullName) }
+                    }
+                }
+                if ($env:GRADLE_HOME) { $paths.Add($env:GRADLE_HOME) }
+                foreach ($cmd in @(Get-Command gradle.bat -CommandType Application -All -ErrorAction SilentlyContinue)) {
+                    $paths.Add((Split-Path (Split-Path $cmd.Source -Parent) -Parent))
+                }
+            }
         }
     }
     $candidates = [Collections.Generic.List[object]]::new()
@@ -222,11 +263,31 @@ function Get-Tool([string]$Kind, [string]$ExplicitPath, [object[]]$Entries) {
                     $compatible = $run.ExitCode -eq 0 -and $match.Success -and [version]$version -ge [version]'2.56.1'
                     $probe = $run.Output
                 }
+                Gradle {
+                    $batch = Join-Path $path 'bin\gradle.bat'
+                    if (-not (Test-Path -LiteralPath $batch -PathType Leaf)) { throw 'Отсутствует bin\gradle.bat' }
+                    $lib = Join-Path $path 'lib'
+                    if (-not (Test-Path -LiteralPath $lib -PathType Container)) { throw 'Отсутствует каталог lib Gradle' }
+                    Assert-TrustedGradleTree $path
+                    $core = @(Get-ChildItem -LiteralPath $lib -Filter 'gradle-core-*.jar' -File |
+                        Where-Object Name -match '^gradle-core-\d+\.\d+\.\d+(?:-[\w.-]+)?\.jar$')
+                    if ($core.Count -ne 1) { throw 'Ожидается один JAR gradle-core с версией Gradle' }
+                    $version = $core[0].BaseName.Substring('gradle-core-'.Length)
+                    $launcher = Join-Path $lib "gradle-launcher-$version.jar"
+                    $compatible = $version -match '^9\.8\.\d+$' -and [version]$version -ge [version]$pins.Gradle.Version -and
+                        (Test-Path -LiteralPath $launcher -PathType Leaf) -and
+                        (Test-Path -LiteralPath (Join-Path $lib 'plugins') -PathType Container)
+                    $probe = "Структура и ACL дистрибутива Gradle $version"
+                }
             }
         } catch { $errorText = $_.Exception.Message }
         $candidates.Add([pscustomobject]@{ Path=$path; Version=$version; Compatible=[bool]$compatible; Probe=$probe; Error=$errorText })
     }
-    $selected = @($candidates | Where-Object Compatible | Select-Object -First 1)
+    $compatibleCandidates = $candidates | Where-Object Compatible
+    if ($Kind -eq 'Gradle') {
+        $compatibleCandidates = $compatibleCandidates | Sort-Object -Property @{Expression={[version]$_.Version};Descending=$true},Path
+    }
+    $selected = @($compatibleCandidates | Select-Object -First 1)
     $state = 'Missing'
     if ($selected.Count) { $state = 'Compatible' }
     elseif ($candidates.Count -or $registered.Count -or $ExplicitPath) { $state = 'Conflict' }
@@ -236,7 +297,8 @@ function Get-Tool([string]$Kind, [string]$ExplicitPath, [object[]]$Entries) {
 
 function Get-Inventory {
     $entries = @(Get-UninstallEntries)
-    [pscustomobject]@{ IDEA=(Get-Tool IDEA $IdeaPath $entries); JDK=(Get-Tool JDK $JdkPath $entries); Git=(Get-Tool Git $GitPath $entries) }
+    [pscustomobject]@{ IDEA=(Get-Tool IDEA $IdeaPath $entries); JDK=(Get-Tool JDK $JdkPath $entries);
+        Git=(Get-Tool Git $GitPath $entries); Gradle=(Get-Tool Gradle $GradlePath $entries) }
 }
 
 function Get-Platform {
@@ -376,11 +438,15 @@ function Get-Installer([string]$Kind) {
     $stageLock = [IO.File]::Open($staged,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
     $script:InstallerLocks.Add($stageLock)
     if ((Get-FileHash -InputStream $stageLock -Algorithm SHA256).Hash -ne $pin.Hash) { throw "SHA256 staging $Kind не совпадает" }
-    $signature = Get-AuthenticodeSignature -LiteralPath $staged
-    if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch [regex]::Escape($pin.Publisher)) {
-        throw "Недействительная или неожиданная подпись $Kind : $($signature.Status), $($signature.SignerCertificate.Subject)"
+    if ($Kind -eq 'Gradle') {
+        $script:Changes.Add([pscustomobject]@{ Tool=$Kind; Operation='ArchiveVerified'; SHA256=$pin.Hash })
+    } else {
+        $signature = Get-AuthenticodeSignature -LiteralPath $staged
+        if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch [regex]::Escape($pin.Publisher)) {
+            throw "Недействительная или неожиданная подпись $Kind : $($signature.Status), $($signature.SignerCertificate.Subject)"
+        }
+        $script:Changes.Add([pscustomobject]@{ Tool=$Kind; Operation='InstallerVerified'; SHA256=$pin.Hash; Signer=$signature.SignerCertificate.Subject })
     }
-    $script:Changes.Add([pscustomobject]@{ Tool=$Kind; Operation='InstallerVerified'; SHA256=$pin.Hash; Signer=$signature.SignerCertificate.Subject })
     $staged
 }
 
@@ -388,6 +454,27 @@ function Install-Tool([string]$Kind, [string]$Installer, [string]$Destination) {
     if (Test-Path -LiteralPath $Destination) { throw "Каталог назначения уже существует: $Destination; автоматическая перезапись запрещена" }
     $arguments = @(); $exe = $Installer
     switch ($Kind) {
+        Gradle {
+            $base = Split-Path $Destination -Parent
+            if (-not (Test-TrustedExecutable $base)) { throw 'Program Files не имеет ожидаемых защищённых ACL для Gradle' }
+            $unpacking = Join-Path $script:WorkingDirectory 'gradle-unpack'
+            New-Item -ItemType Directory -Path $unpacking | Out-Null
+            try {
+                # Защищённый ACL самого корня исключает наследование прав Program Files после переноса.
+                $extracted = Join-Path $unpacking (Split-Path $Destination -Leaf)
+                New-SetupDirectory $extracted -AllowUserExecute
+                Add-Type -AssemblyName System.IO.Compression.FileSystem
+                [IO.Compression.ZipFile]::ExtractToDirectory($Installer, $unpacking)
+                $distribution = Get-Tool Gradle $extracted @()
+                if ($distribution.State -ne 'Compatible' -or $distribution.Selected.Version -ne $pins.Gradle.Version) {
+                    throw 'Проверенный ZIP не содержит ожидаемую структуру Gradle'
+                }
+                # Публикуем целый каталог на том же томе; Directory.Move не заменяет уже существующий путь.
+                [IO.Directory]::Move($extracted, $Destination)
+            } finally { Remove-Item -LiteralPath $unpacking -Recurse -Force }
+            $script:Changes.Add([pscustomobject]@{ Tool=$Kind; Operation='Install'; ExitCode=0; Destination=$Destination })
+            return
+        }
         JDK {
             $exe = "$env:SystemRoot\System32\msiexec.exe"
             $arguments = @('/i', "`"$Installer`"", '/qn','/norestart','ADDLOCAL=FeatureMain',
@@ -427,11 +514,13 @@ function Test-CLI($Inventory) {
 
 function Get-EnvironmentObservation {
     $resolved = @{}
-    foreach ($exe in @('java.exe','javac.exe','git.exe','idea64.exe')) {
+    foreach ($exe in @('java.exe','javac.exe','git.exe','idea64.exe','gradle.bat')) {
         $resolved[$exe] = @(Get-Command $exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source)
     }
     [pscustomobject]@{ MachineJAVA_HOME=[Environment]::GetEnvironmentVariable('JAVA_HOME','Machine');
         UserJAVA_HOME=[Environment]::GetEnvironmentVariable('JAVA_HOME','User');
+        MachineGRADLE_HOME=[Environment]::GetEnvironmentVariable('GRADLE_HOME','Machine');
+        UserGRADLE_HOME=[Environment]::GetEnvironmentVariable('GRADLE_HOME','User');
         MachinePath=[Environment]::GetEnvironmentVariable('Path','Machine');
         UserPath=[Environment]::GetEnvironmentVariable('Path','User'); ResolvedCommands=$resolved }
 }
@@ -456,7 +545,9 @@ $report = [ordered]@{ Timestamp=[DateTime]::UtcNow.ToString('o'); ScriptSHA256=(
     EnvironmentBefore=$null; EnvironmentAfter=$null; EnvironmentPreserved=$null; CLIProbe=$null; WorkingDirectory=$null;
     Changes=@(); Errors=@(); RebootRequired=$false; SoftwareReady=$false; ExamReady=$false;
     ManualChecks=@('Настоящий Shared PC Guest','IDEA: SDK/run/debug, completion/inspection/refactoring, отсутствие генеративных помощников',
+        'Gradle с JDK 25: запуск и сборка исходного проекта в IDEA из Guest',
         'Moodle и PrairieLearn','Физические флешки','Локальное завершение и сохранность обычных занятий') }
+$toolNames = @('IDEA','JDK','Git','Gradle')
 $exitCode = 0
 try {
     if (-not $script:IsAdmin) { throw 'Запустите 64-битный Windows PowerShell от администратора (повышенный UAC token)' }
@@ -473,16 +564,18 @@ try {
     $inventory = Get-Inventory
     $report.Before = $inventory
     if ($Action -eq 'Prepare') {
-        foreach ($name in @('IDEA','JDK','Git')) {
+        $alongsideTools = @('IDEA','JDK','Gradle')
+        $installOrder = @('JDK','Git','IDEA','Gradle')
+        foreach ($name in $toolNames) {
             if ($inventory.$name.State -eq 'Conflict' -and
-                -not ($InstallAlongside -and $name -in @('IDEA','JDK') -and -not $inventory.$name.ExplicitPath)) {
-                throw "Conflict: $name. Выберите подходящий каталог через -${name}Path; IDEA/JDK можно установить отдельно с -InstallAlongside"
+                -not ($InstallAlongside -and $name -in $alongsideTools -and -not $inventory.$name.ExplicitPath)) {
+                throw "Conflict: $name. Выберите подходящий каталог через -${name}Path; IDEA/JDK/Gradle можно установить отдельно с -InstallAlongside"
             }
         }
         $destinations = @{ IDEA="$env:ProgramFiles\JetBrains\IntelliJ IDEA Community Edition 2025.2.6.4";
-            JDK="$env:ProgramFiles\Eclipse Adoptium\jdk-25"; Git="$env:ProgramFiles\Git" }
-        $pending = @(@('JDK','Git','IDEA') | Where-Object {
-            $inventory.$_.State -eq 'Missing' -or ($InstallAlongside -and $inventory.$_.State -eq 'Conflict' -and $_ -in @('IDEA','JDK'))
+            JDK="$env:ProgramFiles\Eclipse Adoptium\jdk-25"; Git="$env:ProgramFiles\Git"; Gradle=(Get-GradleDestination) }
+        $pending = @($installOrder | Where-Object {
+            $inventory.$_.State -eq 'Missing' -or ($InstallAlongside -and $inventory.$_.State -eq 'Conflict' -and $_ -in $alongsideTools)
         })
         foreach ($name in $pending) {
             if (Test-Path -LiteralPath $destinations[$name]) { throw "Conflict: занят каталог $($destinations[$name]); разрешите конфликт вручную" }
@@ -494,7 +587,7 @@ try {
         # Проверка всех требуемых файлов до первого запуска установщика.
         $installers = @{}
         foreach ($name in $pending) { $installers[$name] = Get-Installer $name }
-        foreach ($name in @('JDK','Git','IDEA')) {
+        foreach ($name in $installOrder) {
             if ($installers.ContainsKey($name)) { Install-Tool $name $installers[$name] $destinations[$name] }
             else { $script:Changes.Add([pscustomobject]@{ Tool=$name; Operation='PreservedCompatible'; Path=$inventory.$name.Selected.Path }) }
         }
@@ -529,13 +622,15 @@ try {
     $report.EnvironmentAfter = Get-EnvironmentObservation
     $report.EnvironmentPreserved = $report.EnvironmentBefore.MachineJAVA_HOME -ceq $report.EnvironmentAfter.MachineJAVA_HOME -and
         $report.EnvironmentBefore.UserJAVA_HOME -ceq $report.EnvironmentAfter.UserJAVA_HOME -and
+        $report.EnvironmentBefore.MachineGRADLE_HOME -ceq $report.EnvironmentAfter.MachineGRADLE_HOME -and
+        $report.EnvironmentBefore.UserGRADLE_HOME -ceq $report.EnvironmentAfter.UserGRADLE_HOME -and
         $report.EnvironmentBefore.MachinePath -ceq $report.EnvironmentAfter.MachinePath -and
         $report.EnvironmentBefore.UserPath -ceq $report.EnvironmentAfter.UserPath
     $report.CLIProbe = Test-CLI $report.After
     $report.PluginReview = Get-IDEPlugins $report.After.IDEA
-    $report.SoftwareReady = $report.Platform.SoftwareEligible -and @('IDEA','JDK','Git').Where({ $report.After.$_.State -ne 'Compatible' }).Count -eq 0 -and $report.CLIProbe.Passed
+    $report.SoftwareReady = $report.Platform.SoftwareEligible -and $toolNames.Where({ $report.After.$_.State -ne 'Compatible' }).Count -eq 0 -and $report.CLIProbe.Passed
     if (-not $report.SoftwareReady) { $exitCode = 2 }
-    if (-not $report.EnvironmentPreserved) { $script:Failures.Add('Обнаружено изменение JAVA_HOME/PATH; автоматический откат не выполняется'); $exitCode = 1 }
+    if (-not $report.EnvironmentPreserved) { $script:Failures.Add('Обнаружено изменение JAVA_HOME, GRADLE_HOME или PATH; автоматический откат не выполняется'); $exitCode = 1 }
     if ($script:RebootRequired -and $exitCode -eq 0 -and $script:Failures.Count -eq 0) { $exitCode = 3010 }
 } catch {
     $script:Failures.Add($_.Exception.Message)
