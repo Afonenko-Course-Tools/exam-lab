@@ -60,6 +60,7 @@ namespace ExamLab {
 }
 '@
 $desktops = [ExamLab.DesktopVisibility]::new()
+$alertText = "Подозрительная активность.`r`nПозовите преподавателя."
 
 function New-AlertForm {
     $form = [Windows.Forms.Form]::new()
@@ -82,7 +83,7 @@ function New-AlertForm {
     $form.Controls.Add($layout)
 
     $label = [Windows.Forms.Label]::new()
-    $label.Text = "Подозрительная активность.`r`nПозовите преподавателя."
+    $label.Text = $alertText
     $label.Dock = 'Fill'
     $label.TextAlign = 'BottomCenter'
     $label.ForeColor = [Drawing.Color]::White
@@ -93,6 +94,9 @@ function New-AlertForm {
     $ack = [Windows.Forms.Button]::new()
     $ack.Text = 'Подтвердить как администратор'
     $ack.Font = [Drawing.Font]::new('Segoe UI', 14)
+    $ack.UseVisualStyleBackColor = $false
+    $ack.BackColor = [Drawing.Color]::White
+    $ack.ForeColor = [Drawing.Color]::Black
     $ack.Size = [Drawing.Size]::new(360, 60)
     $ack.Anchor = 'Top'
     $layout.Controls.Add($ack, 0, 1)
@@ -103,7 +107,8 @@ function New-AlertForm {
             $uac = Get-ItemProperty -LiteralPath $uacPolicyPath
             if ($uac.EnableLUA -ne 1 -or $uac.PromptOnSecureDesktop -ne 1 -or
                 $uac.ConsentPromptBehaviorUser -notin 1, 3) {
-                throw 'Требуется запрос учётных данных на защищённом рабочем столе UAC.'
+                $sender.Tag.Text = "$alertText`r`nЗапрос подтверждения запрещён политикой Windows."
+                return
             }
             $powershell = Join-Path $PSHOME 'powershell.exe'
             $controller = Join-Path $base 'ExamLabAlert.ps1'
@@ -111,7 +116,7 @@ function New-AlertForm {
             $process = Start-Process -FilePath $powershell -ArgumentList $arguments -WorkingDirectory $base -Verb RunAs -Wait -PassThru
             if ($process.ExitCode -ne 0) { throw 'Ответ администратора не сохранён.' }
         } catch {
-            $sender.Tag.Text = "Подозрительная активность.`r`nПодтверждение не выполнено."
+            $sender.Tag.Text = "$alertText`r`nПодтверждение не выполнено."
         }
     })
 
@@ -128,7 +133,7 @@ $timer.Add_Tick({
             $context.ExitThread()
             return
         }
-        if (-not $desktops.IsCurrent($script:alertForm.Handle)) {
+        if ($script:alertForm.IsDisposed -or -not $desktops.IsCurrent($script:alertForm.Handle)) {
             # Новое окно получает активный стол; окна других приложений остаются на месте.
             $replacement = New-AlertForm
             $replacement.Show()
