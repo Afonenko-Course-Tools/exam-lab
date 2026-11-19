@@ -14,6 +14,7 @@ $registrySubkey = 'SOFTWARE\ExamLabAlertPilot'
 $registryPath = "HKLM:\$registrySubkey"
 $source = 'ExamLab-Alert'
 $signalEventId = 6101
+$acknowledgementEventId = 6102
 $powerShell = Join-Path $PSHOME 'powershell.exe'
 
 if (-not [Environment]::Is64BitProcess -or $PSScriptRoot -ne $base) {
@@ -205,6 +206,10 @@ try {
             $state.AcknowledgedBy = $identity.Name
             $state.AcknowledgedBySid = $identity.User.Value
             Save-State $state
+            $receipt = $state | Select-Object RunId, GuestSid, SessionId, AcknowledgedUtc,
+                AcknowledgedBy, AcknowledgedBySid | ConvertTo-Json -Compress
+            Write-EventLog -LogName Application -Source $source -EventId $acknowledgementEventId `
+                -EntryType Information -Message $receipt
             Remove-AlertScreen $state
         }
         'Disarm' {
