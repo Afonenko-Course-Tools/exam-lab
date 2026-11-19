@@ -314,6 +314,10 @@ try {
             if ($name -eq $pollTask -and $taskFolder.GetTask($name).GetInstances(0).Count -gt 0) {
                 # Под operation.lock опрос сейчас не может менять политики.
                 Stop-ScheduledTask -TaskName $name
+                $stopWait = [Diagnostics.Stopwatch]::StartNew()
+                while ($taskFolder.GetTask($name).GetInstances(0).Count -gt 0 -and $stopWait.Elapsed.TotalSeconds -lt 3) {
+                    Start-Sleep -Milliseconds 100
+                }
             }
         }
     }

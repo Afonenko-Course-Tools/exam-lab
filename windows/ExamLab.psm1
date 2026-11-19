@@ -404,6 +404,7 @@ function Invoke-ExamLabControllerPolicyProbe {
     $phase = 'Preflight'
     try {
         Assert-SafePath $script:ControllerProbeOptIn
+        if ([IO.File]::ReadAllText($script:ControllerProbeOptIn) -cne 'true') { throw 'Стендовая проба не включена административным установщиком.' }
         $context = Read-Context
         $status = Get-Status $context
         $network = $context.Config.PSObject.Properties['Network']
@@ -438,6 +439,19 @@ function Invoke-ExamLabControllerPolicyProbe {
     return $probe
 }
 
+function Open-ExamLabModeLock([string]$Path, [switch]$WaitForNormal) {
+    $wait = [Diagnostics.Stopwatch]::StartNew()
+    while ($true) {
+        try { return [IO.File]::Open($Path,'OpenOrCreate','ReadWrite','None') }
+        catch {
+            $failure = $_.Exception.GetBaseException()
+            if (-not $WaitForNormal -or $failure -isnot [IO.IOException] -or
+                ($failure.HResult -band 0xffff) -notin @(32,33) -or $wait.Elapsed.TotalSeconds -ge 180) { throw }
+            Start-Sleep -Milliseconds 250
+        }
+    }
+}
+
 function Set-ExamLabMode {
     [CmdletBinding()]
     param(
@@ -452,15 +466,15 @@ function Set-ExamLabMode {
     else { Assert-Host }
     $lockPath = Join-Path $script:DataRoot 'operation.lock'
     if ((Test-ExistingFile $lockPath)) { Assert-SafePath $lockPath }
-    $lock = [IO.File]::Open($lockPath,'OpenOrCreate','ReadWrite','None')
+    $lock = Open-ExamLabModeLock $lockPath -WaitForNormal:(-not $remote)
     try {
         $controller = $null
         if ($remote) {
-            $controller = Read-ControllerState $script:ControllerStateFile
+            $controller = Read-ControllerState $script:ControllerStateFile $ControllerAssignment.deviceId
             if ($controller.LocalGeneration -cne $LocalGeneration) { return }
             $change = Compare-ControllerAssignment $ControllerAssignment $controller.Assignment
             if ($change -ceq 'repeat' -and $controller.Result -and
-                ($controller.Result.outcome -cne 'error' -or $controller.Result.reason -ceq 'machine-apply-failed')) { return }
+                $controller.Result.reason -cnotin @('machine-preflight-failed','local-action-failed','local-normal-incomplete')) { return }
             if ($change -ceq 'new') {
                 $controller.Assignment = $ControllerAssignment
                 $controller.Result = $null
@@ -549,6 +563,8 @@ function Set-ExamLabMode {
 function Invoke-ExamLabControllerLoop {
     Assert-Host
     if ($PSScriptRoot -ne $script:CodeRoot) { throw 'Запустите установленную задачу опроса.' }
+    Assert-SafePath $script:CodeRoot -Readable
+    Assert-SafePath (Join-Path $script:CodeRoot 'ExamLab.Controller.psm1') -Readable
     Assert-SafePath $script:DataRoot
     Assert-SafePath $script:ControllerConfigurationFile
     $configuration = Read-ControllerConfiguration $script:ControllerConfigurationFile
@@ -557,7 +573,7 @@ function Invoke-ExamLabControllerLoop {
     $bootUtc = $boot.ToString("yyyy-MM-ddTHH:mm:ss.fff'Z'",[Globalization.CultureInfo]::InvariantCulture)
     $health = [pscustomobject]@{
         BootUtc=$bootUtc; FirstAttemptUtc=$null; LastAttemptUtc=$null
-        FirstValidContactUtc=$null; LastValidContactUtc=$null; Status='Starting'; Reason=$null
+        FirstValidContactUtc=$null; LastValidContactUtc=$null; Status='Starting'; Reason=$null; ActionDetail=$null
     }
     if (Test-ExistingFile $script:ControllerHealthFile) {
         Assert-SafePath $script:ControllerHealthFile
@@ -572,10 +588,11 @@ function Invoke-ExamLabControllerLoop {
     try {
         while ($true) {
             $health.LastAttemptUtc = Get-ControllerUtc
+            $health.ActionDetail = $null
             if (-not $health.FirstAttemptUtc) { $health.FirstAttemptUtc = $health.LastAttemptUtc }
             Write-ControllerJson $script:ControllerHealthFile $health
             try {
-                $snapshot = Read-ControllerState $script:ControllerStateFile
+                $snapshot = Read-ControllerState $script:ControllerStateFile $configuration.deviceId
             } catch {
                 $health.Status='LocalError'
                 $health.Reason='controller-state-unreadable'
@@ -596,6 +613,7 @@ function Invoke-ExamLabControllerLoop {
                 } catch {
                     $health.Status='LocalError'
                     $health.Reason='controller-action-delayed-or-failed'
+                    $health.ActionDetail=$_.Exception.Message
                     Write-ControllerJson $script:ControllerHealthFile $health
                 }
             } catch {
