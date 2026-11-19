@@ -67,7 +67,7 @@ function Assert-Host {
 }
 
 function Assert-SafePath {
-    param([string]$Path, [switch]$Readable)
+    param([string]$Path, [switch]$Readable, [switch]$AlertPayload)
     $item=Get-Item -LiteralPath $Path -Force
     if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Reparse point: $Path" }
     $trusted=@('S-1-5-18','S-1-5-32-544') + @(Get-LocalGroupMember -SID 'S-1-5-32-544' | ForEach-Object {$_.SID.Value})
@@ -78,6 +78,9 @@ function Assert-SafePath {
         [Security.AccessControl.FileSystemRights]::TakeOwnership
     foreach ($rule in $acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])) {
         if ($rule.AccessControlType -ne 'Allow' -or $rule.IdentityReference.Value -in $trusted) { continue }
+        # Штатное наследование Program Files для установленного экрана тревоги.
+        if ($Readable -and $AlertPayload -and $rule.IsInherited -and
+            $rule.IdentityReference.Value -ceq 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464') { continue }
         # CREATOR OWNER заменяется доверенным создателем дочернего объекта.
         # Остальные InheritOnly ACE проверяем: они дадут доступ новым mode/tmp.
         if ($rule.IdentityReference.Value -eq 'S-1-3-0' -and
@@ -372,8 +375,8 @@ function Stop-ExamLabExtendedCollection {
         $installed = Test-ExistingFile $alertScript
         if ($initialized -ne $installed) { throw 'Обнаружена неполная установка окна тревоги.' }
         if ($installed) {
-            Assert-SafePath $alertRoot -Readable
-            Assert-SafePath $alertScript -Readable
+            Assert-SafePath $alertRoot -Readable -AlertPayload
+            Assert-SafePath $alertScript -Readable -AlertPayload
             & $powerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $alertScript -Action Disarm | Out-Null
             if ($LASTEXITCODE -ne 0) { throw "Disarm вернул $LASTEXITCODE." }
             $result.Alert='Disarmed'
