@@ -159,7 +159,7 @@ if ($Action -eq 'Prepare') {
         throw 'Нужен существующий обычный профиль, из которого вышли.'
     }
     $parents = [ordered]@{OrdinaryProfile=$profile[0].LocalPath;
-        CommonDocuments=[Environment]::GetFolderPath('CommonDocuments'); ProgramData=$programData}
+        PublicProfile=$env:PUBLIC; ProgramData=$programData}
     if ($DataRoot) {
         if ($DataRoot -notmatch '^[A-Za-z]:\\$' -or $DataRoot -eq $osRoot) { throw 'Укажите корень отдельного виртуального диска данных.' }
         $parents.DataVolume = $DataRoot
