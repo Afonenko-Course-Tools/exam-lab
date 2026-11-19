@@ -93,6 +93,15 @@ try {
     Test-RosterCase 'новый неописанный SID' @($student,(New-AccountData 'S-1-5-21-1-2-3-1002' 'new-user')) 0 0 1
     Test-RosterCase 'старое имя у нового SID не подменяет declared SID' @((New-AccountData 'S-1-5-21-1-2-3-1002' $student.Name)) 1 0 1
     Test-RosterCase 'успешно прочитанный пустой список' @() 1 0 0
+    $guest=New-AccountData 'S-1-5-21-1-2-3-1002' 'shpctac0ffee'
+    $other=New-AccountData 'S-1-5-21-1-2-3-1003' 'shpctac0ffef'
+    $knownGuest=& $module {param($c,$a,$sid) Test-LiveRoster $c $a -ObservedGuestSid $sid} $rosterConfig @($student,$guest) $guest.SID.Value
+    $withUnknown=& $module {param($c,$a,$sid) Test-LiveRoster $c $a -ObservedGuestSid $sid -AllowDrift} $rosterConfig @($student,$guest,$other) $guest.SID.Value
+    if ($knownGuest.IdentityUnconfirmed -or -not $withUnknown.IdentityUnconfirmed -or
+        @($withUnknown.UnlistedAccounts).Count -ne 1 -or $withUnknown.UnlistedAccounts[0].Sid -cne $other.SID.Value) {
+        throw 'FAIL: исключение roster должно действовать только для точного наблюдённого SID'
+    }
+    'PASS: исключение roster действует только на подтверждённый SID наблюдаемого сеанса'
     $unset=[pscustomobject]@{EnableSharedPCMode=$null;EnableAccountManager=$null;AccountModel=$null;DeletionPolicy=$null;SetEduPolicies=$null;SetPowerPolicies=$null;RestrictLocalStorage=$null}
     if (-not (& $module {param($s) Test-SharedPCUnset $s} $unset)) { throw 'FAIL all-null SharedPC должен быть unset.' }
     $unset.DeletionPolicy=0

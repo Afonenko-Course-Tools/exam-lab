@@ -113,7 +113,7 @@ function Test-DeclaredConfig {
 }
 
 function Test-LiveRoster {
-    param($Config, [object[]]$LocalAccounts, [switch]$AllowDrift)
+    param($Config, [object[]]$LocalAccounts, [switch]$AllowDrift, [string]$ObservedGuestSid)
     $missing=@(); $renamed=@()
     foreach ($account in @($Config.OrdinaryAccounts)) {
         $actual=@($LocalAccounts | Where-Object {$_.SID.Value -ceq $account.Sid})
@@ -123,9 +123,10 @@ function Test-LiveRoster {
             $renamed += [pscustomobject]@{Sid=$account.Sid; DeclaredName=$account.Name; ActualName=$actual[0].Name}
         }
     }
-    # Происхождение новых SID не угадывается; roster не дополняется автоматически.
+    # Только наблюдение готовности исключает уже проверенный текущий Guest.
     $declared=@($Config.OrdinaryAccounts | ForEach-Object {$_.Sid})
-    $unlisted=@($LocalAccounts | Where-Object { [int]($_.SID.Value.Split('-')[-1]) -ge 1000 -and $_.SID.Value -notin $declared } |
+    $unlisted=@($LocalAccounts | Where-Object { [int]($_.SID.Value.Split('-')[-1]) -ge 1000 -and
+        $_.SID.Value -notin $declared -and $_.SID.Value -cne $ObservedGuestSid } |
         ForEach-Object {[pscustomobject]@{Sid=$_.SID.Value; Name=$_.Name}})
     $unconfirmed=($missing.Count -gt 0 -or $renamed.Count -gt 0 -or $unlisted.Count -gt 0)
     if ($unconfirmed -and -not $AllowDrift) { throw 'Локальный roster изменён: отсутствует SID, изменено имя или есть неописанный SID. Нужна отдельная административная проверка; список не расширяется автоматически.' }
@@ -133,7 +134,7 @@ function Test-LiveRoster {
 }
 
 function Read-Context {
-    param([switch]$AllowRosterDriftOnlyForNormal)
+    param([switch]$AllowRosterDriftOnlyForNormal, [string]$ObservedGuestSid)
     Assert-Host
     if ($PSScriptRoot -ne $script:CodeRoot -or
         (Get-FileHash -LiteralPath (Join-Path $script:CodeRoot 'ExamLab.psm1') -Algorithm SHA256).Hash -cne $script:LoadedSourceHash) {
@@ -159,7 +160,7 @@ function Read-Context {
     }
     # Ошибка чтения SAM остаётся отказом; только успешная enumeration даёт drift.
     $localAccounts=@(Get-LocalUser -ErrorAction Stop)
-    $roster=Test-LiveRoster $config $localAccounts -AllowDrift:$AllowRosterDriftOnlyForNormal
+    $roster=Test-LiveRoster $config $localAccounts -AllowDrift:$AllowRosterDriftOnlyForNormal -ObservedGuestSid $ObservedGuestSid
     $lgpo=Join-Path $script:CodeRoot 'LGPO.exe'
     if ((Get-FileHash -LiteralPath $lgpo -Algorithm SHA256).Hash -ne '0C97F29543418B30340C4FF5D930D31E6196DD59C2CC74B6B890FA7B90C910C7') { throw 'Неизвестный LGPO.exe.' }
     $signature=Get-AuthenticodeSignature -LiteralPath $lgpo
@@ -625,6 +626,82 @@ function Set-ExamLabMode {
     } finally { $lock.Dispose() }
 }
 
+function Get-ExamLabActiveGuest([DateTime]$Boot) {
+    $logon = Get-ControllerConsoleLogon
+    if (-not $logon -or $logon.Sid -cnotmatch '\AS-1-5-21-[0-9]+-[0-9]+-[0-9]+-[0-9]+\z') { return }
+    $account = Get-LocalUser -SID ([Security.Principal.SecurityIdentifier]::new($logon.Sid))
+    # Префикс наблюдался у временных учётных записей на эталонной Windows.
+    # Запись аудита дополнительно связывает имя и SID с созданием от SYSTEM.
+    if (-not $account.Enabled -or $account.Name -cnotmatch '\Ashpctac[0-9a-f]{5}\z' -or
+        $logon.Sid -cin @(Get-LocalGroupMember -SID 'S-1-5-32-544' | ForEach-Object {$_.SID.Value})) { return }
+    $filter = "*[System[Provider[@Name='Microsoft-Windows-Security-Auditing'] and EventID=4720] and " +
+        "EventData[Data[@Name='TargetSid']='$($logon.Sid)' and Data[@Name='TargetUserName']='$($account.Name)' and Data[@Name='SubjectUserSid']='S-1-5-18']]"
+    $created = Get-WinEvent -LogName Security -FilterXPath $filter -MaxEvents 1 -ErrorAction SilentlyContinue
+    if ($created -and $created.TimeCreated.ToUniversalTime() -ge $Boot) { return $logon }
+}
+
+function Get-ExamLabControllerObservation($Configuration, $Snapshot, [DateTime]$Boot, [string]$BootUtc) {
+    $observation = [pscustomobject]@{Result=$Snapshot.Result; Readiness=$null}
+    if (-not $Snapshot.Result) { return $observation }
+    $readiness = [pscustomobject]@{
+        revision=$Snapshot.Result.revision; bootUtc=$BootUtc; observedUtc=(Get-ControllerUtc)
+        machineReady=$false; guestSessionId=$null
+    }
+    if ([StringComparer]::Ordinal.Compare($readiness.observedUtc, $BootUtc) -lt 0) { return $observation }
+    $observation.Readiness = $readiness
+    if ($Snapshot.Result.mode -cne 'exam' -or $Snapshot.Result.outcome -cne 'source-applied' -or
+        $Snapshot.Result.reason -cne 'machine-policies-only') { return $observation }
+
+    $lock = $null
+    try {
+        $lockPath = Join-Path $script:DataRoot 'operation.lock'
+        Assert-SafePath $lockPath
+        $lock = Open-ExamLabModeLock $lockPath
+        $state = Read-ControllerState $script:ControllerStateFile $Configuration.deviceId
+        if ($state.LocalGeneration -cne $Snapshot.LocalGeneration -or -not $state.Result -or
+            $state.Result.revision -ne $Snapshot.Result.revision -or
+            $state.Result.observedUtc -cne $Snapshot.Result.observedUtc -or
+            $state.Result.outcome -cne $Snapshot.Result.outcome -or
+            $state.Result.reason -cne $Snapshot.Result.reason -or $state.StoppedExamId -ceq $state.Result.examId) {
+            return $observation
+        }
+
+        Assert-SafePath $script:ControllerProbeOptIn
+        if ([IO.File]::ReadAllText($script:ControllerProbeOptIn) -cne 'true') { return $observation }
+        $guest = $null
+        try { $guest = Get-ExamLabActiveGuest $Boot } catch { }
+        $guestSid = if ($guest) { $guest.Sid }
+        $context = Read-Context -ObservedGuestSid $guestSid
+        $status = Get-Status $context
+        $usb = $status.Components.Usb
+        if (-not $status.Prepared -or $usb.State -cne 'Applied' -or $usb.OwnSourceEntries -ne 1 -or
+            -not $usb.MetadataRevisionMatches -or $status.Conflicts.Count -or -not $status.Components.Network.EffectiveApplied) {
+            return $observation
+        }
+
+        $guestSessionId = $null
+        if ($guest -and $guestSid -cnotin @($context.Config.OrdinaryAccounts.Sid)) {
+            try {
+                $current = Get-ControllerConsoleLogon
+                if ($current -and $current.Sid -ceq $guest.Sid -and $current.SessionId -eq $guest.SessionId -and
+                    $current.AuthenticationId -eq $guest.AuthenticationId) {
+                    $guestSessionId = Get-ControllerGuestSessionId $Configuration.token $BootUtc $current
+                }
+            } catch { }
+        }
+        $observed = Get-ControllerUtc
+        if ([StringComparer]::Ordinal.Compare($observed, $BootUtc) -lt 0) { return $observation }
+        $observation.Result = $Snapshot.Result.PSObject.Copy()
+        $observation.Result.observedUtc = $observed
+        $readiness.observedUtc = $observed
+        $readiness.machineReady = $true
+        $readiness.guestSessionId = $guestSessionId
+    } catch {
+        # Недоступность наблюдения не останавливает обмен и локальное восстановление.
+    } finally { if ($lock) { $lock.Dispose() } }
+    return $observation
+}
+
 function Invoke-ExamLabControllerLoop {
     Assert-Host
     if ($PSScriptRoot -ne $script:CodeRoot) { throw 'Запустите установленную задачу опроса.' }
@@ -639,6 +716,7 @@ function Invoke-ExamLabControllerLoop {
     $health = [pscustomobject]@{
         BootUtc=$bootUtc; FirstAttemptUtc=$null; LastAttemptUtc=$null
         FirstValidContactUtc=$null; LastValidContactUtc=$null; Status='Starting'; Reason=$null; ActionDetail=$null
+        Readiness=$null
     }
     if (Test-ExistingFile $script:ControllerHealthFile) {
         Assert-SafePath $script:ControllerHealthFile
@@ -654,6 +732,7 @@ function Invoke-ExamLabControllerLoop {
         while ($true) {
             $health.LastAttemptUtc = Get-ControllerUtc
             $health.ActionDetail = $null
+            $health.Readiness = $null
             if (-not $health.FirstAttemptUtc) { $health.FirstAttemptUtc = $health.LastAttemptUtc }
             Write-ControllerJson $script:ControllerHealthFile $health
             try {
@@ -666,12 +745,16 @@ function Invoke-ExamLabControllerLoop {
                 continue
             }
             try {
-                $assignment = Invoke-ControllerRequest $client $configuration $snapshot.Result
+                $observation = Get-ExamLabControllerObservation $configuration $snapshot $boot $bootUtc
+                $assignment = Invoke-ControllerRequest $client $configuration $observation.Result $observation.Readiness
                 $null = Compare-ControllerAssignment $assignment $snapshot.Assignment
                 $health.LastValidContactUtc = Get-ControllerUtc
                 if (-not $health.FirstValidContactUtc) { $health.FirstValidContactUtc = $health.LastValidContactUtc }
                 $health.Status='Connected'
                 $health.Reason=$null
+                if ($observation.Readiness -and $observation.Readiness.revision -eq $assignment.revision) {
+                    $health.Readiness = $observation.Readiness
+                }
                 Write-ControllerJson $script:ControllerHealthFile $health
                 try {
                     $null = Set-ExamLabMode -Mode $assignment.mode -ControllerAssignment $assignment -LocalGeneration $snapshot.LocalGeneration

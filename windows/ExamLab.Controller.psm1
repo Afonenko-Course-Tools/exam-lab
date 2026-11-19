@@ -102,6 +102,111 @@ function Get-ControllerUtc {
     [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fff'Z'", [Globalization.CultureInfo]::InvariantCulture)
 }
 
+function Get-ControllerConsoleLogon {
+    if (-not ('ExamLabConsoleLogon' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Security.Principal;
+using Microsoft.Win32.SafeHandles;
+
+public sealed class ExamLabConsoleLogon {
+    private const int WTSSessionInfoEx = 25;
+    private const int WTSActive = 0;
+    private const int WTS_SESSIONSTATE_UNLOCK = 1;
+    private const int TokenStatistics = 10;
+
+    // Prefix of x64 WTSINFOEXW. Data is aligned to 8 bytes (LARGE_INTEGER members).
+    [StructLayout(LayoutKind.Explicit, Size = 20)]
+    private struct SessionInfo {
+        [FieldOffset(0)] public uint Level;
+        [FieldOffset(8)] public uint SessionId;
+        [FieldOffset(12)] public int State;
+        [FieldOffset(16)] public int Flags;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct TokenStats {
+        public long TokenId;
+        public long AuthenticationId;
+        public long ExpirationTime;
+        public int TokenType, ImpersonationLevel;
+        public uint DynamicCharged, DynamicAvailable, GroupCount, PrivilegeCount;
+        public long ModifiedId;
+    }
+
+    [DllImport("kernel32.dll")]
+    private static extern uint WTSGetActiveConsoleSessionId();
+    [DllImport("wtsapi32.dll", ExactSpelling = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool WTSQuerySessionInformationW(IntPtr server, uint session, int info,
+        out IntPtr buffer, out uint bytes);
+    [DllImport("wtsapi32.dll")]
+    private static extern void WTSFreeMemory(IntPtr buffer);
+    [DllImport("wtsapi32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool WTSQueryUserToken(uint session, out SafeAccessTokenHandle token);
+    [DllImport("advapi32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetTokenInformation(SafeAccessTokenHandle token, int info,
+        out TokenStats stats, int size, out int returnedSize);
+
+    public string Sid { get; private set; }
+    public uint SessionId { get; private set; }
+    public long AuthenticationId { get; private set; }
+
+    private static bool IsActive(uint session) {
+        IntPtr buffer;
+        uint bytes;
+        bool ok = WTSQuerySessionInformationW(IntPtr.Zero, session, WTSSessionInfoEx, out buffer, out bytes);
+        try {
+            if (!ok || buffer == IntPtr.Zero || bytes < Marshal.SizeOf(typeof(SessionInfo))) return false;
+            SessionInfo info = (SessionInfo)Marshal.PtrToStructure(buffer, typeof(SessionInfo));
+            return info.Level == 1 && info.SessionId == session && info.State == WTSActive &&
+                info.Flags == WTS_SESSIONSTATE_UNLOCK && WTSGetActiveConsoleSessionId() == session;
+        } finally {
+            if (buffer != IntPtr.Zero) WTSFreeMemory(buffer);
+        }
+    }
+
+    public static ExamLabConsoleLogon Read() {
+        uint session = WTSGetActiveConsoleSessionId();
+        if (session == 0 || session == UInt32.MaxValue || !IsActive(session)) return null;
+
+        SafeAccessTokenHandle token;
+        bool ok = WTSQueryUserToken(session, out token);
+        using (token) {
+            if (!ok || token == null || token.IsInvalid) return null;
+            TokenStats stats;
+            int size = Marshal.SizeOf(typeof(TokenStats));
+            int returned;
+            if (!GetTokenInformation(token, TokenStatistics, out stats, size, out returned) ||
+                returned != size || stats.AuthenticationId == 0) return null;
+
+            using (WindowsIdentity identity = new WindowsIdentity(token.DangerousGetHandle())) {
+                if (identity.User == null || !identity.User.IsAccountSid() || identity.Groups == null) return null;
+                SecurityIdentifier administrators = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
+                if (identity.Groups.Contains(administrators) || !IsActive(session)) return null;
+                return new ExamLabConsoleLogon { Sid = identity.User.Value, SessionId = session,
+                    AuthenticationId = stats.AuthenticationId };
+            }
+        }
+    }
+}
+'@
+    }
+    return [ExamLabConsoleLogon]::Read()
+}
+
+function Get-ControllerGuestSessionId([string]$Token, [string]$BootUtc, $Logon) {
+    $data = [string]::Format([Globalization.CultureInfo]::InvariantCulture,
+        'exam-lab:guest:v1:{0}:{1}:{2}:{3}', $BootUtc, $Logon.Sid, $Logon.SessionId, $Logon.AuthenticationId)
+    $hmac = [Security.Cryptography.HMACSHA256]::new([Text.Encoding]::ASCII.GetBytes($Token))
+    try {
+        return [BitConverter]::ToString($hmac.ComputeHash([Text.Encoding]::UTF8.GetBytes($data))).Replace('-', '').ToLowerInvariant()
+    } finally { $hmac.Dispose() }
+}
+
 function Test-ControllerResult($Result) {
     return ((Test-ControllerFields $Result @('revision','mode','examId','outcome','reason','fullReady','observedUtc')) -and
         ($Result.revision -is [int] -or $Result.revision -is [long]) -and $Result.revision -ge 1 -and $Result.revision -le [int]::MaxValue -and
@@ -205,11 +310,13 @@ function New-ExamLabHttpClient {
     return $client
 }
 
-function Invoke-ControllerRequest($Client, $Configuration, $Result) {
+function Invoke-ControllerRequest($Client, $Configuration, $Result, $Readiness) {
     $request = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Post, $Configuration.url)
     $request.Headers.Authorization = [Net.Http.Headers.AuthenticationHeaderValue]::new('Bearer', $Configuration.token)
     $request.Headers.ConnectionClose = $true
-    $json = @{ deviceId=$Configuration.deviceId; result=$Result } | ConvertTo-Json -Depth 4 -Compress
+    $payload = @{ deviceId=$Configuration.deviceId; result=$Result }
+    if ($Readiness) { $payload.readiness = $Readiness }
+    $json = $payload | ConvertTo-Json -Depth 4 -Compress
     $request.Content = [Net.Http.StringContent]::new($json, [Text.Encoding]::UTF8, 'application/json')
     try {
         try { $response = $Client.SendAsync($request).GetAwaiter().GetResult() }
@@ -236,4 +343,4 @@ function Invoke-ControllerRequest($Client, $Configuration, $Result) {
 
 Export-ModuleMember -Function Read-ControllerConfiguration,ConvertTo-ControllerAssignment,Get-ControllerUtc,
     Read-ControllerState,Write-ControllerJson,Set-ControllerResult,Compare-ControllerAssignment,
-    New-ExamLabHttpClient,Invoke-ControllerRequest
+    New-ExamLabHttpClient,Invoke-ControllerRequest,Get-ControllerConsoleLogon,Get-ControllerGuestSessionId

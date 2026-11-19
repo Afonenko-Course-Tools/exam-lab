@@ -28,11 +28,23 @@ Assert-Rejected 'другой examId на той же ревизии' {
 if ((Compare-ControllerAssignment $assignment $assignment) -cne 'repeat' -or
     (Compare-ControllerAssignment $normal $assignment) -cne 'new') { throw 'FAIL: повтор и новая ревизия' }
 
+$boot='2026-11-19T14:00:00.123Z'
+$session=[pscustomobject]@{Sid='S-1-5-21-1-2-3-1001';SessionId=[uint32]1;AuthenticationId=[long]1234}
+$token='a'*43
+$id=Get-ControllerGuestSessionId $token $boot $session
+if ($id -cnotmatch '\A[a-f0-9]{64}\z' -or $id -cne (Get-ControllerGuestSessionId $token $boot $session) -or
+    $id -ceq (Get-ControllerGuestSessionId ('b'*43) $boot $session) -or
+    $id -ceq (Get-ControllerGuestSessionId $token '2026-11-19T15:00:00.123Z' $session)) {
+    throw 'FAIL: идентификатор Guest привязан к регистрации и загрузке'
+}
+$session.AuthenticationId=[long]1235
+if ($id -ceq (Get-ControllerGuestSessionId $token $boot $session)) { throw 'FAIL: идентификатор повторился после смены входа' }
+'PASS: непрозрачный идентификатор Guest меняется с регистрацией, загрузкой и входом'
+
 $temporary=Join-Path ([IO.Path]::GetTempPath()) ('exam-lab-controller-'+[Guid]::NewGuid().ToString('N'))
 try {
     New-Item -ItemType Directory -Path $temporary | Out-Null
     $registration=Join-Path $temporary 'enrollment.json'
-    $token='a'*43
     $validRegistration='{"url":"https://controller.test:21650/exam/v1/poll","deviceId":"lab-01","token":"'+$token+'"}'
     [IO.File]::WriteAllText($registration,$validRegistration)
     if ((Read-ControllerConfiguration $registration).deviceId -cne 'lab-01') { throw 'FAIL: файл регистрации' }
