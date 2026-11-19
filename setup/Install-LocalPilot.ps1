@@ -11,7 +11,11 @@ param(
     [string]$SourceDirectory,
     [Parameter(Mandatory)][string]$LGPOPath,
     [Parameter(Mandatory)][string]$ConfigurationPath,
-    [Parameter(Mandatory)][string]$PolicyFileEditorPath
+    [Parameter(Mandatory)][string]$PolicyFileEditorPath,
+    [string]$ControllerConfigurationPath,
+    [string[]]$TrustedRootCertificatePath = @(),
+    [string[]]$TrustedRootSha256 = @(),
+    [switch]$EnableLabControllerPolicyProbe
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2
@@ -20,7 +24,10 @@ $deliveryPending = $false
 $sources = [Collections.Generic.List[object]]::new()
 $actions = @('prepare','check','exam','normal')
 $legacyActions = @('enable','finish')
-$codeFiles = @('ExamLab.psm1','exam-lab.ps1','ExamLab.Usb.psm1','ExamNetwork.psm1')
+$codeFiles = @('ExamLab.psm1','exam-lab.ps1','ExamLab.Usb.psm1','ExamNetwork.psm1','ExamLab.Controller.psm1')
+$pollTask = 'ExamLab-Controller-Poll'
+$taskNames = @($actions + $legacyActions | ForEach-Object { 'ExamLab-Local-'+$_ }) + @($pollTask)
+$roots = @()
 $pfeFiles = [ordered]@{
     'Commands.ps1'='ca04433f2aaf20d8d7f3962337f075a3de599fafeb7d66b5a0af1bfaf80d44b9'
     'Common.ps1'='31e69ad6f0c70883829fa376d9041026757e3819a426453fef14b5dac48d3d44'
@@ -38,7 +45,7 @@ $pfeFiles = [ordered]@{
     'en-US/about_RegistryValuesForAdminTemplates.Help.txt'='06f286bfa5d2dd9b16ad24c8dee8245948dd3f0b3033b65a5dcfacd851a83b5b'
     'package/services/metadata/core-properties/445e8411c5804e3690b6e21eed01e358.psmdcp'='ad5ce893115e275622393531920d6e484d7ae3f2fa53af92765c9246a21e1d00'
 }
-$result = [ordered]@{ Installed=$false; ActionsExecuted=$false; PolicyActivationRequested=$false; Files=@(); Tasks=@() }
+$result = [ordered]@{ Installed=$false; ActionsExecuted=$false; PolicyActivationRequested=$false; Files=@(); Tasks=@(); TrustedRoots=@(); LabControllerPolicyProbe=$false }
 
 function Assert-NativeAMD64 {
     # Тот же native API, что в Prepare-ExamLab; x64-эмуляция на ARM64 не подходит.
@@ -176,6 +183,54 @@ function Copy-Source([string]$From, [string]$To, [string]$ExpectedHash) {
     [pscustomobject]@{ Name=[IO.Path]::GetFileName($To); SHA256=$hash; Changed=$changed }
 }
 
+function Get-CertificateSha256([byte[]]$Bytes) {
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try { [BitConverter]::ToString($algorithm.ComputeHash($Bytes)).Replace('-','') }
+    finally { $algorithm.Dispose() }
+}
+
+function Read-PinnedRoot([string]$Path,[string]$Expected) {
+    if ($Expected -notmatch '\A[0-9A-Fa-f]{64}\z') { throw 'Для каждого корневого сертификата требуется проверенный SHA-256.' }
+    $file = Get-Item -LiteralPath $Path
+    if ($file -isnot [IO.FileInfo] -or $file.Length -gt 16384) { throw 'Ожидался один публичный корневой сертификат DER.' }
+    $data = [IO.File]::ReadAllBytes($file.FullName)
+    if ((Get-CertificateSha256 $data) -ine $Expected) { throw 'Отпечаток файла корневого сертификата отличается от проверенного SHA-256.' }
+    $x509 = [Security.Cryptography.X509Certificates.X509Certificate2]
+    if ($x509::GetCertContentType($data) -ne [Security.Cryptography.X509Certificates.X509ContentType]::Cert) { throw 'Ожидался один публичный сертификат DER.' }
+    $certificate = $x509::new($data)
+    try {
+        $constraints = @($certificate.Extensions | Where-Object { $_.Oid.Value -eq '2.5.29.19' })
+        $keyUsage = @($certificate.Extensions | Where-Object { $_.Oid.Value -eq '2.5.29.15' })
+        $now = Get-Date
+        if ($certificate.HasPrivateKey -or (Get-CertificateSha256 $certificate.RawData) -ine $Expected -or
+            [Convert]::ToBase64String($certificate.SubjectName.RawData) -cne [Convert]::ToBase64String($certificate.IssuerName.RawData) -or
+            $constraints.Count -ne 1 -or -not $constraints[0].CertificateAuthority -or
+            ($keyUsage.Count -and -not ($keyUsage[0].KeyUsages -band [Security.Cryptography.X509Certificates.X509KeyUsageFlags]::KeyCertSign)) -or
+            $certificate.NotBefore -gt $now -or $certificate.NotAfter -le $now) {
+            throw 'Сертификат должен быть действующим публичным корнем CA с разрешением подписывать сертификаты.'
+        }
+        return $certificate
+    } catch { $certificate.Dispose(); throw }
+}
+
+function Install-PinnedRoots([Security.Cryptography.X509Certificates.X509Certificate2[]]$Certificates) {
+    if (-not $Certificates.Count) { return }
+    $store = [Security.Cryptography.X509Certificates.X509Store]::new('Root','LocalMachine')
+    try {
+        $store.Open([Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite -bor [Security.Cryptography.X509Certificates.OpenFlags]::OpenExistingOnly)
+        foreach ($certificate in $Certificates) {
+            $hash = Get-CertificateSha256 $certificate.RawData
+            $matches = @($store.Certificates.Find('FindByThumbprint',$certificate.Thumbprint,$false))
+            if (@($matches | Where-Object { (Get-CertificateSha256 $_.RawData) -cne $hash }).Count) { throw 'В Windows Root найден конфликт отпечатка сертификата.' }
+            if (-not $matches.Count) { $store.Add($certificate) }
+            $readback = @($store.Certificates.Find('FindByThumbprint',$certificate.Thumbprint,$false) |
+                Where-Object { (Get-CertificateSha256 $_.RawData) -ceq $hash })
+            if (-not $readback.Count) { throw 'Корневой сертификат отсутствует при повторном чтении Windows Root.' }
+            [pscustomobject]@{ Subject=$certificate.Subject; SHA256=$hash; Added=(-not $matches.Count) }
+        }
+    } finally { $store.Dispose() }
+}
+
 try {
     if (-not $SourceDirectory) { $SourceDirectory = Join-Path $PSScriptRoot '..\windows' }
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -200,7 +255,14 @@ try {
     }
     # Только pure schema validation из доверенного source payload; Apply не вызывается.
     Import-Module (Join-Path $SourceDirectory 'ExamNetwork.psm1') -Force
+    Import-Module (Join-Path $SourceDirectory 'ExamLab.Controller.psm1') -Force
     $configurationHash = Get-ConfigurationHash $ConfigurationPath
+    if ($TrustedRootCertificatePath.Count -ne $TrustedRootSha256.Count) { throw 'Передайте путь и проверенный SHA-256 для каждого сертификата.' }
+    for ($index = 0; $index -lt $TrustedRootCertificatePath.Count; $index++) {
+        $roots += Read-PinnedRoot $TrustedRootCertificatePath[$index] $TrustedRootSha256[$index]
+    }
+    $registration = $null
+    if ($ControllerConfigurationPath) { $registration = Read-ControllerConfiguration $ControllerConfigurationPath }
     # Готовый offline PFE3.0.1: фиксированные исходные 15 файлов и LICENSE.
     # Держим source handles до завершения доставки; runtime ничего не скачивает.
     foreach ($name in $pfeFiles.Keys) {
@@ -220,17 +282,49 @@ try {
     $lock = [IO.File]::Open((Join-Path $state 'operation.lock'),'OpenOrCreate','ReadWrite','None')
     Assert-NoLegacyState $state
     Assert-ConfigurationRevision $state $configurationHash
+    $registrationFile = Join-Path $state 'controller-registration.json'
+    if (Test-Path -LiteralPath $registrationFile) {
+        $installedRegistration = Read-ControllerConfiguration $registrationFile
+        if ($registration -and ($registration.url -cne $installedRegistration.url -or $registration.deviceId -cne $installedRegistration.deviceId)) {
+            throw 'URL или идентификатор зарегистрированного ПК изменились. Переезд выполняется отдельной административной операцией.'
+        }
+        if (-not $registration) { $registration = $installedRegistration }
+    }
+    $probeFile = Join-Path $state 'controller-policy-probe.enabled'
+    if ($EnableLabControllerPolicyProbe -and -not $registration) { throw 'Стендовая проба требует регистрации контроллера.' }
+    if ($registration) {
+        $pc = [IO.File]::ReadAllText($ConfigurationPath) | ConvertFrom-Json
+        $network = $pc.PSObject.Properties['Network']
+        $endpoint = if ($network) { $network.Value.PSObject.Properties['ControllerEndpoint'] } else { $null }
+        $url = [Uri]$registration.url
+        if (($endpoint -and ($url.Host -cne $endpoint.Value.IP -or $url.Port -ne $endpoint.Value.Port)) -or
+            ($EnableLabControllerPolicyProbe -and -not $endpoint)) {
+            throw 'Для сетевой политики адрес и порт Windows ControllerEndpoint должны совпадать с HTTPS URL контроллера.'
+        }
+    }
+
     $scheduler = New-Object -ComObject Schedule.Service
     $scheduler.Connect()
+    $taskFolder = $scheduler.GetFolder('\')
     $deliveryPending = $true
-    foreach ($action in @($actions + $legacyActions)) {
-        $task = Get-ScheduledTask -TaskName ('ExamLab-Local-'+$action) -ErrorAction SilentlyContinue
-        if ($task) { Disable-ScheduledTask -TaskName ('ExamLab-Local-'+$action) | Out-Null }
+    foreach ($name in $taskNames) {
+        $task = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+        if ($task) {
+            Disable-ScheduledTask -TaskName $name | Out-Null
+            if ($name -eq $pollTask -and $taskFolder.GetTask($name).GetInstances(0).Count -gt 0) {
+                # Под operation.lock опрос сейчас не может менять политики.
+                Stop-ScheduledTask -TaskName $name
+                $stopWait = [Diagnostics.Stopwatch]::StartNew()
+                while ($taskFolder.GetTask($name).GetInstances(0).Count -gt 0 -and $stopWait.Elapsed.TotalSeconds -lt 3) {
+                    Start-Sleep -Milliseconds 100
+                }
+            }
+        }
     }
-    foreach ($action in @($actions + $legacyActions)) {
-        $task = Get-ScheduledTask -TaskName ('ExamLab-Local-'+$action) -ErrorAction SilentlyContinue
-        if ($task -and ($task.State -eq 'Running' -or $scheduler.GetFolder('\').GetTask('ExamLab-Local-'+$action).GetInstances(0).Count -gt 0)) {
-            throw "Дождитесь завершения ExamLab-Local-$action; задачи оставлены Disabled, повторите установку"
+    foreach ($name in $taskNames) {
+        $task = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+        if ($task -and $taskFolder.GetTask($name).GetInstances(0).Count -gt 0) {
+            throw "Дождитесь завершения $name. Задачи оставлены Disabled, повторите установку."
         }
     }
     Assert-SafeDirectory $code -Readable
@@ -253,7 +347,14 @@ try {
         $files += Copy-Source (Join-Path $PolicyFileEditorPath $name) $target $pfeFiles[$name]
     }
     $result.Files=$files
+    $result.TrustedRoots = @(Install-PinnedRoots $roots)
+    if ($registration -and $ControllerConfigurationPath) { Write-ControllerJson $registrationFile $registration }
+    if ($EnableLabControllerPolicyProbe) {
+        Write-ControllerJson $probeFile $true
+        $result.LabControllerPolicyProbe=$true
+    } elseif (Test-Path -LiteralPath $probeFile) { Remove-Item -LiteralPath $probeFile }
     $tasks = @()
+    $principal = New-ScheduledTaskPrincipal -UserId 'S-1-5-18' -LogonType ServiceAccount -RunLevel Highest
     foreach ($action in $actions) {
         $wrapper = Join-Path $code ('task-'+$action+'.ps1')
         $log = Join-Path $state ($action+'.log')
@@ -269,13 +370,22 @@ try {
         $body = $body.Replace('__ENTRY__',(Join-Path $code 'exam-lab.ps1').Replace("'","''")).Replace('__ACTION__',$action).Replace('__LOG__',$log.Replace("'","''"))
         [IO.File]::WriteAllText($wrapper,$body,(New-Object Text.UTF8Encoding($true)))
         $taskAction = New-ScheduledTaskAction -Execute $powershell -Argument ('-NoProfile -ExecutionPolicy Bypass -File "'+$wrapper+'"')
-        $principal = New-ScheduledTaskPrincipal -UserId 'S-1-5-18' -LogonType ServiceAccount -RunLevel Highest
         $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 10) -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Disable
         $name = 'ExamLab-Local-'+$action
         Register-ScheduledTask -TaskName $name -Action $taskAction -Principal $principal -Settings $settings -Description 'ExamLab: локальный экспериментальный пилот' -Force | Out-Null
-        $scheduler.GetFolder('\').GetTask($name).SetSecurityDescriptor('D:P(A;;FA;;;SY)(A;;FA;;;BA)',0)
+        $taskFolder.GetTask($name).SetSecurityDescriptor('D:P(A;;FA;;;SY)(A;;FA;;;BA)',0)
         $tasks += $name
         $result.Tasks=$tasks
+    }
+    if ($registration) {
+        $entry = Join-Path $code 'exam-lab.ps1'
+        $taskAction = New-ScheduledTaskAction -Execute $powershell -Argument ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "'+$entry+'" -Action poll')
+        $trigger = New-ScheduledTaskTrigger -AtStartup
+        $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew `
+            -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -Disable
+        Register-ScheduledTask -TaskName $pollTask -Action $taskAction -Trigger $trigger -Principal $principal -Settings $settings -Description 'ExamLab: исходящий опрос контроллера при запуске Windows' -Force | Out-Null
+        $taskFolder.GetTask($pollTask).SetSecurityDescriptor('D:P(A;;FA;;;SY)(A;;FA;;;BA)',0)
+        $tasks += $pollTask
     }
     Assert-SafeDirectory $code -Readable
     Assert-SafeDirectory $state
@@ -293,8 +403,8 @@ try {
 } catch {
     $failure = $_
     if ($deliveryPending) {
-        foreach ($action in @($actions + $legacyActions)) {
-            try { Disable-ScheduledTask -TaskName ('ExamLab-Local-'+$action) -ErrorAction SilentlyContinue | Out-Null } catch { }
+        foreach ($name in $taskNames) {
+            try { Disable-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue | Out-Null } catch { }
         }
     }
     $result.Error=$failure.Exception.Message
@@ -302,4 +412,8 @@ try {
     Write-Error $failure -ErrorAction Continue
     exit 1
 }
-finally { if ($lock) { $lock.Dispose() }; foreach ($source in $sources) { $source.Dispose() } }
+finally {
+    if ($lock) { $lock.Dispose() }
+    foreach ($source in $sources) { $source.Dispose() }
+    foreach ($root in $roots) { $root.Dispose() }
+}

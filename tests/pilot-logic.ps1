@@ -5,7 +5,7 @@ $previousFiles=$env:ProgramFiles; $previousData=$env:ProgramData
 New-Item -ItemType Directory -Path $temporary | Out-Null
 try {
     $env:ProgramFiles=$temporary; $env:ProgramData=$temporary
-    Import-Module (Join-Path $PSScriptRoot '..\windows\ExamNetwork.psm1') -Force
+    $networkModule=Import-Module (Join-Path $PSScriptRoot '..\windows\ExamNetwork.psm1') -Force -PassThru
     $module=Import-Module (Join-Path $PSScriptRoot '..\windows\ExamLab.psm1') -Force -PassThru
     function Test-Config([string]$Name,[string]$Json,[bool]$Expected) {
         $passed=$false
@@ -36,6 +36,27 @@ try {
     Test-Config 'Network explicit null refused' ($valid.Substring(0,$valid.Length-1)+',"Network":null}') $false
     Test-Config 'Network port string refused' ($withNetwork.Replace(':3128',':"3128"')) $false
     Test-Config 'Network invalid port refused' ($withNetwork.Replace(':3128',':65536')) $false
+    $controller='"ControllerEndpoint":{"IP":"192.0.2.10","Port":443}'
+    $wazuh='"WazuhEndpoint":{"IP":"192.0.2.10","Port":1514}'
+    $withServices=$withNetwork.Replace('"TechnicalAccess":[]',('"TechnicalAccess":[],'+$controller+','+$wazuh))
+    Test-Config 'Network: один IP с тремя разными портами' $withServices $true
+    Test-Config 'Network: необъявленное поле служебного адреса' ($withServices.Replace('"Port":443','"Port":443,"Program":"Any"')) $false
+    Test-Config 'Network: служебный endpoint null' ($withServices.Replace($wazuh,'"WazuhEndpoint":null')) $false
+    Test-Config 'Network: служебный endpoint без порта' ($withServices.Replace(',"Port":443','')) $false
+    Test-Config 'Network: служебный endpoint с именем вместо IPv4' ($withServices.Replace('"IP":"192.0.2.10","Port":443','"IP":"controller.example","Port":443')) $false
+    Test-Config 'Network: служебный endpoint с текстовым портом' ($withServices.Replace('"Port":1514','"Port":"1514"')) $false
+    Test-Config 'Network: контроллер на открытом endpoint прокси' ($withServices.Replace('"Port":443','"Port":3128')) $false
+    Test-Config 'Network: два служебных правила к одному endpoint' ($withServices.Replace('"Port":443','"Port":1514')) $false
+    $serviceSpecs=@(& $networkModule {param($config) Get-NetSpecs $config} (($withServices | ConvertFrom-Json).Network))
+    $proxySpec=$serviceSpecs | Where-Object Name -eq 'ExamLab.Network.Proxy.Out'
+    $controllerSpec=$serviceSpecs | Where-Object Name -eq 'ExamLab.Network.Controller.Out'
+    $wazuhSpec=$serviceSpecs | Where-Object Name -eq 'ExamLab.Network.Wazuh.Out'
+    if ($serviceSpecs.Count -ne 3 -or $proxySpec.LocalUser -ne 'Any' -or
+        $controllerSpec.LocalUser -cne 'D:(A;;CC;;;SY)' -or $controllerSpec.Program -notlike '*\WindowsPowerShell\v1.0\powershell.exe' -or
+        $wazuhSpec.LocalUser -cne 'D:(A;;CC;;;SY)' -or $wazuhSpec.Program -notlike '*\ossec-agent\wazuh-agent.exe' -or $wazuhSpec.Service -ne 'Any' -or
+        @($serviceSpecs | Where-Object {$_.Direction -ne 'Outbound' -or $_.Protocol -ne 'TCP' -or $_.RemoteAddress -ne '192.0.2.10'}).Count -or
+        $controllerSpec.RemotePort -ne '443' -or $wazuhSpec.RemotePort -ne '1514') { throw 'FAIL точные исходящие правила контроллера и агента.' }
+    'PASS Network: описание исходящих правил контроллера и Wazuh; фильтры Windows не испытывались.'
     Test-Config 'TechnicalAccess explicit address/local port' ($withNetwork.Replace('[]','[{"RemoteIP":"192.0.2.20","LocalPort":5985}]')) $true
     Test-Config 'TechnicalAccess arbitrary direction refused' ($withNetwork.Replace('[]','[{"RemoteIP":"192.0.2.20","LocalPort":5985,"Direction":"Inbound"}]')) $false
     Test-Config 'TechnicalAccess duplicate refused' ($withNetwork.Replace('[]','[{"RemoteIP":"192.0.2.20","LocalPort":5985},{"RemoteIP":"192.0.2.20","LocalPort":5985}]')) $false

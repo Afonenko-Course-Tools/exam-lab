@@ -9,6 +9,9 @@ $script:LoadedHash=(Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).
 $script:Profiles=@('Domain','Private','Public')
 $script:Fields=[ordered]@{Enabled='True';DefaultInboundAction='Block';DefaultOutboundAction='Block';AllowInboundRules='True';AllowLocalFirewallRules='False';AllowLocalIPsecRules='False'}
 $script:Group='ExamLab Network v1'
+$script:ControllerProgram='%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe'
+$script:WazuhProgram='%ProgramFiles(x86)%\ossec-agent\wazuh-agent.exe'
+$script:SystemLocalUser='D:(A;;CC;;;SY)'
 
 function Assert-NetEndpointIP($Value){
  $ip=$null
@@ -16,25 +19,37 @@ function Assert-NetEndpointIP($Value){
  $b=$ip.GetAddressBytes()
  if($b[0] -in @(0,127) -or $b[0] -ge 224 -or ($b[0] -eq 169 -and $b[1] -eq 254)){throw 'Network endpoint должен быть unicast IPv4 вне loopback/link-local.'}
 }
+function Assert-NetEndpoint($IP,$Port){
+ Assert-NetEndpointIP $IP
+ if(($Port -isnot [int] -and $Port -isnot [long]) -or $Port -lt 1 -or $Port -gt 65535){throw 'Network требует целые порты 1..65535.'}
+}
 function Test-ExamNetworkConfig {
  [CmdletBinding()]param([AllowNull()]$Config)
  if($null -eq $Config){return}
  $names=@($Config.PSObject.Properties.Name)
  $required=@('ProxyEndpointIP','ProxyEndpointPort','TechnicalAccess')
- if($Config -isnot [pscustomobject] -or @($required|Where-Object{$_ -notin $names}).Count -or @($names|Where-Object{$_ -notin ($required+@('DhcpServerIP'))}).Count){throw 'Network: нужны ProxyEndpointIP, ProxyEndpointPort, TechnicalAccess; DhcpServerIP необязателен.'}
+ $services=@('ControllerEndpoint','WazuhEndpoint')
+ $allowed=$required+@('DhcpServerIP')+$services
+ if($Config -isnot [pscustomobject] -or @($required|Where-Object{$_ -notin $names}).Count -or @($names|Where-Object{$_ -notin $allowed}).Count){throw 'Network: нужны ProxyEndpointIP, ProxyEndpointPort, TechnicalAccess. Допустимы DhcpServerIP, ControllerEndpoint и WazuhEndpoint.'}
  if('DhcpServerIP' -in $names){Assert-NetEndpointIP $Config.DhcpServerIP}
+ Assert-NetEndpoint $Config.ProxyEndpointIP $Config.ProxyEndpointPort
+ $outbound=@(('{0}:{1}' -f $Config.ProxyEndpointIP,$Config.ProxyEndpointPort))
+ foreach($name in $services){
+  if($name -notin $names){continue}
+  $endpoint=$Config.$name
+  if($endpoint -isnot [pscustomobject] -or @($endpoint.PSObject.Properties).Count -ne 2 -or @($endpoint.PSObject.Properties.Name|Where-Object{$_ -notin @('IP','Port')}).Count){throw ('Network.'+$name+' допускает только IP и Port.')}
+  Assert-NetEndpoint $endpoint.IP $endpoint.Port
+  $pair='{0}:{1}' -f $endpoint.IP,$endpoint.Port
+  if($pair -in $outbound){throw 'Все исходящие TCP endpoints Network должны различаться.'}
+  $outbound+=$pair
+ }
  if($Config.TechnicalAccess -isnot [array]){throw 'TechnicalAccess должен быть массивом, включая пустой.'}
- $pairs=@([pscustomobject]@{IP=$Config.ProxyEndpointIP;Port=$Config.ProxyEndpointPort})
  $seen=@{}
  foreach($a in $Config.TechnicalAccess){
   if($a -isnot [pscustomobject] -or @($a.PSObject.Properties).Count -ne 2 -or @($a.PSObject.Properties.Name|Where-Object{$_ -notin @('RemoteIP','LocalPort')}).Count){throw 'TechnicalAccess: только RemoteIP и LocalPort.'}
-  $pairs+=[pscustomobject]@{IP=$a.RemoteIP;Port=$a.LocalPort}
+  Assert-NetEndpoint $a.RemoteIP $a.LocalPort
   $key=([string]$a.RemoteIP)+':'+([string]$a.LocalPort)
   if($seen.ContainsKey($key)){throw 'Повтор TechnicalAccess.'};$seen[$key]=$true
- }
- foreach($pair in $pairs){
-  Assert-NetEndpointIP $pair.IP
-  if(($pair.Port -isnot [int] -and $pair.Port -isnot [long]) -or $pair.Port -lt 1 -or $pair.Port -gt 65535){throw 'Network требует целые порты 1..65535.'}
  }
 }
 function Test-NetPathPresent([string]$Path){
@@ -101,13 +116,34 @@ function Read-NetContext($Config,[string]$Revision){
 }
 function Get-NetSpecs($Config){
  if($null -eq $Config){return}
- [pscustomobject]@{Name='ExamLab.Network.Proxy.Out';Direction='Outbound';Protocol='TCP';RemoteAddress=$Config.ProxyEndpointIP;LocalPort='Any';RemotePort=[string]$Config.ProxyEndpointPort;Program='Any';Service='Any'}
+ [pscustomobject]@{Name='ExamLab.Network.Proxy.Out';Direction='Outbound';Protocol='TCP';RemoteAddress=$Config.ProxyEndpointIP;LocalPort='Any';RemotePort=[string]$Config.ProxyEndpointPort;Program='Any';Service='Any';LocalUser='Any'}
  $index=0
- foreach($a in $Config.TechnicalAccess){[pscustomobject]@{Name=('ExamLab.Network.Technical.'+$index+'.In');Direction='Inbound';Protocol='TCP';RemoteAddress=$a.RemoteIP;LocalPort=[string]$a.LocalPort;RemotePort='Any';Program='Any';Service='Any'};$index++}
+ foreach($a in $Config.TechnicalAccess){[pscustomobject]@{Name=('ExamLab.Network.Technical.'+$index+'.In');Direction='Inbound';Protocol='TCP';RemoteAddress=$a.RemoteIP;LocalPort=[string]$a.LocalPort;RemotePort='Any';Program='Any';Service='Any';LocalUser='Any'};$index++}
  if('DhcpServerIP' -in $Config.PSObject.Properties.Name){
   $client=Join-Path $env:SystemRoot 'System32\svchost.exe'
-  [pscustomobject]@{Name='ExamLab.Network.Dhcp.Out';Direction='Outbound';Protocol='UDP';RemoteAddress=@($Config.DhcpServerIP,'255.255.255.255');LocalPort='68';RemotePort='67';Program=$client;Service='Dhcp'}
-  [pscustomobject]@{Name='ExamLab.Network.Dhcp.In';Direction='Inbound';Protocol='UDP';RemoteAddress=$Config.DhcpServerIP;LocalPort='68';RemotePort='67';Program=$client;Service='Dhcp'}
+  [pscustomobject]@{Name='ExamLab.Network.Dhcp.Out';Direction='Outbound';Protocol='UDP';RemoteAddress=@($Config.DhcpServerIP,'255.255.255.255');LocalPort='68';RemotePort='67';Program=$client;Service='Dhcp';LocalUser='Any'}
+  [pscustomobject]@{Name='ExamLab.Network.Dhcp.In';Direction='Inbound';Protocol='UDP';RemoteAddress=$Config.DhcpServerIP;LocalPort='68';RemotePort='67';Program=$client;Service='Dhcp';LocalUser='Any'}
+ }
+ if('ControllerEndpoint' -in $Config.PSObject.Properties.Name){
+  [pscustomobject]@{Name='ExamLab.Network.Controller.Out';Direction='Outbound';Protocol='TCP';RemoteAddress=$Config.ControllerEndpoint.IP;LocalPort='Any';RemotePort=[string]$Config.ControllerEndpoint.Port;Program=$script:ControllerProgram;Service='Any';LocalUser=$script:SystemLocalUser}
+ }
+ if('WazuhEndpoint' -in $Config.PSObject.Properties.Name){
+  [pscustomobject]@{Name='ExamLab.Network.Wazuh.Out';Direction='Outbound';Protocol='TCP';RemoteAddress=$Config.WazuhEndpoint.IP;LocalPort='Any';RemotePort=[string]$Config.WazuhEndpoint.Port;Program=$script:WazuhProgram;Service='Any';LocalUser=$script:SystemLocalUser}
+ }
+}
+function Assert-NetApplyPrograms($Config){
+ if('ControllerEndpoint' -in $Config.PSObject.Properties.Name){
+  $controllerProgram=[Environment]::ExpandEnvironmentVariables($script:ControllerProgram)
+  if(-not (Test-Path -LiteralPath $controllerProgram -PathType Leaf)){throw 'Не найден штатный Windows PowerShell для опроса контроллера.'}
+ }
+ if('WazuhEndpoint' -in $Config.PSObject.Properties.Name){
+  $wazuhProgram=[Environment]::ExpandEnvironmentVariables($script:WazuhProgram)
+  $agents=@(Get-CimInstance Win32_Service -Filter "Name = 'WazuhSvc'")
+  if($agents.Count -ne 1 -or $agents[0].StartName -ine 'LocalSystem' -or
+     [Environment]::ExpandEnvironmentVariables([string]$agents[0].PathName).Trim('"') -ine $wazuhProgram -or
+     -not (Test-Path -LiteralPath $wazuhProgram -PathType Leaf)){
+   throw 'Для WazuhEndpoint требуется WazuhSvc под LocalSystem со штатным путём к wazuh-agent.exe.'
+  }
  }
 }
 function Assert-NetApplyAddress($Config){
@@ -155,8 +191,8 @@ function Expected-RuleSignature($spec,[string]$runId){
   Enabled='True';Profile='Any';Direction=$spec.Direction;Action='Allow'
   EdgeTraversalPolicy='Block';LooseSourceMapping='False';LocalOnlyMapping='False'
   LocalAddress='Any';RemoteAddress=(Join-Values $spec.RemoteAddress);Protocol=$spec.Protocol;LocalPort=$spec.LocalPort;RemotePort=$spec.RemotePort
-  DynamicTarget='Any';IcmpType='Any';Program=$spec.Program.ToLowerInvariant();Package='Any';Service=$spec.Service.ToLowerInvariant();InterfaceAlias='Any';InterfaceType='Any'
-  Authentication='NotRequired';Encryption='NotRequired';OverrideBlockRules='False';LocalUser='Any';RemoteUser='Any';RemoteMachine='Any'
+  DynamicTarget='Any';IcmpType='Any';Program=[Environment]::ExpandEnvironmentVariables($spec.Program).ToLowerInvariant();Package='Any';Service=$spec.Service.ToLowerInvariant();InterfaceAlias='Any';InterfaceType='Any'
+  Authentication='NotRequired';Encryption='NotRequired';OverrideBlockRules='False';LocalUser=$spec.LocalUser;RemoteUser='Any';RemoteMachine='Any'
  }|ConvertTo-Json -Compress
 }
 function Read-NetView($Config,[string]$Revision){
@@ -221,8 +257,11 @@ function Get-NetStatusFromView($View,$Config,[string]$ConfigRevision,[switch]$Ch
  $applyBlockers=$policyBlockers
  if($CheckApplyHost -and $null -ne $Config -and $state -eq 'NotConfigured' -and -not $applyBlockers.Count){
   try{Assert-NetApplyHost $Config}catch{$applyBlockers+=$_.Exception.Message}
- }elseif($CheckApplyHost -and $state -eq 'Applied' -and -not $applyBlockers.Count -and 'DhcpServerIP' -in $Config.PSObject.Properties.Name){
-  try{Assert-NetApplyAddress $Config}catch{$applyBlockers+=$_.Exception.Message}
+ }elseif($CheckApplyHost -and $state -eq 'Applied' -and -not $applyBlockers.Count){
+  try{
+   if('DhcpServerIP' -in $Config.PSObject.Properties.Name){Assert-NetApplyAddress $Config}
+   Assert-NetApplyPrograms $Config
+  }catch{$applyBlockers+=$_.Exception.Message}
  }
  $effectiveApplied=$false;$effectiveBlockers=@()
  if($state -eq 'Applied'){
@@ -250,6 +289,7 @@ function Assert-NetApplyHost($Config){
  foreach($flag in @('AzureAdJoined','EnterpriseJoined','DomainJoined','WorkplaceJoined')){if($code -ne 0 -or $dsreg -notmatch ('(?m)^\s*'+$flag+'\s*:\s*NO\s*$')){throw 'Unmanaged Windows precondition не подтверждён.'}}
  foreach($service in @('MpsSvc','BFE')){if((Get-Service $service).Status -ne 'Running'){throw 'Firewall services не готовы.'}}
  Assert-NetApplyAddress $Config
+ Assert-NetApplyPrograms $Config
 }
 function Invoke-ExamNetworkUnderLock {
  [CmdletBinding()]param([Parameter(Mandatory=$true)][ValidateSet('Apply','Normal')][string]$Action,[AllowNull()]$Config,[Parameter(Mandatory=$true)][string]$ConfigRevision,[Parameter(Mandatory=$true)][IO.FileStream]$OperationLock)
@@ -274,7 +314,9 @@ function Invoke-ExamNetworkUnderLock {
   $acl=New-Object Security.AccessControl.FileSecurity;$acl.SetSecurityDescriptorSddlForm('O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)');Set-Acl -LiteralPath $script:MetaPath -AclObject $acl
   foreach($spec in $specs){
    $filters=@{Direction=$spec.Direction;Protocol=$spec.Protocol;LocalAddress='Any';RemoteAddress=$spec.RemoteAddress;LocalPort=$spec.LocalPort;RemotePort=$spec.RemotePort}
-   if($spec.Service -ne 'Any'){$filters.Program=$spec.Program;$filters.Service=$spec.Service}
+   if($spec.Program -ne 'Any'){$filters.Program=[Environment]::ExpandEnvironmentVariables($spec.Program)}
+   if($spec.Service -ne 'Any'){$filters.Service=$spec.Service}
+   if($spec.LocalUser -ne 'Any'){$filters.LocalUser=$spec.LocalUser}
    New-NetFirewallRule -PolicyStore localhost -Name $spec.Name -DisplayName $spec.Name -Description ('ExamLab Network '+$state.RunId) -Group $script:Group -Enabled True -Profile Any -Action Allow @filters|Out-Null
   }
   Update-NetPolicy

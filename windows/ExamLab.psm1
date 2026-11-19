@@ -5,6 +5,12 @@ $script:CodeRoot = Join-Path $env:ProgramFiles 'ExamLab'
 $script:DataRoot = Join-Path $env:ProgramData 'ExamLab'
 $script:ConfigFile = Join-Path $script:DataRoot 'pc.json'
 $script:ModeFile = Join-Path $script:DataRoot 'mode.json'
+$script:ControllerConfigurationFile = Join-Path $script:DataRoot 'controller-registration.json'
+$script:ControllerStateFile = Join-Path $script:DataRoot 'controller-state.json'
+$script:ControllerHealthFile = Join-Path $script:DataRoot 'controller-health.json'
+$script:ControllerProbeOptIn = Join-Path $script:DataRoot 'controller-policy-probe.enabled'
+$script:ControllerProbeStatusFile = Join-Path $script:DataRoot 'controller-policy-probe.json'
+Import-Module (Join-Path $PSScriptRoot 'ExamLab.Controller.psm1')
 $script:Namespace = 'root\cimv2\mdm\dmmap'
 $script:LoadedSourceHash = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash
 
@@ -61,7 +67,7 @@ function Assert-Host {
 }
 
 function Assert-SafePath {
-    param([string]$Path, [switch]$Readable)
+    param([string]$Path, [switch]$Readable, [switch]$AlertPayload)
     $item=Get-Item -LiteralPath $Path -Force
     if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Reparse point: $Path" }
     $trusted=@('S-1-5-18','S-1-5-32-544') + @(Get-LocalGroupMember -SID 'S-1-5-32-544' | ForEach-Object {$_.SID.Value})
@@ -72,6 +78,9 @@ function Assert-SafePath {
         [Security.AccessControl.FileSystemRights]::TakeOwnership
     foreach ($rule in $acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])) {
         if ($rule.AccessControlType -ne 'Allow' -or $rule.IdentityReference.Value -in $trusted) { continue }
+        # Штатное наследование Program Files для установленного экрана тревоги.
+        if ($Readable -and $AlertPayload -and $rule.IsInherited -and
+            $rule.IdentityReference.Value -ceq 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464') { continue }
         # CREATOR OWNER заменяется доверенным создателем дочернего объекта.
         # Остальные InheritOnly ACE проверяем: они дадут доступ новым mode/tmp.
         if ($rule.IdentityReference.Value -eq 'S-1-3-0' -and
@@ -132,7 +141,7 @@ function Read-Context {
     }
     Assert-SafePath $script:CodeRoot -Readable
     Assert-SafePath $script:DataRoot
-    foreach ($file in @('ExamLab.psm1','exam-lab.ps1','ExamLab.Usb.psm1','ExamNetwork.psm1','LGPO.exe')) { Assert-SafePath (Join-Path $script:CodeRoot $file) -Readable }
+    foreach ($file in @('ExamLab.psm1','exam-lab.ps1','ExamLab.Usb.psm1','ExamNetwork.psm1','ExamLab.Controller.psm1','LGPO.exe')) { Assert-SafePath (Join-Path $script:CodeRoot $file) -Readable }
     Import-Module (Join-Path $script:CodeRoot 'ExamLab.Usb.psm1') -Force
     Import-Module (Join-Path $script:CodeRoot 'ExamNetwork.psm1') -Force
     Assert-SafePath $script:ConfigFile
@@ -349,48 +358,337 @@ function Initialize-ExamLab {
     } finally { $lock.Dispose() }
 }
 
-function Set-ExamLabMode {
-    param([Parameter(Mandatory)][ValidateSet('exam','normal')][string]$Mode)
-    # ВАЖНО: этот отказ предшествует чтению config, lock/metadata и любым Windows writes.
-    if ($Mode -eq 'exam') { throw 'Экзамен заблокирован до native-проверки структурного файлового ограничения и сети. Windows не изменена.' }
-    # Read-only preflight до создания lock; после acquire контекст читается заново.
-    $null=Read-Context -AllowRosterDriftOnlyForNormal
-    $lockPath=Join-Path $script:DataRoot 'operation.lock'
-    if ((Test-ExistingFile $lockPath)) { Assert-SafePath $lockPath }
-    $lock=[IO.File]::Open($lockPath,'OpenOrCreate','ReadWrite','None')
+function Assert-ExamLabExamReady {
+    throw 'Экзамен заблокирован до native-проверки структурного файлового ограничения и сети. Windows не изменена.'
+}
+
+function Stop-ExamLabExtendedCollection {
+    $result = [pscustomobject]@{Alert='NotInstalled'; Wazuh='NotInstalled'; Errors=@()}
+    $programFiles = [Environment]::GetFolderPath('ProgramFiles')
+    $powerShell = Join-Path $PSHOME 'powershell.exe'
+    $alertRoot = Join-Path $programFiles 'ExamLabAlert'
+    $alertScript = Join-Path $alertRoot 'ExamLabAlert.ps1'
     try {
-        $context=Read-Context -AllowRosterDriftOnlyForNormal
-        $components=Get-ComponentStatus $context
-        $blockers=@($components.Usb.NormalBlockers)+@($components.Network.Blockers)
-        if (-not $components.Usb.NormalAllowed -or -not $components.Network.NormalAllowed) {
-            throw ('normal не применён: component preflight: '+($blockers -join '; '))
+        $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\ExamLabAlertPilot')
+        $initialized = $null -ne $key
+        if ($key) { $key.Dispose() }
+        $installed = Test-ExistingFile $alertScript
+        if ($initialized -ne $installed) { throw 'Обнаружена неполная установка окна тревоги.' }
+        if ($installed) {
+            Assert-SafePath $alertRoot -Readable -AlertPayload
+            Assert-SafePath $alertScript -Readable -AlertPayload
+            & $powerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $alertScript -Action Disarm | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "Disarm вернул $LASTEXITCODE." }
+            $result.Alert='Disarmed'
         }
-        $network=$null
-        if ($context.Config.PSObject.Properties.Name -contains 'Network') { $network=$context.Config.Network }
-        # Все preflight завершены; фиксированные setters повторяют свои проверки.
-        # При последующем отказе нет общего успеха/rollback; own intent сохраняется.
-        $usb=$null; $net=$null; $phase='Usb'
+    } catch {
+        $result.Alert='Error'
+        $result.Errors += "Экран тревоги: $($_.Exception.Message)"
+    }
+
+    try {
+        $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\ExamLabWazuhPilot')
+        if ($key) {
+            try {
+                $installState = $key.GetValue('InstallState')
+                $expectedHash = $key.GetValue('SourceSha256')
+            } finally { $key.Dispose() }
+            if ($installState -cne 'Installed' -or $expectedHash -isnot [string] -or $expectedHash -cnotmatch '\A[A-F0-9]{64}\z') {
+                throw 'Подготовка собственного агента Wazuh не завершена.'
+            }
+            $wazuhRoot = Join-Path $programFiles 'ExamLabWazuh'
+            $wazuhSetup = Join-Path $wazuhRoot 'Install-ExamLabWazuh.ps1'
+            Assert-SafePath $wazuhRoot -Readable
+            Assert-SafePath $wazuhSetup -Readable
+            if ((Get-FileHash -LiteralPath $wazuhSetup -Algorithm SHA256).Hash -cne $expectedHash) {
+                throw 'Хеш установленного сценария Wazuh не совпадает с регистрацией.'
+            }
+            & $powerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $wazuhSetup -Action StopCollection | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "StopCollection вернул $LASTEXITCODE." }
+            $result.Wazuh='Stopped'
+        }
+    } catch {
+        $result.Wazuh='Error'
+        $result.Errors += "Wazuh: $($_.Exception.Message)"
+    }
+    return $result
+}
+
+function Invoke-ExamLabNormalUnderLock {
+    param($Context,[IO.FileStream]$Lock)
+    $components=Get-ComponentStatus $context
+    $blockers=@($components.Usb.NormalBlockers)+@($components.Network.Blockers)
+    if (-not $components.Usb.NormalAllowed -or -not $components.Network.NormalAllowed) {
+        throw ('normal не применён: component preflight: '+($blockers -join '; '))
+    }
+    $network=$null
+    if ($context.Config.PSObject.Properties.Name -contains 'Network') { $network=$context.Config.Network }
+    # Все preflight завершены; фиксированные setters повторяют свои проверки.
+    # При последующем отказе нет общего успеха/rollback; own intent сохраняется.
+    $usb=$null; $net=$null; $phase='Usb'
+    try {
+        $usb=Invoke-ExamLabUsbModeUnderLock -Mode normal -ConfigRevision $context.Revision -OperationLock $lock
+        $phase='Network'
+        $net=Invoke-ExamNetworkUnderLock -Action Normal -Config $network -ConfigRevision $context.Revision -OperationLock $lock
+    } catch {
+        $partial=[pscustomobject]@{Completed=$false;FailedComponent=$phase;Usb=$usb;Network=$net;Error=$_.Exception.Message}
+        throw ('normal не завершён; частичный результат без rollback: '+($partial | ConvertTo-Json -Depth 6 -Compress))
+    }
+    $status=Get-Status $context
+    if (-not $status.OwnSourceNormal) {
+        $incomplete=[pscustomobject]@{Completed=$false;Usb=$usb;Network=$net;FinalComponents=$status.Components;Conflicts=$status.Conflicts}
+        throw ('normal source readback не подтверждён; без rollback: '+($incomplete | ConvertTo-Json -Depth 6 -Compress))
+    }
+    $status | Add-Member -NotePropertyName Normal -NotePropertyValue ([pscustomobject]@{
+        SourceCleanupCompleted=$status.OwnSourceNormal
+        Usb=$usb; Network=$net
+        EffectiveReadbackPending=$true
+        Reason='Сняты только собственные source entries; USB effective readback требует входа пользователя. SharedPC не выключается.'
+    })
+    return $status
+}
+
+function Invoke-ExamLabControllerPolicyProbe {
+    param($Assignment,[IO.FileStream]$Lock)
+    $probe = [pscustomobject]@{
+        Revision=$Assignment.revision; ExamId=$Assignment.examId; FullReady=$false
+        PreflightStartedUtc=(Get-ControllerUtc); MachineApplyStartedUtc=$null
+        UsbSourceReadbackUtc=$null; NetworkReadbackUtc=$null; MachinePoliciesReadyUtc=$null
+        FailedPhase=$null; Error=$null
+    }
+    $phase = 'Preflight'
+    try {
+        Assert-SafePath $script:ControllerProbeOptIn
+        if ([IO.File]::ReadAllText($script:ControllerProbeOptIn) -cne 'true') { throw 'Стендовая проба не включена административным установщиком.' }
+        $context = Read-Context
+        $status = Get-Status $context
+        $network = $context.Config.PSObject.Properties['Network']
+        $endpoint = if ($network) { $network.Value.PSObject.Properties['ControllerEndpoint'] } else { $null }
+        $registration = Read-ControllerConfiguration $script:ControllerConfigurationFile
+        $url = [Uri]$registration.url
+        if (-not $status.Prepared -or -not $endpoint -or -not $endpoint.Value -or
+            $endpoint.Value.IP -cne $url.Host -or $endpoint.Value.Port -ne $url.Port) {
+            throw 'Проба требует подтверждённой Shared PC и одинакового сетевого и регистрационного адреса контроллера.'
+        }
+        $netBefore = Get-ExamNetworkStatus -Config $network.Value -ConfigRevision $context.Revision -CheckApplyHost
+        $usbBefore = $status.Components.Usb
+        if ($usbBefore.State -in @('Applying','Removing')) { throw 'Сначала завершите normal после частичного изменения USB.' }
+        if (-not $usbBefore.ExamAllowed -or $netBefore.ApplyBlockers.Count -or (-not $netBefore.ApplyAllowed -and -not $netBefore.EffectiveApplied)) {
+            throw ('Предварительные проверки USB/сети: ' + ((@($usbBefore.ExamBlockers) + @($netBefore.ApplyBlockers) + @($netBefore.EffectiveBlockers)) -join ' | '))
+        }
+        $probe.MachineApplyStartedUtc = Get-ControllerUtc
+        Write-ControllerJson $script:ControllerProbeStatusFile $probe
+        $phase = 'Usb'
+        $usb = Invoke-ExamLabUsbModeUnderLock -Mode exam -ConfigRevision $context.Revision -OperationLock $Lock
+        if ($usb.State -cne 'Applied' -or $usb.OwnSourceEntries -ne 1 -or $usb.Conflicts.Count) { throw 'USB source readback не подтверждён.' }
+        $probe.UsbSourceReadbackUtc = Get-ControllerUtc
+        $phase = 'Network'
+        $net = Invoke-ExamNetworkUnderLock -Action Apply -Config $network.Value -ConfigRevision $context.Revision -OperationLock $Lock
+        if (-not $net.EffectiveApplied) { throw 'Network ActiveStore readback не подтверждён.' }
+        $probe.NetworkReadbackUtc = Get-ControllerUtc
+        $probe.MachinePoliciesReadyUtc = $probe.NetworkReadbackUtc
+    } catch {
+        $probe.FailedPhase = $phase
+        $probe.Error = $_.Exception.Message
+    }
+    Write-ControllerJson $script:ControllerProbeStatusFile $probe
+    return $probe
+}
+
+function Open-ExamLabModeLock([string]$Path, [switch]$WaitForNormal) {
+    $wait = [Diagnostics.Stopwatch]::StartNew()
+    while ($true) {
+        try { return [IO.File]::Open($Path,'OpenOrCreate','ReadWrite','None') }
+        catch {
+            $failure = $_.Exception.GetBaseException()
+            if (-not $WaitForNormal -or $failure -isnot [IO.IOException] -or
+                ($failure.HResult -band 0xffff) -notin @(32,33) -or $wait.Elapsed.TotalSeconds -ge 180) { throw }
+            Start-Sleep -Milliseconds 250
+        }
+    }
+}
+
+function Set-ExamLabMode {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][ValidateSet('exam','normal')][string]$Mode,
+        $ControllerAssignment,
+        $LocalGeneration
+    )
+    $remote = $null -ne $ControllerAssignment
+    # Локальный exam отказывает до config, lock и любых изменений Windows.
+    if (-not $remote -and $Mode -eq 'exam') { Assert-ExamLabExamReady }
+    if (-not $remote) { $null=Read-Context -AllowRosterDriftOnlyForNormal }
+    else { Assert-Host }
+    $lockPath = Join-Path $script:DataRoot 'operation.lock'
+    if ((Test-ExistingFile $lockPath)) { Assert-SafePath $lockPath }
+    $lock = Open-ExamLabModeLock $lockPath -WaitForNormal:(-not $remote)
+    try {
+        $controller = $null
+        if ($remote) {
+            $controller = Read-ControllerState $script:ControllerStateFile $ControllerAssignment.deviceId
+            if ($controller.LocalGeneration -cne $LocalGeneration) { return }
+            $change = Compare-ControllerAssignment $ControllerAssignment $controller.Assignment
+            if ($change -ceq 'repeat' -and $controller.Result -and
+                $controller.Result.reason -cnotin @('machine-preflight-failed','local-action-failed','local-normal-incomplete','collection-stop-failed')) { return }
+            if ($change -ceq 'new') {
+                $controller.Assignment = $ControllerAssignment
+                $controller.Result = $null
+                if ($controller.AwaitingBaseline) {
+                    if ($Mode -ceq 'exam') { $controller.StoppedExamId = $ControllerAssignment.examId }
+                    $controller.AwaitingBaseline = $false
+                }
+                # Записываем принятое назначение до возможного изменения Windows.
+                Write-ControllerJson $script:ControllerStateFile $controller
+            }
+            if ($Mode -ceq 'exam') {
+                if ($controller.StoppedExamId -ceq $ControllerAssignment.examId) {
+                    if ($controller.LocalNormal -and $controller.LocalNormal.SourceCleanupCompleted) {
+                        $reason = if ($controller.LocalNormal.BaselineUnknown) { 'local-normal-baseline-unknown' } else { 'local-normal' }
+                        Set-ControllerResult $controller 'overridden' $reason $false
+                    } else {
+                        Set-ControllerResult $controller 'error' 'local-normal-incomplete' $false
+                    }
+                } elseif (Test-ExistingFile $script:ControllerProbeOptIn) {
+                    $probe = Invoke-ExamLabControllerPolicyProbe $ControllerAssignment $lock
+                    if ($probe.MachinePoliciesReadyUtc) {
+                        Set-ControllerResult $controller 'source-applied' 'machine-policies-only' $false
+                    } elseif ($probe.FailedPhase -ceq 'Preflight') {
+                        Set-ControllerResult $controller 'blocked' 'machine-preflight-failed' $false
+                    } else {
+                        Set-ControllerResult $controller 'error' 'machine-apply-failed' $false
+                    }
+                } else {
+                    Set-ControllerResult $controller 'blocked' 'full-not-ready' $false
+                }
+                Write-ControllerJson $script:ControllerStateFile $controller
+                return
+            }
+        } elseif (Test-ExistingFile $script:ControllerConfigurationFile) {
+            # Ошибка чтения состояния останавливает опрос, но оставляет доступным
+            # локальное восстановление Windows.
+            try { $controller = Read-ControllerState $script:ControllerStateFile }
+            catch { Write-Warning 'Состояние контроллера недоступно. Локальный normal продолжает восстановление.' }
+            if ($controller) {
+                $controller.LocalGeneration = [Guid]::NewGuid().ToString('N')
+                if (-not $controller.Assignment) { $controller.AwaitingBaseline = $true }
+                elseif ($controller.Assignment.mode -ceq 'exam') {
+                    $controller.StoppedExamId = $controller.Assignment.examId
+                    Set-ControllerResult $controller 'error' 'local-normal-incomplete' $false
+                }
+                $controller.LocalNormal = [pscustomobject]@{
+                    SourceCleanupCompleted=$false; EffectiveMode='Unconfirmed'; ObservedUtc=(Get-ControllerUtc)
+                    BaselineUnknown=$controller.AwaitingBaseline
+                }
+                Write-ControllerJson $script:ControllerStateFile $controller
+            }
+        }
+
+        $normalFailure = $null
         try {
-            $usb=Invoke-ExamLabUsbModeUnderLock -Mode normal -ConfigRevision $context.Revision -OperationLock $lock
-            $phase='Network'
-            $net=Invoke-ExamNetworkUnderLock -Action Normal -Config $network -ConfigRevision $context.Revision -OperationLock $lock
-        } catch {
-            $partial=[pscustomobject]@{Completed=$false;FailedComponent=$phase;Usb=$usb;Network=$net;Error=$_.Exception.Message}
-            throw ('normal не завершён; частичный результат без rollback: '+($partial | ConvertTo-Json -Depth 6 -Compress))
+            $context=Read-Context -AllowRosterDriftOnlyForNormal
+            $status = Invoke-ExamLabNormalUnderLock $context $lock
+        } catch { $normalFailure = $_ }
+
+        $collection = Stop-ExamLabExtendedCollection
+        if ($collection.Errors.Count) { Write-Warning ($collection.Errors -join ' | ') }
+        if ($normalFailure) {
+            if ($remote) {
+                Set-ControllerResult $controller 'error' 'local-action-failed' $false
+                Write-ControllerJson $script:ControllerStateFile $controller
+            }
+            throw $normalFailure
         }
-        $status=Get-Status $context
-        if (-not $status.OwnSourceNormal) {
-            $incomplete=[pscustomobject]@{Completed=$false;Usb=$usb;Network=$net;FinalComponents=$status.Components;Conflicts=$status.Conflicts}
-            throw ('normal source readback не подтверждён; без rollback: '+($incomplete | ConvertTo-Json -Depth 6 -Compress))
+        $status.Normal | Add-Member -NotePropertyName Collection -NotePropertyValue $collection
+        if ($remote) {
+            if ($collection.Errors.Count) {
+                Set-ControllerResult $controller 'error' 'collection-stop-failed' $false
+            } elseif ($status.EffectiveMode -ceq 'normal') {
+                Set-ControllerResult $controller 'applied' '' $status.FullReady
+            } else {
+                Set-ControllerResult $controller 'source-applied' 'effective-readback-pending' $status.FullReady
+            }
+        } elseif ($controller) {
+            $controller.LocalNormal = [pscustomobject]@{
+                SourceCleanupCompleted=$status.Normal.SourceCleanupCompleted
+                EffectiveMode=$status.EffectiveMode
+                ObservedUtc=(Get-ControllerUtc)
+                BaselineUnknown=$controller.AwaitingBaseline
+            }
+            if ($controller.StoppedExamId -and $controller.Assignment.mode -ceq 'exam') {
+                $reason = if ($collection.Errors.Count) { 'local-normal-collection-stop-failed' } else { 'local-normal' }
+                Set-ControllerResult $controller 'overridden' $reason $status.FullReady
+            }
         }
-        $status | Add-Member -NotePropertyName Normal -NotePropertyValue ([pscustomobject]@{
-            SourceCleanupCompleted=$status.OwnSourceNormal
-            Usb=$usb; Network=$net
-            EffectiveReadbackPending=$true
-            Reason='Сняты только собственные source entries; USB effective readback требует входа пользователя. SharedPC не выключается.'
-        })
+        if ($controller) { Write-ControllerJson $script:ControllerStateFile $controller }
         return $status
     } finally { $lock.Dispose() }
 }
 
-Export-ModuleMember -Function Get-ExamLabStatus,Initialize-ExamLab,Set-ExamLabMode
+function Invoke-ExamLabControllerLoop {
+    Assert-Host
+    if ($PSScriptRoot -ne $script:CodeRoot) { throw 'Запустите установленную задачу опроса.' }
+    Assert-SafePath $script:CodeRoot -Readable
+    Assert-SafePath (Join-Path $script:CodeRoot 'ExamLab.Controller.psm1') -Readable
+    Assert-SafePath $script:DataRoot
+    Assert-SafePath $script:ControllerConfigurationFile
+    $configuration = Read-ControllerConfiguration $script:ControllerConfigurationFile
+    if (Test-ExistingFile $script:ControllerStateFile) { Assert-SafePath $script:ControllerStateFile }
+    $boot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime()
+    $bootUtc = $boot.ToString("yyyy-MM-ddTHH:mm:ss.fff'Z'",[Globalization.CultureInfo]::InvariantCulture)
+    $health = [pscustomobject]@{
+        BootUtc=$bootUtc; FirstAttemptUtc=$null; LastAttemptUtc=$null
+        FirstValidContactUtc=$null; LastValidContactUtc=$null; Status='Starting'; Reason=$null; ActionDetail=$null
+    }
+    if (Test-ExistingFile $script:ControllerHealthFile) {
+        Assert-SafePath $script:ControllerHealthFile
+        $previous = [IO.File]::ReadAllText($script:ControllerHealthFile) | ConvertFrom-Json
+        if ([DateTime]$previous.BootUtc -eq [DateTime]$bootUtc) {
+            $health.FirstAttemptUtc = $previous.FirstAttemptUtc
+            $health.FirstValidContactUtc = $previous.FirstValidContactUtc
+            $health.LastValidContactUtc = $previous.LastValidContactUtc
+        }
+    }
+    $client = New-ExamLabHttpClient
+    try {
+        while ($true) {
+            $health.LastAttemptUtc = Get-ControllerUtc
+            $health.ActionDetail = $null
+            if (-not $health.FirstAttemptUtc) { $health.FirstAttemptUtc = $health.LastAttemptUtc }
+            Write-ControllerJson $script:ControllerHealthFile $health
+            try {
+                $snapshot = Read-ControllerState $script:ControllerStateFile $configuration.deviceId
+            } catch {
+                $health.Status='LocalError'
+                $health.Reason='controller-state-unreadable'
+                Write-ControllerJson $script:ControllerHealthFile $health
+                Start-Sleep -Seconds 15
+                continue
+            }
+            try {
+                $assignment = Invoke-ControllerRequest $client $configuration $snapshot.Result
+                $null = Compare-ControllerAssignment $assignment $snapshot.Assignment
+                $health.LastValidContactUtc = Get-ControllerUtc
+                if (-not $health.FirstValidContactUtc) { $health.FirstValidContactUtc = $health.LastValidContactUtc }
+                $health.Status='Connected'
+                $health.Reason=$null
+                Write-ControllerJson $script:ControllerHealthFile $health
+                try {
+                    $null = Set-ExamLabMode -Mode $assignment.mode -ControllerAssignment $assignment -LocalGeneration $snapshot.LocalGeneration
+                } catch {
+                    $health.Status='LocalError'
+                    $health.Reason='controller-action-delayed-or-failed'
+                    $health.ActionDetail=$_.Exception.Message
+                    Write-ControllerJson $script:ControllerHealthFile $health
+                }
+            } catch {
+                $health.Status = if ($_.Exception.Message -ceq 'controller-unreachable') { 'Unavailable' } else { 'Rejected' }
+                $health.Reason = $_.Exception.Message
+                Write-ControllerJson $script:ControllerHealthFile $health
+            }
+            Start-Sleep -Seconds 15
+        }
+    } finally { $client.Dispose() }
+}
+
+Export-ModuleMember -Function Get-ExamLabStatus,Initialize-ExamLab,Set-ExamLabMode,Invoke-ExamLabControllerLoop
