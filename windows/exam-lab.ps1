@@ -9,6 +9,10 @@ try {
         'prepare' { Initialize-ExamLab | ConvertTo-Json -Depth 6 }
         'check' { Get-ExamLabStatus | ConvertTo-Json -Depth 6 }
         'exam' { Set-ExamLabMode -Mode exam | ConvertTo-Json -Depth 6 }
-        'normal' { Set-ExamLabMode -Mode normal | ConvertTo-Json -Depth 6 }
+        'normal' {
+            $result = Set-ExamLabMode -Mode normal
+            $result | ConvertTo-Json -Depth 7
+            if ($result.Normal.Collection.Errors.Count) { exit 1 }
+        }
     }
 } catch { Write-Error $_ -ErrorAction Continue; exit 1 }

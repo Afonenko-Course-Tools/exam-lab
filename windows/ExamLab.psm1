@@ -359,6 +359,58 @@ function Assert-ExamLabExamReady {
     throw 'Экзамен заблокирован до native-проверки структурного файлового ограничения и сети. Windows не изменена.'
 }
 
+function Stop-ExamLabExtendedCollection {
+    $result = [pscustomobject]@{Alert='NotInstalled'; Wazuh='NotInstalled'; Errors=@()}
+    $programFiles = [Environment]::GetFolderPath('ProgramFiles')
+    $powerShell = Join-Path $PSHOME 'powershell.exe'
+    $alertRoot = Join-Path $programFiles 'ExamLabAlert'
+    $alertScript = Join-Path $alertRoot 'ExamLabAlert.ps1'
+    try {
+        $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\ExamLabAlertPilot')
+        $initialized = $null -ne $key
+        if ($key) { $key.Dispose() }
+        $installed = Test-ExistingFile $alertScript
+        if ($initialized -ne $installed) { throw 'Обнаружена неполная установка окна тревоги.' }
+        if ($installed) {
+            Assert-SafePath $alertRoot -Readable
+            Assert-SafePath $alertScript -Readable
+            & $powerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $alertScript -Action Disarm | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "Disarm вернул $LASTEXITCODE." }
+            $result.Alert='Disarmed'
+        }
+    } catch {
+        $result.Alert='Error'
+        $result.Errors += "Экран тревоги: $($_.Exception.Message)"
+    }
+
+    try {
+        $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\ExamLabWazuhPilot')
+        if ($key) {
+            try {
+                $installState = $key.GetValue('InstallState')
+                $expectedHash = $key.GetValue('SourceSha256')
+            } finally { $key.Dispose() }
+            if ($installState -cne 'Installed' -or $expectedHash -isnot [string] -or $expectedHash -cnotmatch '\A[A-F0-9]{64}\z') {
+                throw 'Подготовка собственного агента Wazuh не завершена.'
+            }
+            $wazuhRoot = Join-Path $programFiles 'ExamLabWazuh'
+            $wazuhSetup = Join-Path $wazuhRoot 'Install-ExamLabWazuh.ps1'
+            Assert-SafePath $wazuhRoot -Readable
+            Assert-SafePath $wazuhSetup -Readable
+            if ((Get-FileHash -LiteralPath $wazuhSetup -Algorithm SHA256).Hash -cne $expectedHash) {
+                throw 'Хеш установленного сценария Wazuh не совпадает с регистрацией.'
+            }
+            & $powerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $wazuhSetup -Action StopCollection | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "StopCollection вернул $LASTEXITCODE." }
+            $result.Wazuh='Stopped'
+        }
+    } catch {
+        $result.Wazuh='Error'
+        $result.Errors += "Wazuh: $($_.Exception.Message)"
+    }
+    return $result
+}
+
 function Invoke-ExamLabNormalUnderLock {
     param($Context,[IO.FileStream]$Lock)
     $components=Get-ComponentStatus $context
@@ -417,6 +469,7 @@ function Invoke-ExamLabControllerPolicyProbe {
         }
         $netBefore = Get-ExamNetworkStatus -Config $network.Value -ConfigRevision $context.Revision -CheckApplyHost
         $usbBefore = $status.Components.Usb
+        if ($usbBefore.State -in @('Applying','Removing')) { throw 'Сначала завершите normal после частичного изменения USB.' }
         if (-not $usbBefore.ExamAllowed -or $netBefore.ApplyBlockers.Count -or (-not $netBefore.ApplyAllowed -and -not $netBefore.EffectiveApplied)) {
             throw ('Предварительные проверки USB/сети: ' + ((@($usbBefore.ExamBlockers) + @($netBefore.ApplyBlockers) + @($netBefore.EffectiveBlockers)) -join ' | '))
         }
@@ -474,7 +527,7 @@ function Set-ExamLabMode {
             if ($controller.LocalGeneration -cne $LocalGeneration) { return }
             $change = Compare-ControllerAssignment $ControllerAssignment $controller.Assignment
             if ($change -ceq 'repeat' -and $controller.Result -and
-                $controller.Result.reason -cnotin @('machine-preflight-failed','local-action-failed','local-normal-incomplete')) { return }
+                $controller.Result.reason -cnotin @('machine-preflight-failed','local-action-failed','local-normal-incomplete','collection-stop-failed')) { return }
             if ($change -ceq 'new') {
                 $controller.Assignment = $ControllerAssignment
                 $controller.Result = $null
@@ -528,18 +581,26 @@ function Set-ExamLabMode {
             }
         }
 
+        $normalFailure = $null
         try {
             $context=Read-Context -AllowRosterDriftOnlyForNormal
             $status = Invoke-ExamLabNormalUnderLock $context $lock
-        } catch {
+        } catch { $normalFailure = $_ }
+
+        $collection = Stop-ExamLabExtendedCollection
+        if ($collection.Errors.Count) { Write-Warning ($collection.Errors -join ' | ') }
+        if ($normalFailure) {
             if ($remote) {
                 Set-ControllerResult $controller 'error' 'local-action-failed' $false
                 Write-ControllerJson $script:ControllerStateFile $controller
             }
-            throw
+            throw $normalFailure
         }
+        $status.Normal | Add-Member -NotePropertyName Collection -NotePropertyValue $collection
         if ($remote) {
-            if ($status.EffectiveMode -ceq 'normal') {
+            if ($collection.Errors.Count) {
+                Set-ControllerResult $controller 'error' 'collection-stop-failed' $false
+            } elseif ($status.EffectiveMode -ceq 'normal') {
                 Set-ControllerResult $controller 'applied' '' $status.FullReady
             } else {
                 Set-ControllerResult $controller 'source-applied' 'effective-readback-pending' $status.FullReady
@@ -552,7 +613,8 @@ function Set-ExamLabMode {
                 BaselineUnknown=$controller.AwaitingBaseline
             }
             if ($controller.StoppedExamId -and $controller.Assignment.mode -ceq 'exam') {
-                Set-ControllerResult $controller 'overridden' 'local-normal' $status.FullReady
+                $reason = if ($collection.Errors.Count) { 'local-normal-collection-stop-failed' } else { 'local-normal' }
+                Set-ControllerResult $controller 'overridden' $reason $status.FullReady
             }
         }
         if ($controller) { Write-ControllerJson $script:ControllerStateFile $controller }
