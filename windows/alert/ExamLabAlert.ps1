@@ -14,7 +14,6 @@ $registrySubkey = 'SOFTWARE\ExamLabAlertPilot'
 $registryPath = "HKLM:\$registrySubkey"
 $source = 'ExamLab-Alert'
 $signalEventId = 6101
-$acknowledgementEventId = 6102
 $powerShell = Join-Path $PSHOME 'powershell.exe'
 
 if (-not [Environment]::Is64BitProcess -or $PSScriptRoot -ne $base) {
@@ -73,7 +72,11 @@ if ($Action -eq 'Receive') {
 }
 
 function Save-State($Value) {
-    Set-ItemProperty -LiteralPath $registryPath -Name Status -Value ($Value | ConvertTo-Json -Compress)
+    Set-ItemProperty -LiteralPath $registryPath -Name Status -Value ($Value | ConvertTo-Json -Compress -Depth 3)
+}
+
+function Get-Acknowledgement($Value) {
+    $Value | Select-Object RunId, GuestSid, SessionId, AcknowledgedUtc, AcknowledgedBy, AcknowledgedBySid
 }
 
 function Test-GuestDesktop([string]$Sid, [int]$SessionId) {
@@ -144,6 +147,9 @@ try {
             if (-not (Test-GuestDesktop $sid.Value $GuestSessionId)) {
                 throw 'Explorer указанного пользователя и сеанса не найден.'
             }
+            $lastAcknowledgement = if ($state.AcknowledgedUtc) {
+                Get-Acknowledgement $state
+            } else { $state.LastAcknowledgement }
             $state = [ordered]@{
                 RunId = [guid]::NewGuid().ToString('D')
                 Phase = 'Armed'
@@ -155,6 +161,7 @@ try {
                 AcknowledgedUtc = $null
                 AcknowledgedBy = $null
                 AcknowledgedBySid = $null
+                LastAcknowledgement = $lastAcknowledgement
                 DisarmedUtc = $null
             }
             Register-AlertScreen $state
@@ -205,11 +212,9 @@ try {
             $state.AcknowledgedUtc = [DateTimeOffset]::UtcNow.ToString('o')
             $state.AcknowledgedBy = $identity.Name
             $state.AcknowledgedBySid = $identity.User.Value
+            $receipt = Get-Acknowledgement $state
+            $state | Add-Member -NotePropertyName LastAcknowledgement -NotePropertyValue $receipt -Force
             Save-State $state
-            $receipt = $state | Select-Object RunId, GuestSid, SessionId, AcknowledgedUtc,
-                AcknowledgedBy, AcknowledgedBySid | ConvertTo-Json -Compress
-            Write-EventLog -LogName Application -Source $source -EventId $acknowledgementEventId `
-                -EntryType Information -Message $receipt
             Remove-AlertScreen $state
         }
         'Disarm' {
