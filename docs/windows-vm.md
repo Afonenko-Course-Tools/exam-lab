@@ -45,9 +45,9 @@ https://software-static.download.prss.microsoft.com/dbazure/988969d5-f34g-4e03-a
 | LGPO 3.0, архив SCT | [Microsoft](https://download.microsoft.com/download/8/5/c/85c25433-a1b0-4ffa-9429-7e023e7da8d8/LGPO.zip) | `cb7159d134a0a1e7b1ed2ada9a3ce8ce8f4de391d14403d55438af824247cc55` |
 
 Хеши IDEA, JDK и Git сопоставлены с данными издателя. В Windows дополнительно
-проверяется Authenticode перед запуском установщиков. Хеш загруженного Windows
-ISO зафиксирован после окончания загрузки; без опубликованного Microsoft
-эталонного SHA256 он подтверждает идентичность локального файла, а не подпись Microsoft.
+проверяется Authenticode перед запуском установщиков. 20 ноября SHA-256
+локального ISO совпал с контрольной суммой для Enterprise 22H2 Eval EN-US x64
+и с хешем полной повторной загрузки. [Контрольные суммы Microsoft](https://download.microsoft.com/download/c/1/1/c11d2ca5-967c-45c0-bc7d-2d9ca3f1fe07/Windows10Enterprise22H2HashValues.pdf)
 
 ## Первоначальная установка
 
