@@ -873,8 +873,10 @@ function Save-ExamLabOwnedTree($Ownership, [string]$Path, [string[]]$VerifiedFil
     foreach ($item in Get-ExamLabProtectedTreeItems $Path) {
         $name = $item.FullName.Substring($Path.Length + 1)
         $prior = if ($previous) { $previous.Value.PSObject.Properties[$name] } else { $null }
-        $listed = $item.FullName -in $VerifiedFiles -or ($item.PSIsContainer -and
-            @($VerifiedFiles | Where-Object { $_.StartsWith($item.FullName + '\', [StringComparison]::OrdinalIgnoreCase) }).Count)
+        $listed = $verifiedOnly -and ($item.FullName -in $VerifiedFiles -or ($item.PSIsContainer -and
+            @($VerifiedFiles | Where-Object {
+                $_ -and $_.StartsWith($item.FullName + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)
+            }).Count))
         if ($prior -and -not $listed) {
             $hashes[$name] = $prior.Value
         } elseif ($listed -or (-not $previous -and -not $verifiedOnly)) {

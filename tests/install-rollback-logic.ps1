@@ -6,6 +6,7 @@ $temporary = Join-Path ([IO.Path]::GetTempPath()) ('exam-lab-rollback-' + [guid]
 $examLabReportsPath = $temporary
 $examLabStatePath = $temporary
 $examLabInstallChangesPath = Join-Path $temporary 'installation-pending.json'
+$examLabOwnershipPath = Join-Path $temporary 'ownership.json'
 [void][IO.Directory]::CreateDirectory($temporary)
 try {
     $core = Join-Path $PSScriptRoot '..\setup\ExamLabMaintenance.Core.ps1'
@@ -88,6 +89,33 @@ try {
     if ($result.Count -ne 2 -or $result[0].Status -cne 'ReviewRequired' -or
         $result[0].Target -cne 'Shared PC' -or (Test-Path -LiteralPath $staged)) {
         throw 'Recovery lost the interrupted staging file or durable residual report.'
+    }
+
+    $folder = Join-Path $temporary 'owned-tree'
+    $nested = Join-Path $folder 'nested'
+    [void][IO.Directory]::CreateDirectory($nested)
+    $approved = Join-Path $nested 'approved.txt'
+    $unapproved = Join-Path $nested 'unapproved.txt'
+    [IO.File]::WriteAllText($approved, 'approved')
+    [IO.File]::WriteAllText($unapproved, 'unapproved')
+    $issued = [pscustomobject]@{
+        Resources = [pscustomobject]@{ $folder = 'Created' }; Trees = [pscustomobject]@{}
+    }
+    Save-ExamLabOwnedTree $issued $folder
+    if (@($issued.Trees.PSObject.Properties[$folder].Value.PSObject.Properties).Count -ne 3) {
+        throw 'Initial capture without a whitelist omitted owned content.'
+    }
+    $issued.Trees = [pscustomobject]@{}
+    Save-ExamLabOwnedTree $issued $folder -VerifiedFiles @()
+    if (@($issued.Trees.PSObject.Properties[$folder].Value.PSObject.Properties).Count) {
+        throw 'An empty explicit whitelist accepted files.'
+    }
+    $issued.Trees = [pscustomobject]@{}
+    Save-ExamLabOwnedTree $issued $folder -VerifiedFiles @($null, $approved)
+    $record = $issued.Trees.PSObject.Properties[$folder].Value
+    if (@($record.PSObject.Properties).Count -ne 2 -or $record.nested -cne 'Directory' -or
+        -not $record.PSObject.Properties[(Join-Path 'nested' 'approved.txt')]) {
+        throw 'An explicit whitelist did not capture the verified file and its parent.'
     }
 
     if ((ConvertTo-ExamLabTaskDuration 'PT72H') -cne (ConvertTo-ExamLabTaskDuration 'P3D')) {
