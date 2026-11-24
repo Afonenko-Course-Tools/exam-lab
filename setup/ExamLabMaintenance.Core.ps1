@@ -362,8 +362,12 @@ function Suspend-ExamLabPolling {
             }
             return $wasEnabled
         } catch {
-            if ($wasEnabled) { Enable-ScheduledTask -InputObject $task | Out-Null }
-            throw
+            $failure = $_
+            if ($wasEnabled) {
+                try { Enable-ScheduledTask -InputObject $task | Out-Null }
+                catch { Write-Warning "Could not restore the enabled poll task: $_" }
+            }
+            throw $failure
         }
     } finally { if ($operation) { $operation.Dispose() } }
 }
@@ -906,12 +910,15 @@ function Complete-ExamLabInstallation($Ownership, [string]$Version) {
             Start-ExamLabPolling
             Publish-ExamLabInstallation $Ownership $Version
         } catch {
-            $task = Get-ExamLabTask $examLabPollTask -RequireOwnership
-            if ($task -and $task.State -ne 'Disabled') {
-                Disable-ScheduledTask -InputObject $task | Out-Null
-                Stop-ScheduledTask -InputObject $task
-            }
-            throw
+            $failure = $_
+            try {
+                $task = Get-ExamLabTask $examLabPollTask -RequireOwnership
+                if ($task -and $task.State -ne 'Disabled') {
+                    Disable-ScheduledTask -InputObject $task | Out-Null
+                    if ($task.State -in @('Running', 'Queued')) { Stop-ScheduledTask -InputObject $task }
+                }
+            } catch { Write-Warning "Could not stop the poll task after installation failed: $_" }
+            throw $failure
         }
     } finally { $operation.Dispose() }
 }

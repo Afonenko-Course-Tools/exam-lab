@@ -8,8 +8,8 @@
 .DESCRIPTION
 Запускается локальным администратором в одноразовой Windows VM до первого
 обращения за регистрацией ExamLab. Использует уже работающий WinRM с шифрованием
-и входящим правилом для одного IPv4-адреса оператора. При включении перезапускает
-WinRM, чтобы новая конечная точка вступила в силу. Выполняйте это из локального
+и входящим правилом для IPv4-адреса оператора. Временное правило блокирует
+остальные источники на порте слушателя. При включении перезапускает WinRM, чтобы новая конечная точка вступила в силу. Выполняйте это из локального
 административного сеанса. Пароль вводится в закрытом виде.
 Отдельная учётная запись работает через конечную точку ExamLab-Diagnostics.
 Доступная ей команда Get-ExamLabDiagnosticSnapshot читает задачи и события.
@@ -96,16 +96,56 @@ function Assert-ScopedWinRM {
         $program = [Environment]::ExpandEnvironmentVariables(($rule | Get-NetFirewallApplicationFilter).Program)
         if ($program -notin 'Any', 'System', $hostProcess) { continue }
 
-        $remotes = @(($rule | Get-NetFirewallAddressFilter).RemoteAddress)
-        if (-not $remotes.Count -or @($remotes | Where-Object { $_ -notin $address, "$address/32" }).Count) {
-            throw "Firewall rule '$($rule.Name)' could permit WinRM from another source."
+        if (($rule | Get-NetFirewallSecurityFilter).OverrideBlockRules -eq 'True') {
+            throw "Firewall bypass rule '$($rule.Name)' could override the diagnostic source restriction."
         }
-        if ($rule.Profile -eq 'Any' -and $portFilter.LocalPort -eq [string]$port) { $foundScope = $true }
+        $remotes = @(($rule | Get-NetFirewallAddressFilter).RemoteAddress)
+        if ($rule.Profile -eq 'Any' -and $portFilter.LocalPort -eq [string]$port -and $remotes.Count -eq 1 -and
+            $remotes[0] -in $address, "$address/32") { $foundScope = $true }
     }
     if (-not $foundScope) {
         throw "No active firewall rule for TCP $port and source $address in every profile."
     }
     return $port
+}
+
+function Format-DiagnosticIPv4([uint32]$Number) {
+    $octets = [BitConverter]::GetBytes($Number)
+    [Array]::Reverse($octets)
+    return [IPAddress]::new($octets).ToString()
+}
+
+function Get-DiagnosticBlockedSources([IPAddress]$OperatorAddress) {
+    if ($OperatorAddress.AddressFamily -ne 'InterNetwork' -or
+        $OperatorAddress.Equals([IPAddress]::Any) -or $OperatorAddress.Equals([IPAddress]::Broadcast)) {
+        throw 'Specify one unicast IPv4 address as seen by the VM.'
+    }
+    $octets = $OperatorAddress.GetAddressBytes()
+    [Array]::Reverse($octets)
+    $number = [BitConverter]::ToUInt32($octets, 0)
+    "0.0.0.0-$(Format-DiagnosticIPv4 ($number - 1))"
+    "$(Format-DiagnosticIPv4 ($number + 1))-255.255.255.255"
+    # IPv6 loopback remains available for local WSMan configuration.
+    '::2-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff'
+}
+
+function Assert-DiagnosticFirewallRule($Rule, $Owner) {
+    $ports = $Rule | Get-NetFirewallPortFilter
+    $addresses = $Rule | Get-NetFirewallAddressFilter
+    $expectedSources = @(Get-DiagnosticBlockedSources ([IPAddress]$Owner.SourceIPv4))
+    $actualSources = @($addresses.RemoteAddress)
+    if ($Rule.Description -cne "ExamLabDiag:$($Owner.Id)" -or $Rule.Enabled -ne 'True' -or
+        $Rule.Direction -ne 'Inbound' -or $Rule.Action -ne 'Block' -or $Rule.Profile -ne 'Any' -or
+        $ports.Protocol -notin 'TCP', '6' -or $ports.LocalPort -ne [string]$Owner.Port -or $ports.RemotePort -ne 'Any' -or
+        $addresses.LocalAddress -ne 'Any' -or (Compare-Object $expectedSources $actualSources)) {
+        throw "The diagnostic firewall rule '$($Rule.Name)' differs from its owned definition."
+    }
+    if (($Rule | Get-NetFirewallApplicationFilter).Program -ne 'Any' -or
+        ($Rule | Get-NetFirewallServiceFilter).Service -ne 'Any' -or
+        ($Rule | Get-NetFirewallInterfaceTypeFilter).InterfaceType -ne 'Any' -or
+        ($Rule | Get-NetFirewallInterfaceFilter).InterfaceAlias -ne 'Any') {
+        throw "The diagnostic firewall rule '$($Rule.Name)' has unexpected filters."
+    }
 }
 
 function Remove-DiagnosticAccess {
@@ -118,8 +158,16 @@ function Remove-DiagnosticAccess {
 
     Assert-DiagnosticPath $directory
     Assert-DiagnosticPath $ownerFile
-    $owner = [IO.File]::ReadAllText($ownerFile)
-    if ($owner -cnotmatch '\A[0-9a-f]{32}\z') { throw 'Invalid diagnostic access ownership record.' }
+    $record = [IO.File]::ReadAllText($ownerFile)
+    $scope = $null
+    if ($record -cmatch '\A[0-9a-f]{32}\z') { $owner = $record }
+    else {
+        $scope = $record | ConvertFrom-Json
+        $owner = $scope.Id
+        if ($owner -cnotmatch '\A[0-9a-f]{32}\z' -or [int]$scope.Port -lt 1 -or [int]$scope.Port -gt 65535) {
+            throw 'Invalid diagnostic access ownership record.'
+        }
+    }
     $account = Get-DiagnosticAccount
     if ($account -and $account.Description -cne "ExamLabDiag:$owner") {
         throw 'The local account is not owned by this diagnostic access script.'
@@ -142,6 +190,13 @@ function Remove-DiagnosticAccess {
         Unregister-PSSessionConfiguration -Name $endpointName -Force -NoServiceRestart
     }
     if ($account) { Remove-LocalUser -SID $account.SID }
+    if ($scope) {
+        $ownedRule = Get-NetFirewallRule -PolicyStore PersistentStore -Name "ExamLab-Diagnostics-$owner" -ErrorAction SilentlyContinue
+        if ($ownedRule) {
+            Assert-DiagnosticFirewallRule $ownedRule $scope
+            $ownedRule | Remove-NetFirewallRule
+        }
+    }
     if (Test-Path -LiteralPath $configurationFile) { Assert-DiagnosticPath $configurationFile }
     [IO.File]::Delete($configurationFile)
     if (Get-ChildItem -LiteralPath $directory -Force | Where-Object Name -ne 'owner.txt') {
@@ -187,6 +242,7 @@ try {
     $owner = $ownerGuid.ToString('N')
     $leaseName = "$owner.lease"
     $leaseFile = Join-Path $directory $leaseName
+    $scope = [pscustomobject]@{ Id = $owner; Port = $port; SourceIPv4 = $SourceIPv4.ToString() }
 
     $null = [IO.Directory]::CreateDirectory($directory)
     try {
@@ -199,7 +255,7 @@ try {
             $acl.SetAccessRule($rule)
         }
         Set-Acl -LiteralPath $directory -AclObject $acl
-        [IO.File]::WriteAllText($ownerFile, $owner)
+        [IO.File]::WriteAllText($ownerFile, ($scope | ConvertTo-Json -Compress))
     } catch {
         if (-not [IO.File]::Exists($ownerFile)) { [IO.Directory]::Delete($directory) }
         throw
@@ -258,6 +314,14 @@ try {
         if (-not (Test-PSSessionConfigurationFile -Path $configurationFile)) {
             throw 'Windows rejected the diagnostic session configuration.'
         }
+        $firewallName = "ExamLab-Diagnostics-$owner"
+        $blockedSources = @(Get-DiagnosticBlockedSources $SourceIPv4)
+        New-NetFirewallRule -PolicyStore PersistentStore -Name $firewallName -DisplayName 'ExamLab temporary diagnostic access scope' `
+            -Description "ExamLabDiag:$owner" -Enabled True -Profile Any -Direction Inbound -Action Block `
+            -Protocol TCP -LocalPort $port -RemoteAddress $blockedSources | Out-Null
+        $activeRule = Get-NetFirewallRule -PolicyStore ActiveStore -Name $firewallName
+        Assert-DiagnosticFirewallRule $activeRule $scope
+
         $sid = $account.SID.Value
         $options = New-PSTransportOption -IdleTimeoutSec 300 -MaxIdleTimeoutSec 600 -MaxSessionsPerUser 2
         Register-PSSessionConfiguration -Name $endpointName -Path $configurationFile -Force -TransportOption $options `

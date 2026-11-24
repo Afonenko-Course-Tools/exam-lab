@@ -487,6 +487,9 @@ function Invoke-Bootstrap {
     }
     if (-not $runtimeReady) {
         if ($action -eq 'Verify') { throw 'PowerShell 7 x64 for this release is unavailable.' }
+        if (Test-Path -LiteralPath (Join-Path $programFiles 'ExamLab')) {
+            throw 'The existing ExamLab installation requires local maintenance before changing its PowerShell runtime.'
+        }
         $msi = Join-Path $cache $runtime.Name
         $log = Join-Path $report 'PowerShell-msi.log'
         $signature = Get-AuthenticodeSignature -LiteralPath $msi
