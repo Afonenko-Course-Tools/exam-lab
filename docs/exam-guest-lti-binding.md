@@ -66,7 +66,7 @@ Windows. [Критерии панели](campaign-assignment-expanded-vm-trace.m
    игнорируется. На втором порту нет публичного доступа к private handoff,
    Moodle, PL API или произвольному upstream. Для этой проверки отключают
    возобновление TLS и keep-alive на втором listener.
-   [Проверка владения ключом в TLS](https://www.rfc-editor.org/rfc/rfc9846.html#section-4.4.3)
+   [Проверка владения ключом в TLS](https://www.rfc-editor.org/rfc/rfc9846.html#section-4.5.2)
 5. Gateway сопоставляет клиентское подтверждение с уже проверенным LTI
    snapshot при атомарном употреблении обычного handoff. Nginx передаёт
    Native PL исходные заголовки подтверждённых UID/имени, **Host** базового
