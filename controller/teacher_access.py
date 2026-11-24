@@ -9,7 +9,8 @@ import struct
 from threading import Thread
 
 
-MAX_TEACHER_REQUEST = 8192
+# Групповое завершение передаёт до 100 целей с идентификатором сеанса у каждой.
+MAX_TEACHER_REQUEST = 32768
 PEER_CREDENTIALS = struct.Struct("=iII")
 
 

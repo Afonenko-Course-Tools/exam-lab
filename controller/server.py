@@ -510,8 +510,7 @@ def record_campaign(db, device_id, client, result, readiness, active, now):
         "UPDATE device_campaign SET installation = ?, installation_seen = ? WHERE device_id = ?",
         (json.dumps(install) if install else None, now_utc, device_id),
     )
-    stored = db.execute("SELECT guest_observation FROM device_campaign WHERE device_id = ?", (device_id,)).fetchone()[0]
-    previous = json.loads(stored) if stored else None
+    previous = read_campaign_guest(db, device_id)
     observation = None
     if active["mode"] == "exam" and readiness is not None and readiness["revision"] == active["revision"]:
         row = read_readiness(db, device_id)
@@ -523,13 +522,24 @@ def record_campaign(db, device_id, client, result, readiness, active, now):
             ) > (previous["revision"], previous["bootUtc"], previous["observedUtc"]))
         ):
             same_boot = previous and same_fields(previous, accepted, ("revision", "bootUtc"))
+            state = client["guestState"] or "unknown"
+            last_session = accepted["guestSessionId"] if state == "present" else (
+                previous["lastGuestSessionId"] if same_boot else None
+            )
+            same_guest = same_boot and accepted["guestSessionId"] in (None, previous["lastGuestSessionId"])
+            student = previous.get("confirmedStudent") if same_guest else None
+            last_exit = previous.get("lastGuestExit") if previous and previous.get("examId") == active["examId"] else None
             observation = {
                 **{key: accepted[key] for key in (*SESSION_FIELDS, "observedUtc", "receivedUtc")},
-                "state": client["guestState"] or "unknown", "alertId": None,
-                "lastGuestSessionId": accepted["guestSessionId"] if client["guestState"] == "present" else (
-                    previous["lastGuestSessionId"] if same_boot else None
-                ),
+                "examId": active["examId"], "state": state, "alertId": None, "lastGuestSessionId": last_session,
+                "confirmedStudent": student, "lastGuestExit": last_exit,
             }
+            if student and last_session and state == "absent" and not ended_guest_matches(observation, last_exit):
+                observation["lastGuestExit"] = {
+                    "revision": observation["revision"], "bootUtc": observation["bootUtc"],
+                    "guestSessionId": last_session, "exitedUtc": observation["observedUtc"], "student": student,
+                    "source": "manual",
+                }
             if observation["state"] in ("present", "absent"):
                 for row in db.execute(
                     "SELECT alert_id, report FROM device_alerts WHERE device_id = ? AND acknowledgement IS NOT NULL AND cancelled = 0",
@@ -538,9 +548,7 @@ def record_campaign(db, device_id, client, result, readiness, active, now):
                     if not matches_alert_session(json.loads(row["report"]), observation):
                         db.execute("UPDATE device_alerts SET cancelled = 1 WHERE device_id = ? AND alert_id = ?",
                                    (device_id, row["alert_id"]))
-            if previous and (not same_boot or (
-                observation["state"] == "present" and previous["lastGuestSessionId"] != observation["guestSessionId"]
-            )):
+            if previous and not same_guest:
                 db.execute("UPDATE exam_places SET submission = NULL WHERE device_id = ? AND exam_id = ?",
                            (device_id, active["examId"]))
 
@@ -745,9 +753,12 @@ def get_place(db, device_id, exam_id):
     return db.execute("SELECT * FROM exam_places WHERE exam_id = ? AND device_id = ?", (exam_id, device_id)).fetchone()
 
 
-def campaign_observation(db, device_id, active, now):
+def read_campaign_guest(db, device_id):
     row = db.execute("SELECT guest_observation FROM device_campaign WHERE device_id = ?", (device_id,)).fetchone()
-    saved = json.loads(row["guest_observation"]) if row and row["guest_observation"] else None
+    return json.loads(row["guest_observation"]) if row and row["guest_observation"] else None
+
+
+def campaign_observation(db, device_id, saved, active, now):
     readiness_row = read_readiness(db, device_id)
     latest = json.loads(readiness_row["observation"]) if readiness_row else None
     if (
@@ -756,6 +767,26 @@ def campaign_observation(db, device_id, active, now):
     ):
         return saved
     return None
+
+
+def ended_guest_matches(observation, target):
+    return bool(
+        target and observation and observation["state"] == "absent"
+        and same_fields(target, observation, ("revision", "bootUtc"))
+        and target["guestSessionId"] == observation["lastGuestSessionId"]
+    )
+
+
+def can_submit_after_exit(place, observation):
+    last_exit = observation.get("lastGuestExit") if observation else None
+    return bool(
+        place and ended_guest_matches(observation, last_exit)
+        and observation.get("confirmedStudent") == last_exit["student"] == place["student"]
+    )
+
+
+def is_local_cleanup(report):
+    return report and report["outcome"] == "overridden" and report["reason"] == "local-normal-source-confirmed"
 
 
 def installation_status(db, device_id, expected_version, now):
@@ -800,7 +831,9 @@ def teacher_snapshot(db, device, exam_id, version, now, details=False):
     active = snapshot["assignment"]
     place = get_place(db, device_id, exam_id)
     intended_exam = active["examId"] == exam_id
-    observation = campaign_observation(db, device_id, active, now) if intended_exam else None
+    saved = read_campaign_guest(db, device_id)
+    observation = campaign_observation(db, device_id, saved, active, now) if intended_exam else None
+    last_exit = saved.get("lastGuestExit") if saved and saved.get("examId") == exam_id else None
     alert_rows = db.execute(
         "SELECT * FROM device_alerts WHERE device_id = ? ORDER BY rowid DESC LIMIT ?", (device_id, 10 if details else 1),
     ).fetchall()
@@ -813,6 +846,15 @@ def teacher_snapshot(db, device, exam_id, version, now, details=False):
             alert_rows = [row] + [historical for historical in alert_rows if historical["alert_id"] != row["alert_id"]]
     alerts = [display_alert(row, observation, now) for row in alert_rows]
     report = confirmed_report(db, device_id, active, snapshot["latestReport"], now)
+    submission = json.loads(place["submission"]) if place and place["submission"] else None
+    eligible_exit = can_submit_after_exit(place, observation)
+    session_student = (
+        observation.get("confirmedStudent") if observation and (observation["state"] == "present" or eligible_exit) else None
+    )
+    normal_target = (
+        {key: submission[key] for key in SESSION_FIELDS}
+        if not is_local_cleanup(report) and ended_guest_matches(observation, submission) else None
+    )
     report_status = "pending"
     if snapshot["connection"] != "fresh":
         report_status = "offline"
@@ -823,25 +865,34 @@ def teacher_snapshot(db, device, exam_id, version, now, details=False):
         and snapshot["readiness"]["guestReady"]
     )
     summary = {
-        "deviceId": device_id, "student": place["student"] if place else None,
+        "deviceId": device_id, "student": place["student"] if place else None, "sessionStudent": session_student,
+        "sessionStudentSource": "manual" if session_student else None,
         "installation": installation_status(db, device_id, version, now), "connection": snapshot["connection"],
+        "connectionAgeSeconds": snapshot["connectionAgeSeconds"],
         "examId": active["examId"], "assignedMode": active["mode"], "reportStatus": report_status,
         "reportReason": report["reason"] if report else None,
         "machineReady": intended_exam and snapshot["readiness"]["machineReady"], "guestReady": guest_ready,
-        "guestState": observation["state"] if observation else None, "submitted": bool(place and place["submission"]),
+        "guestState": observation["state"] if observation else None, "submitted": submission is not None,
+        "lastGuestExit": last_exit, "canSubmitAfterExit": eligible_exit and submission is None,
+        "normalTarget": normal_target, "canReturnToNormal": bool(
+            active["mode"] == "normal" or (intended_exam and (is_local_cleanup(report) or normal_target))
+        ),
         "alert": {key: alerts[0][key] for key in ("current", "status", "reason")} if alerts else None,
     }
     if details:
         summary.update({
-            "device": snapshot, "guestObservation": observation, "alerts": alerts,
-            "submission": json.loads(place["submission"]) if place and place["submission"] else None,
+            "device": snapshot, "alerts": alerts, "submission": submission,
+            "guestObservation": {key: observation[key] for key in (
+                *SESSION_FIELDS, "observedUtc", "receivedUtc", "state", "alertId", "lastGuestSessionId",
+            )} if observation else None,
         })
     return summary
 
 
 def selected_guest(db, device, exam_id, target, now):
-    active = current_assignment(db, device["device_id"])
-    observation = campaign_observation(db, device["device_id"], active, now)
+    device_id = device["device_id"]
+    active = current_assignment(db, device_id)
+    observation = campaign_observation(db, device_id, read_campaign_guest(db, device_id), active, now)
     if (
         active["examId"] != exam_id or not observation or observation["state"] != "present"
         or not same_fields(target, observation, SESSION_FIELDS)
@@ -878,9 +929,13 @@ def request_acknowledgement(db, device, exam_id, target, uid, now):
 def reset_place_confirmation(db, device_id, exam_id):
     if current_assignment(db, device_id)["examId"] == exam_id:
         db.execute("UPDATE device_readiness SET guest_confirmed = 0 WHERE device_id = ?", (device_id,))
+        observation = read_campaign_guest(db, device_id)
+        if observation and observation.pop("confirmedStudent", None) is not None:
+            db.execute("UPDATE device_campaign SET guest_observation = ? WHERE device_id = ?",
+                       (json.dumps(observation), device_id))
 
 
-def group_assign(db, exam_id, mode, selection, now):
+def group_assign(db, exam_id, mode, selection, targets, now):
     devices = [row["device_id"] for row in db.execute("SELECT device_id FROM devices ORDER BY device_id")]
     if selection == "*":
         selection = [
@@ -896,21 +951,24 @@ def group_assign(db, exam_id, mode, selection, now):
             device = device_row(db, device_id)
             latest = json.loads(device["latest_report"]) if device["latest_report"] else None
             report = confirmed_report(db, device_id, active, latest, now)
-            local_cleanup = report and report["outcome"] == "overridden" and report["reason"] == "local-normal-source-confirmed"
+            local_cleanup = is_local_cleanup(report)
             if active["mode"] == "exam" and active["examId"] != exam_id and not (mode == "exam" and local_cleanup):
                 raise ValueError("Назначен другой экзамен")
+            target = targets.get(device_id)
+            if mode == "normal" and local_cleanup and target is not None:
+                raise ValueError("ПК уже локально вышел из экзамена. Обновите список")
             if mode == "normal" and active["mode"] == "exam" and not local_cleanup:
                 place = get_place(db, device_id, exam_id)
                 submission = json.loads(place["submission"]) if place and place["submission"] else None
                 if submission is None:
                     raise ValueError("Сдача не подтверждена")
-                observation = campaign_observation(db, device_id, active, now)
-                if (
-                    not observation or observation["state"] != "absent"
-                    or not same_fields(submission, observation, ("revision", "bootUtc"))
-                    or submission["guestSessionId"] != observation["lastGuestSessionId"]
-                ):
+                observation = campaign_observation(db, device_id, read_campaign_guest(db, device_id), active, now)
+                if not ended_guest_matches(observation, submission):
                     raise ValueError("Выход Guest не подтверждён")
+                if target is None:
+                    raise ValueError("Выберите подтверждённый сеанс Guest в обновлённой панели")
+                if not same_fields(target, submission, SESSION_FIELDS):
+                    raise ValueError("Сеанс Guest изменился или связь устарела. Обновите список")
             assigned = assign_locked(db, device_id, exam_id if mode == "exam" else None)
             results.append({"deviceId": device_id, "status": "pending" if assigned != active else "unchanged"})
         except ValueError as error:
@@ -929,9 +987,11 @@ def teacher_dispatch(db_path, owner_uid, expected_version, uid, request):
     if not isinstance(request, dict):
         raise ValueError("Недопустимая команда TUI")
     action = request.get("action")
+    required = {"action", "examId", "version"}
+    allowed_extra = {"targets"} if action == "normal" else set()
     if (
         not isinstance(action, str) or action not in TEACHER_ACTIONS
-        or request.keys() != {"action", "examId", "version"} | TEACHER_ACTIONS[action]
+        or not (required | TEACHER_ACTIONS[action]) <= request.keys() <= (required | TEACHER_ACTIONS[action] | allowed_extra)
         or not valid_code(IDENTIFIER, request["examId"]) or request["version"] != expected_version
     ):
         raise ValueError("Недопустимая команда TUI")
@@ -960,7 +1020,17 @@ def teacher_command(db, uid, owner_uid, exam_id, version, action, request, now):
             or any(not valid_code(IDENTIFIER, device_id) for device_id in selected) or len(set(selected)) != len(selected)
         ):
             raise ValueError("Укажите номера зарегистрированных ПК или * для всех мест выбранного экзамена")
-        return group_assign(db, exam_id, action, selected, now)
+        targets = request.get("targets", {})
+        if (
+            not isinstance(targets, dict) or len(targets) > 100
+            or any(
+                not valid_code(IDENTIFIER, device_id) or (selected != "*" and device_id not in selected)
+                or not valid_session_target(target)
+                for device_id, target in targets.items()
+            )
+        ):
+            raise ValueError("Недопустимая привязка текущего сеанса")
+        return group_assign(db, exam_id, action, selected, targets, now)
     device_id = request["deviceId"]
     device = device_row(db, device_id) if valid_code(IDENTIFIER, device_id) else None
     if device is None:
@@ -991,30 +1061,49 @@ def teacher_command(db, uid, owner_uid, exam_id, version, action, request, now):
         return {"student": place["student"], "deviceId": destination}
 
     target = request["target"]
-    target_fields = ALERT_TARGET_FIELDS if action == "dismiss" else SESSION_FIELDS
-    if (
-        not isinstance(target, dict) or target.keys() != set(target_fields)
-        or type(target["revision"]) is not int or not 1 <= target["revision"] <= MAX_REVISION
-        or not valid_utc(target["bootUtc"]) or not valid_code(IDENTIFIER, target["guestSessionId"])
-        or (action == "dismiss" and not valid_code(UUID, target["alertId"]))
-    ):
+    if not valid_session_target(target, alert=action == "dismiss"):
         raise ValueError("Недопустимая привязка текущего сеанса")
     if action == "dismiss":
         return request_acknowledgement(db, device, exam_id, target, uid, now)
     if not place:
         raise ValueError("Сначала укажите студента на этом месте")
-    selected_guest(db, device, exam_id, target, now)
     if action == "guest":
+        observation = selected_guest(db, device, exam_id, target, now)
         if request["checks"] != ["file", "project", "wazuh"]:
             raise ValueError("Подтвердите файловый запрет, проект и Wazuh")
-        return confirm_guest_locked(db, device_id, target["revision"], target["bootUtc"], target["guestSessionId"])
-    snapshot = device_status(db, device, now, READINESS_TIMEOUT)
-    if not snapshot["readiness"]["guestReady"]:
-        raise ValueError("Сначала подтвердите место и текущий сеанс Guest")
+        confirmation = confirm_guest_locked(db, device_id, target["revision"], target["bootUtc"], target["guestSessionId"])
+        observation["confirmedStudent"] = place["student"]
+        db.execute("UPDATE device_campaign SET guest_observation = ? WHERE device_id = ?",
+                   (json.dumps(observation), device_id))
+        return confirmation
+    active = current_assignment(db, device_id)
+    observation = campaign_observation(db, device_id, read_campaign_guest(db, device_id), active, now)
+    after_exit = (
+        active["examId"] == exam_id and can_submit_after_exit(place, observation) and ended_guest_matches(observation, target)
+    )
+    if not after_exit:
+        selected_guest(db, device, exam_id, target, now)
+        snapshot = device_status(db, device, now, READINESS_TIMEOUT)
+        if not snapshot["readiness"]["guestReady"]:
+            raise ValueError("Сначала подтвердите место и текущий сеанс Guest")
+    if place["submission"]:
+        previous = json.loads(place["submission"])
+        if same_fields(previous, target, SESSION_FIELDS):
+            return previous
     receipt = {**target, "confirmedUtc": iso_utc(now), "confirmedByUid": uid}
     db.execute("UPDATE exam_places SET submission = ? WHERE device_id = ? AND exam_id = ?",
                (json.dumps(receipt), device_id, exam_id))
     return receipt
+
+
+def valid_session_target(target, *, alert=False):
+    fields = ALERT_TARGET_FIELDS if alert else SESSION_FIELDS
+    return (
+        isinstance(target, dict) and target.keys() == set(fields)
+        and type(target["revision"]) is int and 1 <= target["revision"] <= MAX_REVISION
+        and valid_utc(target["bootUtc"]) and valid_code(IDENTIFIER, target["guestSessionId"])
+        and (not alert or valid_code(UUID, target["alertId"]))
+    )
 
 
 DIAGNOSTICS_PATH = "/install/diagnostics"
