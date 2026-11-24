@@ -108,9 +108,14 @@ def bootstrap_pem(certificate):
     return "\n".join(f'{redirect} "%WORK%\\controller-ca.pem" echo {line}' for redirect, line in commands)
 
 
-def bootstrap_check(script):
+def bootstrap_payload(name, script):
     encoded = base64.b64encode(script).decode("ascii")
-    return "\n".join(f"rem EXAMLAB_EARLY_CHECK:{line}" for line in textwrap.wrap(encoded, width=100))
+    return "\n".join(f"rem EXAMLAB_{name}:{line}" for line in textwrap.wrap(encoded, width=100))
+
+
+def render_cmd(template, substitutions):
+    cmd = fill_template(template, {name: str(value) for name, value in substitutions.items()})
+    return cmd.replace("\r\n", "\n").replace("\n", "\r\n").encode("ascii")
 
 
 def bootstrap_private_paths(core):
@@ -130,6 +135,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--revision", default="HEAD", help="Точная Git-ревизия исходников")
     parser.add_argument("--launcher", type=Path, required=True, help="Путь к файлу Start-ExamLab.cmd для HTTP")
+    parser.add_argument("--check-launcher", type=Path, help="Путь к Check-ExamLab.cmd для запуска только Check")
     parser.add_argument("--controller-ca", type=Path, required=True, help="Публичный CA контроллера в DER")
     parser.add_argument("--squid-ca", type=Path, required=True, help="Публичный CA Squid в DER")
     parser.add_argument("--tools-dir", type=Path, required=True, help="Проверенные файлы для HTTPS-публикации пилота")
@@ -150,6 +156,12 @@ def main():
         parser.error("--moodle-activity-url: неверный номер порта")
     if args.launcher.suffix.lower() != ".cmd" or args.launcher.resolve().is_relative_to(args.output.resolve()):
         parser.error("--launcher: укажите путь к файлу .cmd вне каталога HTTPS-публикации")
+    if args.check_launcher and (
+        args.check_launcher.suffix.lower() != ".cmd"
+        or args.check_launcher.resolve().is_relative_to(args.output.resolve())
+        or args.check_launcher.resolve() == args.launcher.resolve()
+    ):
+        parser.error("--check-launcher: укажите отдельный путь .cmd вне каталога HTTPS-публикации")
     try:
         certificate = read_root(args.controller_ca)
         squid_certificate = read_root(args.squid_ca)
@@ -192,6 +204,8 @@ def main():
     tools_url = f"{base}/exam-lab-{revision}/tools"
     tools_pins = ";\n        ".join(f"'{name}' = '{pin}'" for name, pin in tools_hashes.items())
     cmd = git("show", f"{revision}:setup/Start-ExamLab.cmd").decode("ascii")
+    if args.check_launcher and "@CHECK_ONLY@" not in cmd:
+        parser.error("--check-launcher требует ревизию с поддержкой входа Check")
     include_expanded_sizes = "@BUNDLE_EXPANDED_BYTES@" in cmd
     bootstrap_tools = []
     for name, pin in tools_hashes.items():
@@ -268,12 +282,17 @@ def main():
         "BUNDLE_EXPANDED_BYTES": sum(len(data) for data in files.values()),
         "BUNDLE_SHA256": digest,
         "BOOTSTRAP_TOOLS": "@(" + ", ".join(bootstrap_tools) + ")",
-        "EARLY_CHECK_PAYLOAD": bootstrap_check(files["setup/Prepare-ExamLab.ps1"]),
+        "EARLY_CHECK_PAYLOAD": bootstrap_payload("EARLY_CHECK", files["setup/Prepare-ExamLab.ps1"]),
     }
     if "@BOOTSTRAP_PRIVATE_PATHS@" in cmd:
         cmd_substitutions["BOOTSTRAP_PRIVATE_PATHS"] = bootstrap_private_paths(files["setup/ExamLabMaintenance.Core.ps1"])
-    cmd = fill_template(cmd, {name: str(value) for name, value in cmd_substitutions.items()})
-    launcher_bytes = cmd.replace("\r\n", "\n").replace("\n", "\r\n").encode("ascii")
+    if "@INVENTORY_PAYLOAD@" in cmd:
+        inventory = git("show", f"{revision}:setup/ExamLabInventory.ps1")
+        cmd_substitutions["INVENTORY_PAYLOAD"] = bootstrap_payload("INVENTORY", inventory)
+        cmd_substitutions["CHECK_ONLY"] = "$false"
+    launcher_bytes = render_cmd(cmd, cmd_substitutions)
+    if args.check_launcher:
+        check_launcher_bytes = render_cmd(cmd, {**cmd_substitutions, "CHECK_ONLY": "$true"})
     args.output.mkdir(parents=True, exist_ok=True)
     (args.output / filename).write_bytes(bundle)
     (args.output / installer_name).write_bytes(installer_bytes)
@@ -282,6 +301,9 @@ def main():
     print(f"{installer_name}  SHA-256 {sha256(installer_bytes)}")
     print(f"{filename}  SHA-256 {digest}")
     print(f"{args.launcher}  SHA-256 {sha256(launcher_bytes)}")
+    if args.check_launcher:
+        args.check_launcher.write_bytes(check_launcher_bytes)
+        print(f"{args.check_launcher}  SHA-256 {sha256(check_launcher_bytes)}")
 
 
 if __name__ == "__main__":

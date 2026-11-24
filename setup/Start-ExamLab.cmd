@@ -17,17 +17,36 @@ if not defined EXAMLAB_NO_PAUSE pause
 exit /b %RESULT%
 
 @EARLY_CHECK_PAYLOAD@
+@INVENTORY_PAYLOAD@
 
 :NativePowerShell
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2
-$arg1 = $env:EXAMLAB_ARG1
-$action = if ($arg1) { $arg1 } else { 'Apply' }
-$options = @($env:EXAMLAB_ARG2, $env:EXAMLAB_ARG3 | Where-Object { $_ })
-if ($action -notin 'Check', 'Prefetch', 'Apply', 'Verify' -or $env:EXAMLAB_ARG4 -or
-    @($options | Where-Object { $_ -notin '--offline', '--elevated' }).Count -or
-    @($options | Select-Object -Unique).Count -ne $options.Count) {
-    throw 'Usage: Start-ExamLab.cmd [Check|Prefetch|Apply|Verify] [--offline]'
+
+function Read-EmbeddedPowerShell([string]$Tag) {
+    $pattern = '(?m)^rem ' + [regex]::Escape($Tag) + ':([A-Za-z0-9+/=]+)\r?$'
+    $parts = [regex]::Matches($launcherText, $pattern)
+    if (-not $parts.Count) { throw 'The verified launcher is missing a PowerShell payload.' }
+    $encoded = ($parts | ForEach-Object { $_.Groups[1].Value }) -join ''
+    return ,([Convert]::FromBase64String($encoded))
+}
+
+function Invoke-ExamLabInventory([string]$OutputPath) {
+    $inventory = [ScriptBlock]::Create([Text.Encoding]::UTF8.GetString((Read-EmbeddedPowerShell 'EXAMLAB_INVENTORY')))
+    & $inventory -OutputPath $OutputPath
+}
+
+if (@CHECK_ONLY@) {
+    $action = 'Check'
+    $options = @()
+} else {
+    $action = if ($env:EXAMLAB_ARG1) { $env:EXAMLAB_ARG1 } else { 'Apply' }
+    $options = @($env:EXAMLAB_ARG2, $env:EXAMLAB_ARG3 | Where-Object { $_ })
+    if ($action -notin 'Check', 'Prefetch', 'Apply', 'Verify' -or $env:EXAMLAB_ARG4 -or
+        @($options | Where-Object { $_ -notin '--offline', '--elevated' }).Count -or
+        @($options | Select-Object -Unique).Count -ne $options.Count) {
+        throw 'Usage: Start-ExamLab.cmd [Check|Prefetch|Apply|Verify] [--offline]'
+    }
 }
 $offline = $options -contains '--offline'
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -394,11 +413,8 @@ function Send-Diagnostics([string]$Directory) {
 }
 
 function Invoke-EarlyCheck {
-    $parts = [regex]::Matches($launcherText, '(?m)^rem EXAMLAB_EARLY_CHECK:([A-Za-z0-9+/=]+)\r?$')
-    if (-not $parts.Count) { throw 'The verified launcher is missing the Check payload.' }
-    $encoded = ($parts | ForEach-Object { $_.Groups[1].Value }) -join ''
     $checkScript = Join-Path $work 'Prepare-ExamLab.ps1'
-    [IO.File]::WriteAllBytes($checkScript, [Convert]::FromBase64String($encoded))
+    [IO.File]::WriteAllBytes($checkScript, (Read-EmbeddedPowerShell 'EXAMLAB_EARLY_CHECK'))
     $checkReport = Join-Path $report 'early-check.json'
     $previousTemp = $env:TEMP
     $previousTmp = $env:TMP
@@ -851,6 +867,14 @@ try {
         if (Test-Path -LiteralPath $reports) { Assert-ExamLabProtectedPath $reports }
         if (Test-Path -LiteralPath $cache) { Assert-ExamLabProtectedPath $cache }
         $sharedCacheRead = $true
+    }
+    if ($action -eq 'Check') {
+        Write-Host 'Collecting Windows inventory...'
+        $inventoryReport = Join-Path $report 'inventory.txt'
+        try {
+            Invoke-ExamLabInventory $inventoryReport
+            Write-Host "Inventory summary: $inventoryReport"
+        } catch { Write-Warning 'The optional inventory report could not be collected.' }
     }
     $result = Invoke-Bootstrap
 } catch {
