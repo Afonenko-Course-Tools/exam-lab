@@ -49,6 +49,7 @@ exit /b %RESULT%
 :Run
 set "STARTED=1"
 set "EXAMLAB_BOOTSTRAP_CA_ADDED="
+set "CURL_TLS_FLAGS="
 set "EXAMLAB_DIAGNOSTICS_DIR=%ProgramFiles%\ExamLabBootstrap-%RANDOM%-%RANDOM%"
 set "WORK=%EXAMLAB_DIAGNOSTICS_DIR%"
 set "REPORT=%WORK%\report"
@@ -123,6 +124,7 @@ if exist "%ProgramFiles%\ExamLab" (
 ) else (
     if exist "%CA_PENDING%" set "EXAMLAB_BOOTSTRAP_CA_ADDED=1"
 )
+call :ConfigureCurl
 
 if defined RUNTIME_READY goto :Installer
 call :Step "PowerShell 7 download"
@@ -177,8 +179,20 @@ type "%WORK%\artifact-hash.txt" >> "%LOG%"
 "%NATIVE%\findstr.exe" /I /X /L /C:"%~2" "%WORK%\artifact-hash.txt" >nul
 exit /b %ERRORLEVEL%
 
+:ConfigureCurl
+"%CURL%" -q --ssl-revoke-best-effort --version >nul 2>&1
+if not errorlevel 1 (
+    set "CURL_TLS_FLAGS=--ssl-revoke-best-effort --cacert "%WORK%\controller-ca.pem""
+    exit /b 0
+)
+rem WinSSL 7.55.1 uses the Windows root store and cannot use a custom CA file.
+rem The private pilot CA has no revocation endpoint. Keep chain and hostname checks.
+set "CURL_TLS_FLAGS=--ssl-no-revoke"
+>> "%LOG%" echo HTTPS: legacy Windows curl, native certificate store.
+exit /b 0
+
 :Download
-"%CURL%" -q --proto "=https" --noproxy "*" --tlsv1.2@CURL_RESOLVE@ --ssl-revoke-best-effort --cacert "%WORK%\controller-ca.pem" --fail --silent --show-error --connect-timeout 8 --max-time 180 --output "%~2" "%~1" >> "%LOG%" 2>&1
+"%CURL%" -q --proto "=https" --noproxy "*" --tlsv1.2@CURL_RESOLVE@ %CURL_TLS_FLAGS% --fail --silent --show-error --connect-timeout 8 --max-time 180 --output "%~2" "%~1" >> "%LOG%" 2>&1
 exit /b %ERRORLEVEL%
 
 :Step
@@ -192,12 +206,12 @@ if not "%PHASE%"=="ExamLab installer" call :CollectNative
 if exist "%WORK%\PowerShell-msi.log" "%NATIVE%\findstr.exe" /I /L /C:"Return value 3" /C:"MainEngineThread is returning" "%WORK%\PowerShell-msi.log" > "%REPORT%\msi-summary.log"
 "%NATIVE%\tar.exe" -a -cf "%WORK%\diagnostics.zip" -C "%WORK%" report > "%WORK%\archive.log" 2>&1
 if not "%ERRORLEVEL%"=="0" exit /b 0
-if not exist "%WORK%\controller-ca.pem" exit /b 0
+if not defined CURL_TLS_FLAGS exit /b 0
 for %%F in ("%WORK%\diagnostics.zip") do if %%~zF GTR 8388608 (
     echo Diagnostic ZIP is larger than 8 MiB. It is available locally.
     exit /b 0
 )
-"%CURL%" -q --proto "=https" --noproxy "*" --tlsv1.2@CURL_RESOLVE@ --ssl-revoke-best-effort --cacert "%WORK%\controller-ca.pem" --fail --silent --show-error --connect-timeout 4 --max-time 12 --header "Content-Type: application/zip" --header "Expect:" --data-binary "@%WORK%\diagnostics.zip" --output "%WORK%\upload-result.json" "@DIAGNOSTICS_URL@" >> "%LOG%" 2>&1
+"%CURL%" -q --proto "=https" --noproxy "*" --tlsv1.2@CURL_RESOLVE@ %CURL_TLS_FLAGS% --fail --silent --show-error --connect-timeout 4 --max-time 12 --header "Content-Type: application/zip" --header "Expect:" --data-binary "@%WORK%\diagnostics.zip" --output "%WORK%\upload-result.json" "@DIAGNOSTICS_URL@" >> "%LOG%" 2>&1
 if not "%ERRORLEVEL%"=="0" (
     echo Diagnostic upload unavailable. The ZIP is available locally.
     exit /b 0
