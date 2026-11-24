@@ -91,6 +91,22 @@ try {
         throw 'Recovery lost the interrupted staging file or durable residual report.'
     }
 
+    Start-ExamLabInstallChanges
+    $openWorker = ${function:Open-ExamLabInstallWorkerLock}
+    function Open-ExamLabInstallWorkerLock {
+        $worker = & $openWorker
+        # Имитируем запись прежнего дочернего процесса перед получением блокировки повтором.
+        Save-ExamLabInstallTemporaryFile $staged $false
+        [IO.File]::WriteAllText($staged, 'last worker change')
+        $worker
+    }
+    try {
+        $result = @(Invoke-ExamLabInstallRecovery)
+        if ($result.Count -ne 1 -or $result[0].Status -cne 'RolledBack' -or (Test-Path -LiteralPath $staged)) {
+            throw 'Recovery omitted the last changes made by the previous worker.'
+        }
+    } finally { Set-Item Function:Open-ExamLabInstallWorkerLock $openWorker }
+
     $folder = Join-Path $temporary 'owned-tree'
     $nested = Join-Path $folder 'nested'
     [void][IO.Directory]::CreateDirectory($nested)

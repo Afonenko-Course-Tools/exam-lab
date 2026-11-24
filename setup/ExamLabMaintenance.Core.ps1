@@ -617,12 +617,13 @@ function Undo-ExamLabInstallChange($Change) {
 }
 
 function Undo-ExamLabInstallChanges {
-    $journal = Read-ExamLabInstallChanges
-    if (-not $journal) { return }
+    if (-not (Test-Path -LiteralPath $examLabInstallChangesPath)) { return }
     $results = [Collections.Generic.List[object]]::new()
     $operation = $null
     $worker = Open-ExamLabInstallWorkerLock
     try {
+        $journal = Read-ExamLabInstallChanges
+        if (-not $journal) { return }
         if (-not $journal.Committed -and (Test-Path -LiteralPath $examLabStatePath)) {
             Assert-ExamLabProtectedPath $examLabStatePath
             $path = Join-Path $examLabStatePath 'operation.lock'
