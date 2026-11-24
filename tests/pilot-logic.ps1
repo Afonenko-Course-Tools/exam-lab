@@ -10,7 +10,9 @@ try {
     $traceAttempt = [pscustomobject]@{ revision=17; examId='file-trace-demo'; localGeneration='baseline' }
     $traceState = [pscustomobject]@{
         Assignment = [pscustomobject]@{ mode='exam'; revision=17; examId='file-trace-demo' }
-        Result = [pscustomobject]@{ outcome='source-applied'; reason='machine-policies-only' }
+        Result = [pscustomobject]@{
+            mode='exam'; revision=17; examId='file-trace-demo'; outcome='source-applied'; reason='machine-policies-only'
+        }
         StoppedExamId = $null
         LocalGeneration = 'baseline'
     }
@@ -32,8 +34,22 @@ try {
     $traceState.Assignment.mode = 'normal'
     Assert-TraceAssignment 'обычный режим' $false
     $traceState.Assignment.mode = 'exam'
-    $traceState.Assignment.examId = $traceAttempt.examId = 'regular-demo'
+    $traceState.Assignment.examId = $traceState.Result.examId = $traceAttempt.examId = 'regular-demo'
     Assert-TraceAssignment 'обычный экзамен' $false
+    function Assert-ActiveExam([string]$Name,[bool]$Expected) {
+        $active = & $module { param($State) Test-ControllerActiveExam $State } $traceState
+        if ($active -ne $Expected) { throw "FAIL назначение Wazuh: $Name" }
+        "PASS назначение Wazuh: $Name"
+    }
+    Assert-ActiveExam 'текущий обычный экзамен с подтверждёнными политиками' $true
+    $traceState.StoppedExamId = 'regular-demo'
+    Assert-ActiveExam 'локальный normal запретил восстановление старого назначения' $false
+    $traceState.StoppedExamId = $null
+    $traceState.Result.revision = 16
+    Assert-ActiveExam 'результат предыдущей ревизии' $false
+    $traceState.Result.revision = 17
+    $traceState.Result.outcome = 'blocked'
+    Assert-ActiveExam 'назначение есть, подтверждения политики нет' $false
     function Test-Config([string]$Name,[string]$Json,[bool]$Expected) {
         $passed=$false
         try { & $module {param($c) Test-DeclaredConfig $c} ($Json|ConvertFrom-Json) | Out-Null; $passed=$true } catch {}
@@ -197,6 +213,23 @@ try {
     $installAst=Get-ParsedSource '..\setup\Install-LocalPilot.ps1'
     $mainAst=Get-ParsedSource '..\windows\ExamLab.psm1'
     $netAst=Get-ParsedSource '..\windows\ExamNetwork.psm1'
+    $observe=Get-FunctionNode $mainAst 'Get-ExamLabControllerObservation'
+    Assert-CallBefore $observe.Body 'Get-ExamLabControllerPolicyReadback' @('Test-ExamLabWazuhRunning')
+    foreach ($mutation in @('Restore-ExamLabControllerCollection','Open-ExamLabModeLock','Invoke-ExamLabFileTraceAssignment',
+        'Start-ExamLabFileTraceExport','Stop-ExamLabOrphanedFileTrace')) {
+        if (@(Get-CommandNodes $observe.Body $mutation).Count) { throw "FAIL наблюдение вызвало $mutation" }
+    }
+    $poll=Get-FunctionNode $mainAst 'Invoke-ExamLabControllerLoop'
+    Assert-CallBefore $poll.Body 'Invoke-ControllerRequest' @('Set-ExamLabMode','Invoke-ExamLabFileTraceAssignment')
+    foreach ($mutation in @('Restore-ExamLabControllerCollection','Start-ExamLabFileTraceExport','Stop-ExamLabOrphanedFileTrace')) {
+        if (@(Get-CommandNodes $poll.Body $mutation).Count) { throw "FAIL опрос вызвал $mutation" }
+    }
+    $restore=Get-FunctionNode $mainAst 'Restore-ExamLabControllerCollection'
+    Assert-CallBefore $restore.Body 'Test-ControllerActiveExam' @('Get-ExamLabControllerPolicyReadback','Get-ExamLabWazuhRunner')
+    $setMode=Get-FunctionNode $mainAst 'Set-ExamLabMode'
+    Assert-CallBefore $setMode.Body 'Open-ExamLabModeLock' @('Restore-ExamLabControllerCollection','Stop-ExamLabExtendedCollection',
+        'Complete-ExamLabFileTraceNormal')
+    'PASS режим: пригодность Wazuh читается, восстановление и остановка принадлежат назначению и normal.'
     $nativeSource=$null
     foreach ($sourceAst in @($installAst,$mainAst,$netAst)) {
         if ($sourceAst.Extent.Text -match 'QEMU|KVM|Red Hat|ExamLab-TestVM') { throw 'FAIL runtime must not depend on VM identity.' }
@@ -222,8 +255,10 @@ try {
     }
     $entry=@($installAst.EndBlock.Statements | Where-Object {$_ -is [Management.Automation.Language.TryStatementAst]})
     if ($entry.Count -ne 1) { throw 'FAIL installer entry boundary.' }
-    Assert-CallBefore $entry[0].Body 'Assert-NativeAMD64' @('Import-Module','Assert-SafeDirectory','Open-ExamLabMaintenanceLock','Suspend-ExamLabPolling','Register-ScheduledTask')
+    Assert-CallBefore $entry[0].Body 'Assert-NativeAMD64' @('Import-Module','Assert-SafeDirectory','Open-ExamLabMaintenanceLock','Suspend-ExamLabPolling','Add-ExamLabInstallTask')
     $maintenanceAst=Get-ParsedSource '..\setup\ExamLabMaintenance.Core.ps1'
+    $registerTask=Get-FunctionNode $maintenanceAst 'Add-ExamLabInstallTask'
+    Assert-CallBefore $registerTask.Body 'Add-ExamLabInstallChange' @('New-ExamLabScheduledTask')
     $pause=Get-FunctionNode $maintenanceAst 'Suspend-ExamLabPolling'
     Assert-CallBefore $pause.Body 'Assert-ExamLabInactive' @('Disable-ScheduledTask','Stop-ScheduledTask')
     Assert-CallBefore (Get-FunctionNode $mainAst 'Assert-Host') 'Assert-NativeAMD64' @('Get-CimInstance')

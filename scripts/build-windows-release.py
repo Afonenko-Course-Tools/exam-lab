@@ -41,6 +41,13 @@ SOURCES = (
     "windows/alert/Wait-ExamLabFileRead.ps1",
     "windows/alert/exam-lab-alert.cmd",
     "windows/LICENSE-exam-lab-0.1.0.txt",
+)
+TRACE_SOURCES = (
+    "windows/trace/ExamLab.FileTrace.ps1",
+    "windows/trace/windows-fileio-light.ps1",
+    "windows/trace/Export-ExamLabFileTrace.ps1",
+)
+LEGACY_TRACE_SOURCES = (
     "tests/windows-fileio-light.ps1",
     "tests/Export-ExamLabFileTrace.ps1",
 )
@@ -96,6 +103,22 @@ def bootstrap_pem(certificate):
     return "\n".join(f'{redirect} "%WORK%\\controller-ca.pem" echo {line}' for redirect, line in commands)
 
 
+def bootstrap_check(script):
+    encoded = base64.b64encode(script).decode("ascii")
+    return "\n".join(f"rem EXAMLAB_EARLY_CHECK:{line}" for line in textwrap.wrap(encoded, width=100))
+
+
+def bootstrap_private_paths(core):
+    start = "# BEGIN EXAMLAB BOOTSTRAP PRIVATE PATHS\n"
+    end = "\n# END EXAMLAB BOOTSTRAP PRIVATE PATHS"
+    script = core.decode("utf-8-sig").replace("\r\n", "\n")
+    _, found_start, remainder = script.partition(start)
+    functions, found_end, _ = remainder.partition(end)
+    if not found_start or not found_end or not functions.strip():
+        raise ValueError("Не найден блок защиты путей для раннего запуска")
+    return functions
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default=f"https://{PILOT_CONTROLLER_IP}:21650/install")
@@ -142,7 +165,8 @@ def main():
         return subprocess.check_output(["git", "-C", str(ROOT), *command])
 
     revision = git("rev-parse", "--verify", "--end-of-options", f"{args.revision}^{{commit}}").decode("ascii").strip()
-    files = {path: git("show", f"{revision}:{path}") for path in SOURCES}
+    trace_sources = TRACE_SOURCES if git("ls-tree", revision, "windows/trace") else LEGACY_TRACE_SOURCES
+    files = {path: git("show", f"{revision}:{path}") for path in (*SOURCES, *trace_sources)}
     files["windows/file-trace-exam.txt"] = args.file_trace_exam.encode("utf-8")
     response_pin = re.search(rb"(?m)^\$expectedResponseSha256 = '([0-9A-F]{64})'\r?$",
                              files["setup/Install-ExamLabWazuh.ps1"])
@@ -162,6 +186,11 @@ def main():
     installer_name = f"exam-lab-{revision}.ps1"
     tools_url = f"{base}/exam-lab-{revision}/tools"
     tools_pins = ";\n        ".join(f"'{name}' = '{pin}'" for name, pin in tools_hashes.items())
+    bootstrap_tools = ", ".join(
+        f"@{{Name='{name}'; SHA256='{pin}'; Bytes={(args.tools_dir / name).stat().st_size}}}"
+        for name, pin in tools_hashes.items()
+        if name != PWSH_MSI
+    )
     template = git("show", f"{revision}:setup/Install-FromHttps.ps1.in").decode("utf-8-sig")
     installer = fill_template(template, {
         "BUNDLE_URL": f"{base}/{filename}",
@@ -202,19 +231,33 @@ def main():
         curl_resolve = f' --resolve "{PILOT_CONTROLLER_DNS}:{url.port or 443}:{url.hostname}"'
 
     cmd = git("show", f"{revision}:setup/Start-ExamLab.cmd").decode("ascii")
-    cmd = fill_template(cmd, {
+    cmd_substitutions = {
         "REVISION": revision,
         "CONTROLLER_CA_PEM": bootstrap_pem(certificate),
+        "CONTROLLER_CA_BASE64": base64.b64encode(certificate).decode("ascii"),
         "CONTROLLER_CA_SHA256": sha256(certificate),
         "CONTROLLER_CA_THUMBPRINT": hashlib.sha1(certificate, usedforsecurity=False).hexdigest(),
         "PWSH_VERSION": PWSH_VERSION,
         "CURL_RESOLVE": curl_resolve,
+        "PWSH_FILE": PWSH_MSI,
+        "PWSH_BYTES": (args.tools_dir / PWSH_MSI).stat().st_size,
         "PWSH_URL": f"{native_base}/exam-lab-{revision}/tools/{PWSH_MSI}",
         "PWSH_SHA256": PWSH_SHA256,
+        "INSTALLER_FILE": installer_name,
+        "INSTALLER_BYTES": len(installer_bytes),
         "INSTALLER_URL": f"{native_base}/{installer_name}",
         "INSTALLER_SHA256": sha256(installer_bytes),
         "DIAGNOSTICS_URL": f"{native_base}/diagnostics",
-    })
+        "PREFETCH_BASE_URL": base,
+        "BUNDLE_FILE": filename,
+        "BUNDLE_BYTES": len(bundle),
+        "BUNDLE_SHA256": digest,
+        "BOOTSTRAP_TOOLS": f"@({bootstrap_tools})",
+        "EARLY_CHECK_PAYLOAD": bootstrap_check(files["setup/Prepare-ExamLab.ps1"]),
+    }
+    if "@BOOTSTRAP_PRIVATE_PATHS@" in cmd:
+        cmd_substitutions["BOOTSTRAP_PRIVATE_PATHS"] = bootstrap_private_paths(files["setup/ExamLabMaintenance.Core.ps1"])
+    cmd = fill_template(cmd, {name: str(value) for name, value in cmd_substitutions.items()})
     launcher_bytes = cmd.replace("\r\n", "\n").replace("\n", "\r\n").encode("ascii")
     args.output.mkdir(parents=True, exist_ok=True)
     (args.output / filename).write_bytes(bundle)

@@ -31,6 +31,20 @@ function Request-ExamLabEnrollment([uri]$EnrollmentUrl, [string]$Claim) {
             catch { throw 'ExamLab could not reach the enrollment server over HTTPS. Run the same launcher again.' }
             try {
                 if ([int]$response.StatusCode -notin 200,201) {
+                    $reason = $null
+                    try {
+                        $body = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+                        $reason = (ConvertFrom-Json -InputObject $body -NoEnumerate).error
+                    } catch { }
+                    $message = switch -Exact ($reason) {
+                        'enrollment-closed' { 'No enrollment window is open for this PC.' }
+                        'enrollment-expired' { 'The enrollment window has expired.' }
+                        'enrollment-already-claimed' { 'The enrollment window has no places left for a new PC.' }
+                        'diagnostic-enrollment-revoked' { 'The saved diagnostic registration was revoked.' }
+                        'diagnostic-wazuh-unavailable' { 'The diagnostic server could not issue a Wazuh key. Run the same launcher again.' }
+                    }
+                    if ($message) { throw "ExamLab enrollment failed. $message" }
+                    if ([int]$response.StatusCode -in 401,403) { throw 'ExamLab enrollment access was denied by the server.' }
                     throw "ExamLab enrollment server returned HTTP $([int]$response.StatusCode)."
                 }
                 try {

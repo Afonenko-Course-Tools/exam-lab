@@ -24,10 +24,14 @@ from textual.widgets import Button, DataTable, Input, Static
 
 GREEN, YELLOW, RED, CYAN = "#8fedaf", "#ffd482", "#ff8697", "#8ae8ed"
 REPORT = {
-    "pending": ("ожидает", YELLOW), "offline": ("нет связи", RED),
+    "pending": ("ожидает", YELLOW), "offline": ("нет свежего результата", YELLOW),
     "applied": ("применён", GREEN), "source-applied": ("применён", GREEN),
     "blocked": ("отказ", RED), "error": ("ошибка", RED),
     "overridden": ("локальный", CYAN),
+}
+CONNECTION = {
+    "fresh": ("есть", GREEN), "stale": ("нет свежего опроса", RED),
+    "never": ("первого опроса ещё не было", YELLOW),
 }
 ALERT = {
     "received": ("Получена", RED), "shown": ("На экране", RED),
@@ -58,7 +62,8 @@ Tab  Перейти к кнопкам   R  Обновить   F1  Справка
 
 Мышь выбирает строку и нажимает кнопки. Повторный щелчок по строке открывает её действия.
 Если ПК отмечены, «Экзамен» и «Обычный» действуют на всю отмеченную группу. Иначе используется текущая строка.
-«Обычный» после экзамена требует подтверждённой сдачи и выхода Guest. Режим виден по свежему отчёту ПК.
+«Обычный» после экзамена требует сверки сдачи преподавателем и выхода Guest.
+Сдачу и оценку смотрите в PrairieLearn. В панели видна отметка ручной сверки.
 В узком окне Э означает экзамен, О — обычный режим.
 В колонке «Версия» ✓ означает ожидаемый выпуск по итоговому отчёту, ≠ — другой выпуск, ? — нет подтверждения.
 Для снятия тревоги владелец подтверждает конкретное событие в действиях на месте."""
@@ -94,36 +99,60 @@ def alert_label(alert):
     return ALERT_REASON.get(alert["reason"], alert["reason"])
 
 
-def place_state(row, exam_id):
+def machine_report(row):
     if row["reportReason"] == "local-normal-source-confirmed":
-        return "Ограничения сняты локально. Проверьте обычный вход.", CYAN
-    if row["reportStatus"] == "offline":
-        return "Нет свежей связи с ПК", RED
+        return "источники политик очищены локально", CYAN
+    if row["reportStatus"] == "source-applied":
+        if row["assignedMode"] == "normal":
+            return "источники политик очищены", GREEN
+        return "политики ПК применены", GREEN
+    if row["reportStatus"] == "applied":
+        return "режим применён", GREEN
+    return REPORT[row["reportStatus"]]
+
+
+def place_guidance(row, exam_id):
+    if row["reportReason"] == "local-normal-source-confirmed":
+        return "Проверьте обычный вход после локального снятия.", CYAN
+    if row["connection"] != "fresh":
+        return None
     if row["examId"] and row["examId"] != exam_id:
         return f"Другой экзамен — {row['examId']}", YELLOW
     if row["assignedMode"] == "normal":
         if row["reportStatus"] in ("applied", "source-applied"):
-            return "Ограничения сняты. Проверьте обычный вход.", GREEN
-        label, color = REPORT[row["reportStatus"]]
-        return f"Обычный режим · {label}", color
+            return "Проверьте обычный вход.", GREEN
+        return None
     if row["submitted"]:
         if row["guestState"] == "absent":
-            return "Сдача подтверждена, Guest вышел. Доступен обычный режим.", GREEN
-        return "Сдача подтверждена. Дождитесь выхода Guest.", GREEN
+            return "Guest вышел. Доступен обычный режим.", GREEN
+        return "Дождитесь выхода Guest.", YELLOW
     if row["guestReady"]:
-        return "Guest подтверждён. Можно начинать.", GREEN
+        return "Преподаватель сверил Guest. Можно начинать.", GREEN
     if row["machineReady"]:
         if row["guestState"] == "present":
             return "Guest открыт. Подтвердите место и проверки.", YELLOW
         return "ПК готов. Можно входить в Guest.", GREEN
-    label, color = REPORT[row["reportStatus"]]
-    return f"Экзамен · {label}", color
+    return None
 
 
 def place_information(row, exam_id, *, compact=False):
-    state, color = place_state(row, exam_id)
     result = Text()
-    result.append(state, color)
+    connection, connection_color = CONNECTION[row["connection"]]
+    report, report_color = machine_report(row)
+    result.append("Связь с ПК · ")
+    result.append(connection, connection_color)
+    result.append("\nОтчёт ПК · ")
+    result.append(report, report_color)
+    if row["student"]:
+        result.append("\nСверка сдачи · ")
+        if row["submitted"]:
+            result.append("преподаватель сверил в PrairieLearn", GREEN)
+        else:
+            result.append("отметки преподавателя пока нет", YELLOW)
+    state = place_guidance(row, exam_id)
+    if state:
+        result.append("\n")
+        result.append(*state)
     alert = row["alert"]
     if alert and alert["current"]:
         label, color = ALERT[alert["status"]]
@@ -230,7 +259,7 @@ class PlaceDialog(Dialog):
                 yield Button("Пересадить", id="move", disabled=not row["student"])
                 yield Button("Подтвердить Guest", id="guest", disabled=not (guest_present and row["machineReady"]))
             with Horizontal(classes="button-row"):
-                yield Button("Сдача", id="submit", variant="success", disabled=not row["guestReady"])
+                yield Button("Сверка сдачи", id="submit", variant="success", disabled=not row["guestReady"])
                 if self.owner:
                     yield Button("Снять тревогу", id="dismiss-alert", variant="error", disabled=not can_dismiss)
                 yield Button("Отчёт", id="details")
@@ -260,10 +289,15 @@ class GroupDialog(MessageDialog):
             else:
                 row = rows.get(device)
                 if row and row["assignedMode"] == self.mode and (self.mode == "normal" or row["examId"] == self.exam):
-                    state, style = place_state(row, self.exam)
+                    state = place_guidance(row, self.exam)
+                    if state is None:
+                        if row["connection"] == "fresh":
+                            state = machine_report(row)
+                        else:
+                            state = ("Нет свежей связи с ПК", RED)
                     if entry["status"] == "unchanged":
                         report.append(f"{label} · ", color)
-                    report.append(state, style)
+                    report.append(*state)
                 else:
                     report.append(f"{label} · ждём свежий отчёт ПК", color)
             report.append("\n")
@@ -287,7 +321,7 @@ class ExamTUI(App):
     #places > .datatable--cursor { background: #355873; color: #ffffff; text-style: bold; }
     #places > .datatable--hover { background: #263d4c; }
     #places-empty { height: 1; padding: 0 1; color: #bbd0dc; }
-    #selected { height: 4; padding: 0 1; margin: 0 1; color: #e6edf3; background: #192b3a; }
+    #selected { height: auto; max-height: 6; padding: 0 1; margin: 0 1; color: #e6edf3; background: #192b3a; }
     #notice { height: 1; padding: 0 1; color: #bfd0da; }
     #key-hint { height: 1; padding: 0 1; background: #245574; color: #f0f8ff; }
     .toolbar { height: 1; grid-size: 6 1; grid-gutter: 0 1; margin: 0 1 1 1; }
@@ -486,12 +520,12 @@ class ExamTUI(App):
         ready = sum(row["guestReady"] for row in rows)
         compact = self.terminal_width < 72
         divider = " · " if compact else "  ·  "
-        line = Text(f"Сеть {fresh}/{len(rows)}{divider}Guest {ready}{divider}")
+        line = Text(f"Опрос ПК {fresh}/{len(rows)}{divider}Guest {ready}{divider}")
         line.append(f"{'Трев.' if compact else 'Тревоги'} {alerts}", f"bold {RED}" if alerts else "")
         line.append(f"{divider}Метки {len(self.marked)}{divider}")
         stamp = self.updated.strftime("%H:%M:%S") if self.updated else None
         if self.connected:
-            line.append(f"Связь {stamp}", GREEN)
+            line.append(f"Сводка {stamp}", GREEN)
         else:
             line.append(f"Сводка {stamp} устарела" if stamp else "Связь…", YELLOW)
         self.query_one("#summary", Static).update(line)
@@ -504,6 +538,8 @@ class ExamTUI(App):
             heading = f"{row['student'] or 'Свободное место'} — {device}"
             info = Text(overflow="ellipsis", no_wrap=True)
             info.append(heading, "bold #b6f0ff")
+            if not self.connected:
+                info.append(" · устаревшая сводка", YELLOW)
             info.append("\n")
             info.append_text(place_information(row, self.scope.exam_id, compact=True))
         else:
@@ -538,9 +574,11 @@ class ExamTUI(App):
         if report_width < 15:
             mode = mode[0]
         if row["reportReason"] == "local-normal-source-confirmed":
-            report = "снят локально" if report_width >= 15 else "лок. снят"
+            report, color = ("снят локально" if report_width >= 15 else "лок. снят"), CYAN
         elif row["examId"] and row["examId"] != self.scope.exam_id:
             report, color = "другой", YELLOW
+        elif row["connection"] != "fresh":
+            report, color = "нет связи", RED
         alert = row["alert"]
         label, alert_color = "—", "dim"
         if alert and (alert["current"] or (row["examId"] == self.scope.exam_id and alert["status"] == "acknowledged")):
@@ -706,8 +744,8 @@ class ExamTUI(App):
                 question = f"{name}\nМесто сверено, контрольное чтение запрещено, проект доступен, Wazuh готов?"
                 fields["checks"] = ["file", "project", "wazuh"]
             else:
-                title = "Подтвердить сдачу"
-                question = f"{name}\nPrairieLearn подтвердил сдачу в текущем Guest?"
+                title = "Отметить сверку сдачи"
+                question = f"{name}\nВы проверили сдачу этого студента в PrairieLearn в текущем Guest?"
         self.push_screen(
             ConfirmDialog(title, self.scoped_message(question)),
             lambda accepted: self.change(scope, action, **fields) if accepted else None,
@@ -736,7 +774,7 @@ class ExamTUI(App):
                 group.update_reports({})
             notes = {
                 "bind": "Студент назначен", "move": "Студент пересажен", "guest": "Текущий Guest подтверждён",
-                "submit": "Сдача подтверждена. Дождитесь выхода Guest.",
+                "submit": "Отметка о сверке записана. Дождитесь выхода Guest.",
                 "dismiss": "Снятие запрошено. Ожидается подтверждение ПК.",
             }
             self.notice(notes.get(action, "Результаты назначения обновляются по отчётам ПК"), CYAN)

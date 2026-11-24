@@ -416,6 +416,15 @@ function Compare-ControllerAssignment($Incoming, $Previous) {
     return 'repeat'
 }
 
+function Test-ControllerActiveExam($State) {
+    $assignment = $State.Assignment
+    $result = $State.Result
+    return ($assignment -and $result -and $assignment.mode -ceq 'exam' -and
+        $result.revision -eq $assignment.revision -and $result.mode -ceq 'exam' -and
+        $result.examId -ceq $assignment.examId -and $State.StoppedExamId -cne $assignment.examId -and
+        $result.outcome -ceq 'source-applied' -and $result.reason -ceq 'machine-policies-only')
+}
+
 function New-ExamLabHttpClient {
     Add-Type -AssemblyName System.Net.Http
     $handler = [Net.Http.HttpClientHandler]::new()
@@ -464,6 +473,6 @@ function Invoke-ControllerRequest {
 }
 
 Export-ModuleMember -Function Read-ControllerConfiguration,ConvertTo-ControllerAssignment,Get-ControllerUtc,
-    Read-ControllerState,Write-ControllerJson,Set-ControllerResult,Compare-ControllerAssignment,
+    Read-ControllerState,Write-ControllerJson,Set-ControllerResult,Compare-ControllerAssignment,Test-ControllerActiveExam,
     New-ExamLabHttpClient,Invoke-ControllerRequest,Get-ControllerConsoleLogon,Get-ControllerGuestSessionId,
     Get-ControllerInstallReport,Test-ControllerNoGuestSession,ConvertFrom-ControllerResponse

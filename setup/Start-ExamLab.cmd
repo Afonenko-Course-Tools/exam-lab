@@ -2,243 +2,526 @@
 setlocal EnableExtensions DisableDelayedExpansion
 set "ERRORLEVEL="
 set "EXAMLAB_LAUNCHER=%~f0"
+set "EXAMLAB_ARG1=%~1"
+set "EXAMLAB_ARG2=%~2"
+set "EXAMLAB_ARG3=%~3"
+set "EXAMLAB_ARG4=%~4"
 set "NATIVE=%SystemRoot%\System32"
-if /I not "%PROCESSOR_ARCHITECTURE%"=="AMD64" goto :Unsupported
-"%NATIVE%\fltmc.exe" >nul 2>&1
-if not "%ERRORLEVEL%"=="0" goto :Elevate
-
-cd /d "%NATIVE%"
-set "CURL=%NATIVE%\curl.exe"
-set "PWSH=%ProgramFiles%\PowerShell\7\pwsh.exe"
-set "CA_PIN=@CONTROLLER_CA_SHA256@"
-set "CA_THUMB=@CONTROLLER_CA_THUMBPRINT@"
-set "CA_PENDING=%ProgramFiles%\.exam-lab-controller-%CA_PIN%.pending"
-set "STARTED="
-call :Run 9>"%ProgramFiles%\.exam-lab-bootstrap.lock"
+if exist "%SystemRoot%\Sysnative\WindowsPowerShell\v1.0\powershell.exe" set "NATIVE=%SystemRoot%\Sysnative"
+"%NATIVE%\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "try { $launcherText = [IO.File]::ReadAllText($env:EXAMLAB_LAUNCHER); $script = ($launcherText -split '(?m)^:NativePowerShell\r?$', 2)[1]; . ([ScriptBlock]::Create($script)) } catch { [Console]::Error.WriteLine($_.ToString()); exit 1 }"
 set "RESULT=%ERRORLEVEL%"
-if not defined STARTED (
-    echo Cannot start ExamLab. Another installation may already be running.
-    set "RESULT=1"
-)
-goto :Finish
-
-:Elevate
-if /I "%~1"=="--elevated" goto :ManualElevation
-set "ELEVATION_SCRIPT=%TEMP%\ExamLab-runas-%RANDOM%-%RANDOM%.vbs"
-> "%ELEVATION_SCRIPT%" echo Set shell = CreateObject("Shell.Application")
->> "%ELEVATION_SCRIPT%" echo shell.ShellExecute WScript.Arguments.Item(0), "--elevated", "", "runas", 1
-"%NATIVE%\cscript.exe" //nologo //E:VBScript "%ELEVATION_SCRIPT%" "%EXAMLAB_LAUNCHER%"
-set "RESULT=%ERRORLEVEL%"
-del /q "%ELEVATION_SCRIPT%" >nul 2>&1
-if not "%RESULT%"=="0" goto :ManualElevation
+if not "%RESULT%"=="100" goto :Finish
 exit /b 0
-
-:ManualElevation
-echo Right-click the verified Start-ExamLab.cmd and select Run as administrator.
-set "RESULT=1"
-goto :Finish
-
-:Unsupported
-echo ExamLab requires native Windows x64.
-set "RESULT=1"
-
 :Finish
 if not defined EXAMLAB_NO_PAUSE pause
 exit /b %RESULT%
 
-:Run
-set "STARTED=1"
-set "EXAMLAB_BOOTSTRAP_CA_ADDED="
-set "CURL_TLS_FLAGS="
-set "EXAMLAB_DIAGNOSTICS_DIR=%ProgramFiles%\ExamLabBootstrap-%RANDOM%-%RANDOM%"
-set "WORK=%EXAMLAB_DIAGNOSTICS_DIR%"
-set "REPORT=%WORK%\report"
-set "LOG=%REPORT%\bootstrap.log"
-md "%WORK%" || exit /b 1
-"%NATIVE%\icacls.exe" "%WORK%" /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F"
-if not "%ERRORLEVEL%"=="0" (
-    rd "%WORK%" >nul 2>&1
-    exit /b 1
-)
-md "%REPORT%" || exit /b 1
+@EARLY_CHECK_PAYLOAD@
 
-> "%LOG%" echo ExamLab release @REVISION@ - %DATE% %TIME%
->> "%LOG%" ver
->> "%LOG%" echo Native architecture: %PROCESSOR_ARCHITECTURE%
-for %%V in (EditionID DisplayVersion CurrentBuildNumber UBR) do (
-    "%NATIVE%\reg.exe" query "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion" /v %%V >> "%LOG%" 2>&1
-)
-if exist "%CURL%" "%CURL%" -q --version >> "%LOG%" 2>&1
-call :Install
-set "RESULT=%ERRORLEVEL%"
->> "%LOG%" echo Result: %RESULT%; phase: %PHASE%; %DATE% %TIME%
+:NativePowerShell
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version 2
+$arg1 = $env:EXAMLAB_ARG1
+$action = if ($arg1) { $arg1 } else { 'Apply' }
+$options = @($env:EXAMLAB_ARG2, $env:EXAMLAB_ARG3 | Where-Object { $_ })
+if ($action -notin 'Check', 'Prefetch', 'Apply', 'Verify' -or $env:EXAMLAB_ARG4 -or
+    @($options | Where-Object { $_ -notin '--offline', '--elevated' }).Count -or
+    @($options | Select-Object -Unique).Count -ne $options.Count) {
+    throw 'Usage: Start-ExamLab.cmd [Check|Prefetch|Apply|Verify] [--offline]'
+}
+$offline = $options -contains '--offline'
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$admin = [Security.Principal.WindowsPrincipal]::new($identity).IsInRole(
+    [Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $admin -and $action -ne 'Check') {
+    if ($options -contains '--elevated') { throw 'Run the verified Start-ExamLab.cmd as an administrator.' }
+    $arguments = "$action --elevated"
+    if ($offline) { $arguments += ' --offline' }
+    Start-Process -FilePath $env:EXAMLAB_LAUNCHER -ArgumentList $arguments -Verb RunAs
+    exit 100
+}
 
-if "%RESULT%"=="0" goto :Success
-if "%RESULT%"=="3010" goto :Restart
-echo ExamLab failed during %PHASE% ^(exit %RESULT%^).
-call :Upload
-call :FinishTrust
-call :RemovePayloads
-echo Local diagnostics: "%WORK%"
-exit /b %RESULT%
+@BOOTSTRAP_PRIVATE_PATHS@
 
-:Restart
-call :FinishTrust
-call :RemovePayloads
-echo Restart Windows, then run the same verified Start-ExamLab.cmd again.
-echo Local diagnostics: "%WORK%"
-exit /b 3010
+$release = '@REVISION@'
+$baseUrl = '@PREFETCH_BASE_URL@'
+$toolPath = "exam-lab-$release/tools"
+$controllerCa = [Convert]::FromBase64String('@CONTROLLER_CA_BASE64@')
+$receiver = "$baseUrl/diagnostics @CONTROLLER_CA_SHA256@"
+$runtime = @{ Name='@PWSH_FILE@'; SHA256='@PWSH_SHA256@'; Bytes=@PWSH_BYTES@; Tool=$true }
+$installer = @{ Name='@INSTALLER_FILE@'; SHA256='@INSTALLER_SHA256@'; Bytes=@INSTALLER_BYTES@; Tool=$false }
+$bundle = @{ Name='@BUNDLE_FILE@'; SHA256='@BUNDLE_SHA256@'; Bytes=@BUNDLE_BYTES@; Tool=$false }
+$tools = @BOOTSTRAP_TOOLS@
+foreach ($tool in $tools) { $tool.Tool = $true }
+$programFiles = [Environment]::GetFolderPath('ProgramFiles')
+$reports = Join-Path $programFiles 'ExamLabSetupReports'
+$cache = Join-Path $reports 'Downloads'
+$pwsh = Join-Path $programFiles 'PowerShell\7\pwsh.exe'
+$sourceDirectory = [IO.Path]::GetDirectoryName($env:EXAMLAB_LAUNCHER)
+$attempt = [Guid]::NewGuid().ToString('N')
+$attemptParent = if ($admin) { $programFiles } else { [Environment]::GetFolderPath('LocalApplicationData') }
+$work = Join-Path $attemptParent "ExamLabBootstrap-$attempt"
+$env:PSModulePath = Join-Path $PSHOME 'Modules'
+Set-Location -LiteralPath ([Environment]::GetFolderPath('System'))
+$report = Join-Path $work 'report'
+$transcribing = $false
+$lock = $null
+$attemptLock = $null
+$result = 1
+$sharedCacheRead = $false
+$transportStarted = $false
 
-:Success
-call :FinishTrust
-rd /s /q "%WORK%" >nul 2>&1
-exit /b 0
+function Start-BootstrapTransport {
+    if ($script:transportStarted) { return }
+    $previousTemp = $env:TEMP
+    $previousTmp = $env:TMP
+    try {
+        $env:TEMP = $env:TMP = $work
+        Add-Type -TypeDefinition @'
+using System;
+using System.Net;
+using System.Net.Security;
+using System.Security.Cryptography.X509Certificates;
 
-:Install
-call :Step "controller CA verification"
-@CONTROLLER_CA_PEM@
-"%NATIVE%\certutil.exe" -f -decode "%WORK%\controller-ca.pem" "%WORK%\controller-ca.cer" >> "%LOG%" 2>&1
-if not "%ERRORLEVEL%"=="0" exit /b 1
-call :VerifyHash "%WORK%\controller-ca.cer" "%CA_PIN%"
-if not "%ERRORLEVEL%"=="0" exit /b 1
-set "CA_PRESENT="
-"%NATIVE%\certutil.exe" -store Root "%CA_THUMB%" >> "%LOG%" 2>&1
-if "%ERRORLEVEL%"=="0" set "CA_PRESENT=1"
+public sealed class ExamLabBootstrapTransport : IDisposable {
+    private readonly X509Certificate2 root;
 
-call :Step "PowerShell 7 check"
-set "RUNTIME_READY="
-call :CheckPowerShell
-if "%ERRORLEVEL%"=="0" set "RUNTIME_READY=1"
-if exist "%ProgramFiles%\ExamLab" (
-    if not defined CA_PRESENT goto :PrerequisiteRepair
-    if not defined RUNTIME_READY goto :PrerequisiteRepair
-)
+    public ExamLabBootstrapTransport(byte[] certificate) {
+        root = new X509Certificate2(certificate);
+    }
 
-call :Step "controller CA installation"
-if defined CA_PRESENT goto :ControllerTrusted
-call :AddControllerTrust
-if not "%ERRORLEVEL%"=="0" exit /b 1
-:ControllerTrusted
-if exist "%ProgramFiles%\ExamLab" (
-    del /q "%CA_PENDING%" >nul 2>&1
-) else (
-    if exist "%CA_PENDING%" set "EXAMLAB_BOOTSTRAP_CA_ADDED=1"
-)
-call :ConfigureCurl
+    private bool ValidateServer(object sender, X509Certificate certificate, X509Chain supplied, SslPolicyErrors errors) {
+        if (certificate == null || (errors & ~SslPolicyErrors.RemoteCertificateChainErrors) != 0) return false;
+        using (var leaf = new X509Certificate2(certificate))
+        using (var chain = new X509Chain()) {
+            chain.ChainPolicy.ExtraStore.Add(root);
+            if (supplied != null)
+                foreach (X509ChainElement element in supplied.ChainElements)
+                    chain.ChainPolicy.ExtraStore.Add(element.Certificate);
+            chain.ChainPolicy.VerificationFlags = X509VerificationFlags.AllowUnknownCertificateAuthority;
+            chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
+            chain.ChainPolicy.ApplicationPolicy.Add(new System.Security.Cryptography.Oid("1.3.6.1.5.5.7.3.1"));
+            if (!chain.Build(leaf) || chain.ChainElements.Count < 2) return false;
+            foreach (var status in chain.ChainStatus)
+                if ((status.Status & ~X509ChainStatusFlags.UntrustedRoot) != 0) return false;
+            var anchor = chain.ChainElements[chain.ChainElements.Count - 1].Certificate;
+            return Convert.ToBase64String(anchor.RawData) == Convert.ToBase64String(root.RawData);
+        }
+    }
 
-if defined RUNTIME_READY goto :Installer
-call :Step "PowerShell 7 download"
-call :Download "@PWSH_URL@" "%WORK%\PowerShell.msi"
-if not "%ERRORLEVEL%"=="0" exit /b 1
-call :Step "PowerShell 7 MSI verification"
-call :VerifyHash "%WORK%\PowerShell.msi" "@PWSH_SHA256@"
-if not "%ERRORLEVEL%"=="0" exit /b 1
+    public HttpWebRequest Request(string url) {
+        var uri = new Uri(url);
+        if (uri.Scheme != Uri.UriSchemeHttps) throw new ArgumentException("HTTPS is required.");
+        var request = (HttpWebRequest)WebRequest.Create(uri);
+        request.AllowAutoRedirect = false;
+        request.Proxy = null;
+        request.ServerCertificateValidationCallback = ValidateServer;
+        request.Timeout = 30000;
+        request.ReadWriteTimeout = 120000;
+        return request;
+    }
 
-call :Step "PowerShell 7 MSI installation"
-"%NATIVE%\msiexec.exe" /i "%WORK%\PowerShell.msi" /quiet /norestart USE_MU=0 ENABLE_MU=0 /L*v "%WORK%\PowerShell-msi.log"
-set "MSI_RESULT=%ERRORLEVEL%"
->> "%LOG%" echo MSI exit code: %MSI_RESULT%
-if not "%MSI_RESULT%"=="0" exit /b %MSI_RESULT%
-call :CheckPowerShell
-if not "%ERRORLEVEL%"=="0" exit /b 1
+    public void Dispose() { root.Dispose(); }
+}
+'@
+    } finally {
+        $env:TEMP = $previousTemp
+        $env:TMP = $previousTmp
+    }
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $script:transport = [ExamLabBootstrapTransport]::new($controllerCa)
+    $script:transportStarted = $true
+}
 
-:Installer
-call :Step "ExamLab installer download"
-call :Download "@INSTALLER_URL@" "%WORK%\Install-ExamLab.ps1"
-if not "%ERRORLEVEL%"=="0" exit /b 1
-call :Step "ExamLab installer verification"
-call :VerifyHash "%WORK%\Install-ExamLab.ps1" "@INSTALLER_SHA256@"
-if not "%ERRORLEVEL%"=="0" exit /b 1
-call :Step "ExamLab installer"
-"%PWSH%" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%WORK%\Install-ExamLab.ps1"
-exit /b %ERRORLEVEL%
+function Test-Artifact([string]$Path, $Artifact) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    (Get-Item -LiteralPath $Path -Force).Length -eq $Artifact.Bytes -and
+        (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash -ieq $Artifact.SHA256
+}
 
-:PrerequisiteRepair
->> "%LOG%" echo An existing ExamLab installation is missing a trusted prerequisite. Local maintenance is required.
-echo Existing ExamLab installation needs local maintenance before prerequisites can change.
-exit /b 1
+function Get-SuppliedArtifact($Artifact) {
+    $folders = if ($Artifact.Tool) { 'tools', $toolPath.Replace('/', '\') } else { '.' }
+    foreach ($folder in $folders) {
+        $supplied = Join-Path (Join-Path $sourceDirectory $folder) $Artifact.Name
+        if (Test-Path -LiteralPath $supplied -PathType Leaf) { return $supplied }
+    }
+}
 
-:CheckPowerShell
-if not exist "%PWSH%" exit /b 1
-"%PWSH%" -NoLogo -NoProfile -NonInteractive -Command "if ($PSVersionTable.PSVersion.Major -ne 7 -or $PSVersionTable.PSVersion -lt [semver]'@PWSH_VERSION@' -or $PSVersionTable.PSVersion.PreReleaseLabel -or -not [Environment]::Is64BitProcess) { exit 1 }; $PSVersionTable.PSVersion.ToString()" >> "%LOG%" 2>&1
-exit /b %ERRORLEVEL%
+function Receive-Artifact($Artifact, [string]$Partial) {
+    Start-BootstrapTransport
+    $relative = if ($Artifact.Tool) { "$toolPath/$($Artifact.Name)" } else { $Artifact.Name }
+    $request = $transport.Request("$baseUrl/$relative")
+    $offset = 0L
+    if (Test-Path -LiteralPath $Partial) {
+        Assert-ExamLabProtectedPath $Partial
+        $offset = (Get-Item -LiteralPath $Partial -Force).Length
+        if ($offset -ge $Artifact.Bytes) { $offset = 0L }
+    }
+    if ($offset) { $request.AddRange($offset) }
+    $response = $null
+    $source = $null
+    $target = $null
+    $activity = 'Downloading ' + $Artifact.Name
+    try {
+        try { $response = $request.GetResponse() }
+        catch [Net.WebException] {
+            if ($_.Exception.Response) {
+                try {
+                    if ($offset -and [int]$_.Exception.Response.StatusCode -eq 416) {
+                        [IO.File]::Delete($Partial)
+                        return Receive-Artifact $Artifact $Partial
+                    }
+                } finally { $_.Exception.Response.Dispose() }
+            }
+            throw
+        }
+        if ($response.StatusCode -eq [Net.HttpStatusCode]::OK) {
+            $offset = 0L
+        } elseif ($response.StatusCode -eq [Net.HttpStatusCode]::PartialContent -and $offset) {
+            if ($response.Headers['Content-Range'] -cne "bytes $offset-$($Artifact.Bytes - 1)/$($Artifact.Bytes)") {
+                throw "Unexpected Content-Range for $($Artifact.Name)."
+            }
+        } else { throw "Unexpected HTTP status $([int]$response.StatusCode) for $($Artifact.Name)." }
+        if ($response.ContentLength -ge 0 -and $response.ContentLength -ne $Artifact.Bytes - $offset) {
+            throw "Unexpected Content-Length for $($Artifact.Name)."
+        }
+        $mode = if ($offset) { [IO.FileMode]::Append } else { [IO.FileMode]::Create }
+        $target = [IO.File]::Open($Partial, $mode, 'Write', 'None')
+        $source = $response.GetResponseStream()
+        $buffer = [byte[]]::new(256KB)
+        $received = $offset
+        $progress = [Diagnostics.Stopwatch]::StartNew()
+        $lastDisplayed = -1L
+        $lastLogged = -30L
+        Write-Host "$activity ($offset / $($Artifact.Bytes) bytes)."
+        while (($read = $source.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            if ($progress.Elapsed.TotalHours -ge 4) { throw 'The download exceeded four hours.' }
+            $received += $read
+            if ($received -gt $Artifact.Bytes) { throw "Unexpected extra bytes for $($Artifact.Name)." }
+            $target.Write($buffer, 0, $read)
+            $seconds = [long][Math]::Floor($progress.Elapsed.TotalSeconds)
+            if ($seconds -ne $lastDisplayed) {
+                Write-Progress -Activity $activity -Status "$received / $($Artifact.Bytes) bytes" `
+                    -PercentComplete ([Math]::Floor(100.0 * $received / $Artifact.Bytes))
+                $lastDisplayed = $seconds
+            }
+            if ($seconds -ge $lastLogged + 30) {
+                Write-Host "$activity ($received / $($Artifact.Bytes) bytes)."
+                $lastLogged = $seconds
+            }
+        }
+        $target.Flush($true)
+        if ($received -ne $Artifact.Bytes) { throw "Incomplete download: $received / $($Artifact.Bytes) bytes." }
+        Write-Host "$activity ($received / $($Artifact.Bytes) bytes)."
+    } finally {
+        if ($target) { $target.Dispose() }
+        if ($source) { $source.Dispose() }
+        if ($response) { $response.Dispose() }
+        Write-Progress -Activity $activity -Completed
+    }
+}
 
-:AddControllerTrust
-> "%CA_PENDING%" echo %CA_PIN%
-if not "%ERRORLEVEL%"=="0" exit /b 1
-set "EXAMLAB_BOOTSTRAP_CA_ADDED=1"
-"%NATIVE%\certutil.exe" -f -addstore Root "%WORK%\controller-ca.cer" >> "%LOG%" 2>&1
-if not "%ERRORLEVEL%"=="0" exit /b 1
-"%NATIVE%\certutil.exe" -store Root "%CA_THUMB%" >> "%LOG%" 2>&1
-exit /b %ERRORLEVEL%
+function Save-Artifact($Artifact) {
+    $target = Join-Path $cache $Artifact.Name
+    if (Test-Path -LiteralPath $target) {
+        Assert-ExamLabProtectedPath $target
+        if (Test-Artifact $target $Artifact) {
+            Write-Host "Verified cache: $($Artifact.Name)."
+            return
+        }
+    }
+    $partial = "$target.$($Artifact.SHA256).partial"
+    if (Test-Path -LiteralPath $partial) { Assert-ExamLabProtectedPath $partial }
+    if (-not (Test-Artifact $partial $Artifact)) {
+        $supplied = Get-SuppliedArtifact $Artifact
+        if ($supplied) {
+            [IO.File]::Copy($supplied, $partial, $true)
+            Write-Host "Imported $($Artifact.Name) from the supplied directory."
+        } elseif ($offline) {
+            throw "The offline cache is missing $($Artifact.Name)."
+        } else {
+            Receive-Artifact $Artifact $partial
+        }
+    }
+    if (-not (Test-Artifact $partial $Artifact)) {
+        [IO.File]::Delete($partial)
+        throw "Package size or SHA-256 does not match: $($Artifact.Name)."
+    }
+    if ([IO.File]::Exists($target)) { [IO.File]::Replace($partial, $target, [NullString]::Value) }
+    else { [IO.File]::Move($partial, $target) }
+}
 
-:VerifyHash
-"%NATIVE%\certutil.exe" -hashfile "%~1" SHA256 > "%WORK%\artifact-hash.txt" 2>&1
-if not "%ERRORLEVEL%"=="0" exit /b 1
-type "%WORK%\artifact-hash.txt" >> "%LOG%"
-"%NATIVE%\findstr.exe" /I /X /L /C:"%~2" "%WORK%\artifact-hash.txt" >nul
-exit /b %ERRORLEVEL%
+function Send-Diagnostics([string]$Directory) {
+    $archive = Join-Path $Directory 'diagnostics.zip'
+    $receipt = Join-Path $Directory 'upload-result.json'
+    $receiverFile = Join-Path $Directory 'delivery-target.txt'
+    if ($offline -or -not (Test-Path -LiteralPath $archive -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $receiverFile -PathType Leaf)) { return }
+    if ($admin) {
+        Assert-ExamLabProtectedPath $archive
+        Assert-ExamLabProtectedPath $receiverFile
+    }
+    if ([IO.File]::ReadAllText($receiverFile) -cne $receiver) { return }
+    if (Test-Path -LiteralPath $receipt -PathType Leaf) {
+        if ($admin) { Assert-ExamLabProtectedPath $receipt }
+        try {
+            $saved = [IO.File]::ReadAllText($receipt) | ConvertFrom-Json
+            if ($saved.reportId -cmatch '\A[0-9a-f]{32}\z') { return }
+        } catch { Write-Warning "Invalid diagnostics receipt in $Directory. Retrying the same ZIP." }
+    }
+    Start-BootstrapTransport
+    $request = $transport.Request("$baseUrl/diagnostics")
+    $request.Method = 'POST'
+    $request.ContentType = 'application/zip'
+    $request.AllowWriteStreamBuffering = $false
+    $request.ServicePoint.Expect100Continue = $false
+    $request.ContentLength = (Get-Item -LiteralPath $archive -Force).Length
+    $archiveStream = [IO.File]::Open($archive, 'Open', 'Read', 'Read')
+    try {
+        $output = $request.GetRequestStream()
+        try { $archiveStream.CopyTo($output) } finally { $output.Dispose() }
+        $response = $request.GetResponse()
+        try {
+            if ([int]$response.StatusCode -ne 201) { throw "Unexpected diagnostics status $([int]$response.StatusCode)." }
+            $reader = [IO.StreamReader]::new($response.GetResponseStream())
+            try {
+                $content = $reader.ReadToEnd()
+                $id = ($content | ConvertFrom-Json).reportId
+                if ($id -cnotmatch '\A[0-9a-f]{32}\z') { throw 'Missing diagnostics reportId.' }
+            } finally { $reader.Dispose() }
+        } finally { $response.Dispose() }
+        $temporary = "$receipt.$([Guid]::NewGuid().ToString('N')).tmp"
+        try {
+            [IO.File]::WriteAllText($temporary, $content)
+            if ([IO.File]::Exists($receipt)) { [IO.File]::Replace($temporary, $receipt, [NullString]::Value) }
+            else { [IO.File]::Move($temporary, $receipt) }
+        } finally { [IO.File]::Delete($temporary) }
+        Write-Host "Diagnostics accepted: $id"
+    } finally { $archiveStream.Dispose() }
+}
 
-:ConfigureCurl
-"%CURL%" -q --ssl-revoke-best-effort --version >nul 2>&1
-if not errorlevel 1 (
-    set "CURL_TLS_FLAGS=--ssl-revoke-best-effort --cacert "%WORK%\controller-ca.pem""
-    exit /b 0
-)
-rem WinSSL 7.55.1 uses the Windows root store and cannot use a custom CA file.
-rem The private pilot CA has no revocation endpoint. Keep chain and hostname checks.
-set "CURL_TLS_FLAGS=--ssl-no-revoke"
->> "%LOG%" echo HTTPS: legacy Windows curl, native certificate store.
-exit /b 0
+function Invoke-EarlyCheck {
+    $parts = [regex]::Matches($launcherText, '(?m)^rem EXAMLAB_EARLY_CHECK:([A-Za-z0-9+/=]+)\r?$')
+    if (-not $parts.Count) { throw 'The verified launcher is missing the Check payload.' }
+    $encoded = ($parts | ForEach-Object { $_.Groups[1].Value }) -join ''
+    $checkScript = Join-Path $work 'Prepare-ExamLab.ps1'
+    [IO.File]::WriteAllBytes($checkScript, [Convert]::FromBase64String($encoded))
+    $checkReport = Join-Path $report 'early-check.json'
+    $previousTemp = $env:TEMP
+    $previousTmp = $env:TMP
+    try {
+        $env:TEMP = $env:TMP = $work
+        $ErrorActionPreference = 'Continue'
+        & (Join-Path $PSHOME 'powershell.exe') -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+            -File $checkScript -Action Check -HumanOutput -ReportPath $checkReport 2>&1 |
+            ForEach-Object { [string]$_ } | Tee-Object -FilePath (Join-Path $report 'early-check.log') | Out-Host
+        $script:checkExit = $LASTEXITCODE
+    } finally {
+        $env:TEMP = $previousTemp
+        $env:TMP = $previousTmp
+    }
+    if (-not (Test-Path -LiteralPath $checkReport -PathType Leaf)) { throw "Check returned $checkExit without a report." }
+    Get-Content -LiteralPath $checkReport -Raw | ConvertFrom-Json
+}
 
-:Download
-"%CURL%" -q --proto "=https" --noproxy "*" --tlsv1.2@CURL_RESOLVE@ %CURL_TLS_FLAGS% --fail --silent --show-error --connect-timeout 30 --max-time 2700 --output "%~2" "%~1" >> "%LOG%" 2>&1
-exit /b %ERRORLEVEL%
+function Get-ReleasePlan($Check, [bool]$RuntimeReady) {
+    $plannedFiles = @($Check.Plan.Packages | ForEach-Object { $_.File })
+    $requiredTools = @('LGPO.zip', 'PolicyFileEditor-3.0.1.zip', 'wazuh-agent-4.14.10-1.msi',
+        'gradle-9.8.2-bin.zip', 'gradle-exam-cache.zip') + $plannedFiles
+    $artifacts = @($installer, $bundle)
+    if (-not $RuntimeReady) { $artifacts += $runtime }
+    foreach ($name in $requiredTools | Select-Object -Unique) {
+        $tool = @($tools | Where-Object { $_.Name -ceq $name })
+        if ($tool.Count -ne 1) { throw "No pinned release artifact for $name." }
+        $artifacts += $tool[0]
+    }
+    $rows = foreach ($artifact in $artifacts) {
+        $target = Join-Path $cache $artifact.Name
+        $status = if (-not $sharedCacheRead) { 'UnknownWithoutElevation' }
+            elseif (Test-Artifact $target $artifact) { 'Cached' }
+            else { 'Missing' }
+        $supplied = Get-SuppliedArtifact $artifact
+        if ($status -ne 'Cached' -and $supplied) { $status = 'SuppliedUnverified' }
+        [pscustomobject]@{ Name=$artifact.Name; Bytes=$artifact.Bytes; CacheStatus=$status }
+    }
+    $unknown = @($rows | Where-Object CacheStatus -eq 'UnknownWithoutElevation')
+    $missing = @($rows | Where-Object CacheStatus -eq 'Missing')
+    $plan = [ordered]@{
+        Release=$release; Attempt=$attempt; Action=$action; Elevated=$admin; Offline=$offline
+        PowerShell7Ready=$RuntimeReady; Artifacts=@($rows)
+        DownloadBytes=$(if (-not $unknown.Count) { [long](($missing | Measure-Object Bytes -Sum).Sum) })
+        DownloadUpperBoundBytes=[long](($rows | Where-Object CacheStatus -ne 'Cached' | Measure-Object Bytes -Sum).Sum)
+        CacheDriveFreeBytes=([IO.DriveInfo]::new([IO.Path]::GetPathRoot($programFiles))).AvailableFreeSpace
+    }
+    $plan | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $report 'release-plan.json') -Encoding UTF8
+    Write-Host "PowerShell 7 ready: $RuntimeReady. Cache drive free bytes: $($plan.CacheDriveFreeBytes)."
+    $rows | Format-Table Name, Bytes, CacheStatus -AutoSize | Out-Host
+    Write-Host "Download upper bound: $($plan.DownloadUpperBoundBytes) bytes."
+    return $artifacts
+}
 
-:Step
-set "PHASE=%~1"
-echo [%TIME%] %PHASE%
->> "%LOG%" echo [%TIME%] %PHASE%
-exit /b 0
+function Test-PowerShellRuntime {
+    if (-not (Test-Path -LiteralPath $pwsh -PathType Leaf)) { return $false }
+    if ($admin) {
+        Assert-ExamLabProtectedPath ([IO.Path]::GetDirectoryName($pwsh)) -Readable
+        Assert-ExamLabProtectedPath $pwsh -Readable
+    }
+    & $pwsh -NoLogo -NoProfile -NonInteractive -Command `
+        'if ($PSVersionTable.PSVersion.Major -ne 7 -or $PSVersionTable.PSVersion -lt [semver]"@PWSH_VERSION@" -or $PSVersionTable.PSVersion.PreReleaseLabel -or -not [Environment]::Is64BitProcess) { exit 1 }' | Out-Host
+    return $LASTEXITCODE -eq 0
+}
 
-:Upload
-if not "%PHASE%"=="ExamLab installer" call :CollectNative
-if exist "%WORK%\PowerShell-msi.log" "%NATIVE%\findstr.exe" /I /L /C:"Return value 3" /C:"MainEngineThread is returning" "%WORK%\PowerShell-msi.log" > "%REPORT%\msi-summary.log"
-"%NATIVE%\tar.exe" -a -cf "%WORK%\diagnostics.zip" -C "%WORK%" report > "%WORK%\archive.log" 2>&1
-if not "%ERRORLEVEL%"=="0" exit /b 0
-if not defined CURL_TLS_FLAGS exit /b 0
-for %%F in ("%WORK%\diagnostics.zip") do if %%~zF GTR 8388608 (
-    echo Diagnostic ZIP is larger than 8 MiB. It is available locally.
-    exit /b 0
-)
-"%CURL%" -q --proto "=https" --noproxy "*" --tlsv1.2@CURL_RESOLVE@ %CURL_TLS_FLAGS% --fail --silent --show-error --connect-timeout 30 --max-time 1200 --header "Content-Type: application/zip" --header "Expect:" --data-binary "@%WORK%\diagnostics.zip" --output "%WORK%\upload-result.json" "@DIAGNOSTICS_URL@" >> "%LOG%" 2>&1
-if not "%ERRORLEVEL%"=="0" (
-    echo Diagnostic upload unavailable. The ZIP is available locally.
-    exit /b 0
-)
-echo Diagnostic upload response:
-type "%WORK%\upload-result.json"
-exit /b 0
+function Invoke-Bootstrap {
+    $check = Invoke-EarlyCheck
+    $bootCheck = [Collections.Generic.List[string]]::new()
+    if ($check.Platform) {
+        $platform = $check.Platform
+        $domain = if ($null -eq $platform.PartOfDomain) { 'unknown' } else { $platform.PartOfDomain }
+        Write-Host "Windows $($platform.Edition), build $($platform.Build). Domain member: $domain. Elevated: $admin."
+        $platform.OptionalObservations | ForEach-Object { Write-Host "Check: $_" }
+        if (-not $platform.ClientWindows -or [int]$platform.Build -lt 19041) {
+            $bootCheck.Add('The pilot requires a Windows client, build 19041 or newer.')
+        }
+        if ($platform.PartOfDomain -eq $true) { $bootCheck.Add('The pilot requires a standalone Windows computer.') }
+    }
+    if ($check.Preflight) { $check.Preflight.Services | Format-Table Name, Status, StartValue -AutoSize | Out-Host }
+    if ($check.Plan) {
+        $check.Plan.Actions | Format-Table Name, Operation, ExistingVersion, ExistingPath, Destination -AutoSize | Out-Host
+    }
+    $check.Errors | ForEach-Object { Write-Host "Check: $_" }
+    $bootCheck | ForEach-Object { Write-Host "Check: $_" }
+    [ordered]@{ Blockers=$bootCheck.ToArray(); NativeCheckExit=$checkExit } | ConvertTo-Json |
+        Set-Content -LiteralPath (Join-Path $report 'pilot-preflight.json') -Encoding UTF8
+    if ($action -ne 'Verify' -and ($checkExit -ne 0 -or $bootCheck.Count)) {
+        Write-Host "Check report: $report"
+        if ($checkExit -ne 0) { return $checkExit }
+        return 2
+    }
+    $runtimeReady = Test-PowerShellRuntime
+    if ($check.Plan) { $artifacts = @(Get-ReleasePlan $check $runtimeReady) }
+    if ($action -eq 'Check') {
+        Write-Host "Check report: $report"
+        return 0
+    }
+    if ($action -ne 'Verify' -and -not $check.Plan) { throw 'Check returned no installation plan.' }
+    if ($action -ne 'Verify') {
+        foreach ($artifact in $artifacts) { Save-Artifact $artifact }
+        if ($action -eq 'Prefetch') { return 0 }
+    }
+    if (-not $runtimeReady) {
+        if ($action -eq 'Verify') { throw 'PowerShell 7 x64 for this release is unavailable.' }
+        $msi = Join-Path $cache $runtime.Name
+        $log = Join-Path $report 'PowerShell-msi.log'
+        $signature = Get-AuthenticodeSignature -LiteralPath $msi
+        if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'Microsoft Corporation') {
+            throw "The PowerShell MSI signature did not pass verification: $($signature.Status)."
+        }
+        Write-Host 'Installing PowerShell 7 x64.'
+        $process = Start-Process -FilePath (Join-Path ([Environment]::GetFolderPath('System')) 'msiexec.exe') `
+            -ArgumentList "/i `"$msi`" /quiet /norestart USE_MU=0 ENABLE_MU=0 /L*v `"$log`"" -Wait -PassThru
+        if ($process.ExitCode -ne 0) { return $process.ExitCode }
+        if (-not (Test-PowerShellRuntime)) { throw 'The PowerShell 7 MSI ran, but the specified runtime did not pass verification.' }
+    }
+    $entry = Join-Path $cache $installer.Name
+    Assert-ExamLabProtectedPath $entry
+    $localEntry = Join-Path $work 'Install-ExamLab.ps1'
+    [IO.File]::Copy($entry, $localEntry)
+    if (-not (Test-Artifact $localEntry $installer)) { throw 'The cached installer failed SHA-256 verification.' }
+    $env:EXAMLAB_DIAGNOSTICS_DIR = $work
+    $env:PSModulePath = (Join-Path ([IO.Path]::GetDirectoryName($pwsh)) 'Modules') + ';' + (Join-Path $PSHOME 'Modules')
+    $arguments = @('-Action', $action)
+    if ($offline) { $arguments += '-Offline' }
+    $ErrorActionPreference = 'Continue'
+    & $pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $localEntry @arguments 2>&1 |
+        ForEach-Object { [string]$_ } | Tee-Object -FilePath (Join-Path $report 'powershell-console.log') | Out-Host
+    return $LASTEXITCODE
+}
 
-:CollectNative
-"%NATIVE%\wevtutil.exe" qe Application /q:"*[System[Provider[@Name='MsiInstaller'] and TimeCreated[timediff(@SystemTime) <= 900000]]]" /rd:true /c:12 /f:xml > "%WORK%\msi-events.xml" 2>> "%LOG%"
-"%NATIVE%\wevtutil.exe" qe System /q:"*[System[Provider[@Name='Schannel'] and TimeCreated[timediff(@SystemTime) <= 900000]]]" /rd:true /c:12 /f:xml > "%WORK%\schannel-events.xml" 2>> "%LOG%"
-exit /b 0
-
-:FinishTrust
-if not defined EXAMLAB_BOOTSTRAP_CA_ADDED exit /b 0
-if exist "%WORK%\bootstrap-ca-managed" goto :ClearTrustPending
-"%NATIVE%\certutil.exe" -store Root "%CA_THUMB%" >nul 2>&1
-if not "%ERRORLEVEL%"=="0" goto :ClearTrustPending
-"%NATIVE%\certutil.exe" -delstore Root "%CA_THUMB%" >> "%LOG%" 2>&1
-if not "%ERRORLEVEL%"=="0" (
-    echo Controller CA rollback failed. See the local bootstrap log.
-    exit /b 1
-)
-:ClearTrustPending
-del /q "%CA_PENDING%" >nul 2>&1
-exit /b 0
-
-:RemovePayloads
-del /q "%WORK%\PowerShell.msi" "%WORK%\Install-ExamLab.ps1" "%WORK%\controller-ca.pem" "%WORK%\controller-ca.cer" "%WORK%\artifact-hash.txt" >nul 2>&1
-exit /b 0
+try {
+    if ($admin) { New-ExamLabPrivateDirectory $work }
+    else {
+        $acl = [Security.AccessControl.DirectorySecurity]::new()
+        $acl.SetAccessRuleProtection($true, $false)
+        foreach ($sid in $identity.User.Value, 'S-1-5-18', 'S-1-5-32-544') {
+            $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+                [Security.Principal.SecurityIdentifier]::new($sid), 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow'))
+        }
+        [void][IO.Directory]::CreateDirectory($work, $acl)
+    }
+    [void][IO.Directory]::CreateDirectory($report)
+    [IO.File]::WriteAllText((Join-Path $work 'delivery-target.txt'), $receiver)
+    $attemptLock = [IO.File]::Open((Join-Path $work 'attempt.lock'), 'CreateNew', 'ReadWrite', 'None')
+    Start-Transcript -LiteralPath (Join-Path $report 'bootstrap.log') | Out-Null
+    $transcribing = $true
+    Write-Host "ExamLab $release, $action, attempt $attempt"
+    if ($admin) {
+        if ($action -in 'Prefetch', 'Apply') {
+            $lockPath = Join-Path $programFiles '.exam-lab-bootstrap.lock'
+            if (Test-Path -LiteralPath $lockPath) { Assert-ExamLabProtectedPath $lockPath -Readable }
+            $lock = [IO.File]::Open($lockPath, 'OpenOrCreate', 'ReadWrite', 'None')
+            if (-not (Test-Path -LiteralPath $reports)) { New-ExamLabPrivateDirectory $reports }
+            Assert-ExamLabProtectedPath $reports
+            if (-not (Test-Path -LiteralPath $cache)) { New-ExamLabPrivateDirectory $cache }
+        }
+        if (Test-Path -LiteralPath $reports) { Assert-ExamLabProtectedPath $reports }
+        if (Test-Path -LiteralPath $cache) { Assert-ExamLabProtectedPath $cache }
+        $sharedCacheRead = $true
+    }
+    $result = Invoke-Bootstrap
+} catch {
+    $failure = $_
+    if (Test-Path -LiteralPath $report) {
+        $failure | Format-List * -Force | Out-String -Width 360 |
+            Set-Content -LiteralPath (Join-Path $report 'bootstrap-error.log') -Encoding UTF8
+    }
+    [Console]::Error.WriteLine($failure.ToString())
+} finally {
+    if (Test-Path -LiteralPath $report) {
+        try {
+            if (-not (Test-Path -LiteralPath (Join-Path $report 'powershell-transcript.log'))) {
+                $eventLog = Join-Path ([Environment]::GetFolderPath('System')) 'wevtutil.exe'
+                & $eventLog qe Application '/q:*[System[Provider[@Name="MsiInstaller"] and TimeCreated[timediff(@SystemTime) <= 900000]]]' `
+                    /rd:true /c:30 /f:xml 2>&1 | Out-File -LiteralPath (Join-Path $report 'bootstrap-msi-events.xml') -Encoding UTF8
+                & $eventLog qe System '/q:*[System[Provider[@Name="Schannel"] and TimeCreated[timediff(@SystemTime) <= 900000]]]' `
+                    /rd:true /c:30 /f:xml 2>&1 | Out-File -LiteralPath (Join-Path $report 'bootstrap-schannel-events.xml') -Encoding UTF8
+            }
+        } catch { Write-Warning "Native Windows events unavailable: $_" }
+        Write-Host "Attempt $attempt finished with exit $result."
+        if ($transcribing) { try { Stop-Transcript | Out-Null } catch { Write-Warning $_ } }
+        try {
+            [ordered]@{ Attempt=$attempt; Release=$release; Action=$action; ExitCode=$result; EndedUtc=[DateTime]::UtcNow } |
+                ConvertTo-Json | Set-Content -LiteralPath (Join-Path $report 'attempt.json') -Encoding UTF8
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            $archive = Join-Path $work 'diagnostics.zip'
+            $temporary = "$archive.partial"
+            try {
+                [IO.Compression.ZipFile]::CreateFromDirectory($report, $temporary)
+                [IO.File]::Move($temporary, $archive)
+            } finally { [IO.File]::Delete($temporary) }
+            $retryPrevious = -not $offline
+            try { Send-Diagnostics $work }
+            catch {
+                Write-Warning "Diagnostic delivery is pending: $_"
+                if ($_.Exception.InnerException -is [Net.WebException] -and -not $_.Exception.InnerException.Response) {
+                    $retryPrevious = $false
+                }
+            }
+            if ($retryPrevious) {
+                $previous = Get-ChildItem -LiteralPath $attemptParent -Directory -Filter 'ExamLabBootstrap-*' |
+                    Where-Object { $_.FullName -ne $work -and -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) }
+                foreach ($directory in $previous) {
+                    try {
+                        if ($admin) { Assert-ExamLabProtectedPath $directory.FullName }
+                        Send-Diagnostics $directory.FullName
+                    } catch { Write-Warning "Diagnostic delivery is pending for $($directory.Name): $_" }
+                }
+            }
+        } catch { Write-Warning "Diagnostic delivery is pending: $_" }
+        Write-Host "Local diagnostics: $work"
+    }
+    if ($transportStarted) { $transport.Dispose() }
+    if ($attemptLock) { $attemptLock.Dispose() }
+    if ($lock) { $lock.Dispose() }
+}
+if ($result -eq 3010) { Write-Host 'Restart Windows, then run the same verified Start-ExamLab.cmd again.' }
+exit $result

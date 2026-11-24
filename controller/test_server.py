@@ -2,18 +2,22 @@ import base64
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import timedelta, timezone
-from http.client import HTTPConnection
+from http.client import HTTPConnection, RemoteDisconnected
 from http.server import ThreadingHTTPServer
+from io import BytesIO
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Thread
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+from zipfile import ZipFile
 
 from server import (
-    ENROLLMENT_PATH, MAX_BODY, POLL_PATH, SCHEMA, TEACHER_PATH, TEACHER_PROXY_HEADER,
-    EnrollmentSlot, PollHandler, assign, confirm_guest, connect, enrollment_receipt,
+    DIAGNOSTIC_ENROLLMENT_SCHEMA, DIAGNOSTICS_PATH, ENROLLMENT_PATH, MAX_BODY, MAX_DIAGNOSTICS_BODY,
+    POLL_PATH, SCHEMA, TEACHER_PATH, TEACHER_PROXY_HEADER,
+    DiagnosticEnrollment, DiagnosticStore, EnrollmentSlot, PollHandler, WazuhEnrollment, WazuhEnrollmentError,
+    assign, confirm_guest, connect, enrollment_receipt,
     iso_utc, parse_utc, read_teacher_proxy_token, readiness_table, register, status, utc_now,
 )
 
@@ -40,11 +44,12 @@ class ControllerTest(unittest.TestCase):
         self.thread.join()
         self.server.server_close()
 
-    def send(self, payload, token=None, *, path=POLL_PATH, headers=None):
+    def send(self, payload, token=None, *, path=POLL_PATH, headers=None, source_ip=None):
         headers = {"Content-Type": "application/json; charset=utf-8", **(headers or {})}
         if token is not None:
             headers["Authorization"] = f"Bearer {token}"
-        with closing(HTTPConnection(*self.server.server_address, timeout=2)) as client:
+        source_address = (source_ip, 0) if source_ip else None
+        with closing(HTTPConnection(*self.server.server_address, timeout=2, source_address=source_address)) as client:
             client.request("POST", path, payload, headers)
             response = client.getresponse()
             self.assertEqual("no-store", response.getheader("Cache-Control"))
@@ -173,6 +178,130 @@ class ControllerTest(unittest.TestCase):
         self.assertCountEqual([receipt for _, receipt in allocations], receipts)
         self.assertEqual((409, {"error": "enrollment-already-claimed"}), enroll(10))
         self.assertEqual(results[0], enroll(0))
+
+    def test_diagnostics_before_enrollment_and_duplicate_at_capacity(self):
+        self.server.db_path = self.path.parent / "unused.sqlite3"
+        directory = self.path.parent / "diagnostics"
+        self.server.diagnostics_store = DiagnosticStore(directory)
+        headers = {"Content-Type": "application/zip"}
+
+        def zip_body(content):
+            buffer = BytesIO()
+            with ZipFile(buffer, "w") as archive:
+                archive.writestr("attempt/child-error.txt", content)
+            return buffer.getvalue()
+
+        body = zip_body(b"raw diagnostic bytes\0\xff")
+        self.assertEqual(404, self.send(body, path=DIAGNOSTICS_PATH, headers=headers)[0])
+        directory.mkdir(mode=0o700)
+        self.assertEqual(400, self.send(body[:8], path=DIAGNOSTICS_PATH, headers=headers)[0])
+        self.assertEqual(415, self.send(body, path=DIAGNOSTICS_PATH)[0])
+        oversized = {**headers, "Content-Length": str(MAX_DIAGNOSTICS_BODY + 1)}
+        self.assertEqual(413, self.send(b"", path=DIAGNOSTICS_PATH, headers=oversized)[0])
+        with patch("server.MAX_DIAGNOSTICS_STORAGE", len(body)):
+            first = self.send(body, path=DIAGNOSTICS_PATH, headers=headers)
+            self.assertEqual(201, first[0])
+            self.assertRegex(first[1]["reportId"], r"\A[0-9a-f]{32}\Z")
+            self.assertEqual(first, self.send(body, path=DIAGNOSTICS_PATH, headers=headers))
+            self.assertEqual(
+                (503, {"error": "diagnostics-capacity"}),
+                self.send(zip_body(b"different"), path=DIAGNOSTICS_PATH, headers=headers),
+            )
+        stored = list(directory.iterdir())
+        self.assertEqual([f"{first[1]['reportId']}.zip"], [file.name for file in stored])
+        self.assertEqual(body, stored[0].read_bytes())
+        self.assertEqual(0o600, stored[0].stat().st_mode & 0o777)
+        self.assertEqual(404, self.get(DIAGNOSTICS_PATH)[0])
+        self.assertFalse(self.server.db_path.exists())
+
+    def test_diagnostic_enrollment_two_clients_loss_replay_and_addressed_revocation(self):
+        path = self.path.parent / "empty.sqlite3"
+        with closing(connect(path, create=True)) as db, db:
+            db.executescript(SCHEMA + DIAGNOSTIC_ENROLLMENT_SCHEMA)
+            self.assertEqual(0, db.execute("SELECT count(*) FROM devices").fetchone()[0])
+            self.assertEqual(0, db.execute("SELECT count(*) FROM exam_places").fetchone()[0])
+        wazuh = Mock(spec=WazuhEnrollment)
+
+        def issue_key(name):
+            key = f"{wazuh.get_or_create.call_count:03d} {name} any {name.removeprefix('diag-') * 2}"
+            return base64.b64encode(key.encode("ascii")).decode("ascii")
+
+        wazuh.get_or_create.side_effect = issue_key
+        network = {
+            "ControllerEndpoint": {"IP": "192.0.2.10", "Port": 21650},
+            "WazuhEndpoint": {"IP": "192.0.2.10", "Port": 1514},
+        }
+        url = "https://192.0.2.10:21650/exam/v1/poll"
+        self.server.db_path = path
+        pilot = DiagnosticEnrollment(path.parent, url, network, wazuh)
+        self.server.diagnostic_enrollment = pilot
+        headers = self.enable_teacher_panel()
+
+        def enroll(number, *, source_ip=None):
+            claim = json.dumps({"claim": f"{number:064x}"})
+            return self.send(claim, path=ENROLLMENT_PATH, headers=headers, source_ip=source_ip)
+
+        # Ответ потерян после успешной записи. Следующий вызов приходит с другого адреса.
+        with patch.object(PollHandler, "reply", return_value=None):
+            with self.assertRaises(RemoteDisconnected):
+                enroll(1, source_ip="127.0.0.1")
+        self.assertEqual(1, wazuh.get_or_create.call_count)
+        self.stop_server()
+        self.start_server()
+        self.server.db_path = path
+        pilot = DiagnosticEnrollment(path.parent, url, network, wazuh)
+        self.server.diagnostic_enrollment = pilot
+        headers = self.enable_teacher_panel()
+        first = enroll(1, source_ip="127.0.0.2")
+        self.assertEqual(200, first[0])
+        self.assertEqual(1, wazuh.get_or_create.call_count)
+        second = enroll(2, source_ip="127.0.0.1")
+        self.assertEqual(200, second[0])
+        self.assertNotEqual(first[1]["wazuhKey"], second[1]["wazuhKey"])
+        first_registration, second_registration = (receipt[1]["registration"] for receipt in (first, second))
+        self.assertNotEqual(first_registration["deviceId"], second_registration["deviceId"])
+        self.assertNotEqual(first_registration["token"], second_registration["token"])
+        for registration in (first_registration, second_registration):
+            device_id, token = registration["deviceId"], registration["token"]
+            self.assertEqual((200, {"deviceId": device_id, "revision": 1, "mode": "normal", "examId": None}),
+                             self.poll(device_id=device_id, token=token))
+        self.assertEqual(first, enroll(1, source_ip="127.0.0.2"))
+        with closing(connect(path)) as db, db:
+            self.assertEqual(2, db.execute("SELECT count(*) FROM devices").fetchone()[0])
+            self.assertEqual(0, db.execute("SELECT count(*) FROM exam_places").fetchone()[0])
+        with closing(connect(path)) as db, db:
+            assign(db, first_registration["deviceId"], "isolated-exam")
+        wazuh.revoke.side_effect = [WazuhEnrollmentError(), None]
+        with closing(connect(path)) as db, self.assertRaises(WazuhEnrollmentError):
+            pilot.revoke(first_registration["deviceId"], db)
+        self.assertEqual((410, {"error": "diagnostic-enrollment-revoked"}), enroll(1))
+        self.assertEqual(401, self.poll(device_id=first_registration["deviceId"], token=first_registration["token"])[0])
+        self.assertEqual(second, enroll(2))
+        with closing(connect(path)) as db, db:
+            self.assertEqual("normal", status(db, first_registration["deviceId"], 45)["assignment"]["mode"])
+        with closing(connect(path)) as db:
+            pilot.revoke(first_registration["deviceId"], db)
+        self.assertEqual([(first_registration["deviceId"],)] * 2, [entry.args for entry in wazuh.revoke.call_args_list])
+
+    def test_wazuh_recovers_existing_named_agent_and_revokes_only_its_id(self):
+        wazuh = object.__new__(WazuhEnrollment)
+        wazuh.authorization = "Basic test"
+        name = "diag-" + "a" * 32
+        key = base64.b64encode(f"021 {name} any {'b' * 64}".encode()).decode()
+        authorize = {"token": "test.token.value"}
+        match = {"affected_items": [{"id": "021", "name": name}]}
+        with patch.object(wazuh, "request", side_effect=[authorize, {"affected_items": []}, WazuhEnrollmentError(),
+                                                         authorize, match, {"affected_items": [{"id": "021", "key": key}]},
+                                                         authorize, match, {"affected_items": ["021"]}]) as request:
+            with self.assertRaises(WazuhEnrollmentError):
+                wazuh.get_or_create(name)
+            self.assertEqual(key, wazuh.get_or_create(name))
+            wazuh.revoke(name)
+            self.assertEqual(("POST", "/agents", "Bearer test.token.value", {"name": name, "ip": "any"}),
+                             request.call_args_list[2].args)
+            self.assertEqual(("GET", "/agents/021/key", "Bearer test.token.value"), request.call_args_list[5].args)
+            self.assertEqual(("DELETE", "/agents?agents_list=021&status=all&older_than=0s&purge=true", "Bearer test.token.value"),
+                             request.call_args_list[8].args)
 
     def test_report_order_override_and_connection_age(self):
         normal = self.assign(None)

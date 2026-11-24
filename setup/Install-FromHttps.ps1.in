@@ -19,97 +19,45 @@
     @ENROLLMENT_CORE@
 
     function Add-InstallPhase([string]$Phase) {
-        if (-not $env:EXAMLAB_DIAGNOSTICS_DIR) { return }
         try {
-            $reportDirectory = Join-Path $env:EXAMLAB_DIAGNOSTICS_DIR 'report'
-            [void][IO.Directory]::CreateDirectory($reportDirectory)
-            [IO.File]::AppendAllText((Join-Path $reportDirectory 'install-phase.txt'), "$Phase`r`n")
+            [IO.File]::AppendAllText((Join-Path $diagnosticReport 'install-phase.txt'),
+                "$([DateTime]::UtcNow.ToString('o')) $Phase`r`n")
         } catch { Write-Warning 'Installation phase log unavailable.' }
     }
 
+    function Save-InstallReport([string]$Name, $Value) {
+        ConvertTo-Json -InputObject $Value -Depth 14 |
+            Set-Content -LiteralPath (Join-Path $diagnosticReport $Name) -Encoding utf8
+    }
+
     function Invoke-Setup([string]$Name, [string[]]$Arguments, [ref]$RestartRequired) {
-        Add-InstallPhase ([IO.Path]::GetFileNameWithoutExtension($Name))
+        $step = [IO.Path]::GetFileNameWithoutExtension($Name)
+        $log = Join-Path $diagnosticReport "$step.log"
+        Add-InstallPhase $step
         $PSNativeCommandUseErrorActionPreference = $false
-        & $examLabPowerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $setup $Name) @Arguments
-        if ($LASTEXITCODE -eq 3010) {
+        try {
+            $env:EXAMLAB_DIAGNOSTICS_DIR = $diagnosticReport
+            & $examLabPowerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $setup $Name) @Arguments 2>&1 |
+                ForEach-Object { [string]$_ } | Tee-Object -FilePath $log | Out-Host
+            $code = $LASTEXITCODE
+        } finally { $env:EXAMLAB_DIAGNOSTICS_DIR = $diagnosticDirectory }
+        if ($code -eq 3010) {
             if ($null -eq $RestartRequired) { throw 'Restart Windows and run the same installation command again.' }
             $RestartRequired.Value = $true
             return
         }
-        if ($LASTEXITCODE -ne 0) { throw "$Name failed with exit code $LASTEXITCODE." }
+        if ($code -ne 0) { throw "$Name failed with exit code $code. See $log." }
     }
 
-    function Get-Download([string]$Url, [string]$Target) {
-        Add-InstallPhase ('download-' + [IO.Path]::GetFileName($Target))
-        Write-Host ('Downloading ' + [IO.Path]::GetFileName($Target))
-        Invoke-WebRequest -Uri $Url -OutFile $Target -ConnectionTimeoutSeconds 120 -OperationTimeoutSeconds 900 -MaximumRedirection 0 -NoProxy -ErrorAction Stop
-    }
-
-    function Get-IdeaDownload([string]$Url, [string]$Target) {
-        $ProgressPreference = 'Continue'
-        $activity = 'Downloading IntelliJ IDEA'
-        Add-InstallPhase ('download-' + [IO.Path]::GetFileName($Target))
-        Write-Host ('Downloading ' + [IO.Path]::GetFileName($Target))
-        $request = [Net.WebRequest]::CreateHttp($Url)
-        $request.AllowAutoRedirect = $false
-        $request.Proxy = $null
-        $request.Timeout = 900000
-        $request.ReadWriteTimeout = 900000
-        $response = $source = $file = $null
-        try {
-            Write-Progress -Activity $activity -Status 'Connecting...'
-            $response = $request.GetResponse()
-            if ($response.StatusCode -ne [Net.HttpStatusCode]::OK) {
-                throw "Unexpected HTTP status $([int]$response.StatusCode) for the IDEA download."
-            }
-            $length = $response.ContentLength
-            $source = $response.GetResponseStream()
-            $file = [IO.File]::Open($Target, 'CreateNew', 'Write', 'None')
-            $buffer = [byte[]]::new(256KB)
-            $received = 0L
-            $timer = [Diagnostics.Stopwatch]::StartNew()
-            $deadline = [Diagnostics.Stopwatch]::StartNew()
-            while (($read = $source.Read($buffer, 0, $buffer.Length)) -gt 0) {
-                if ($deadline.Elapsed.TotalHours -ge 4) { throw 'The IDEA download exceeded its time limit.' }
-                $file.Write($buffer, 0, $read)
-                $received += $read
-                if ($timer.ElapsedMilliseconds -ge 500) {
-                    $status = '{0:F1} MiB received' -f ($received / 1MB)
-                    $percent = -1
-                    if ($length -gt 0) {
-                        $status = '{0:F1} of {1:F1} MiB' -f ($received / 1MB), ($length / 1MB)
-                        $percent = [Math]::Min(100, [Math]::Floor(100.0 * $received / $length))
-                    }
-                    Write-Progress -Activity $activity -Status $status -PercentComplete $percent
-                    $timer.Restart()
-                }
-            }
-            if ($length -ge 0 -and $received -ne $length) { throw 'The IDEA download ended before Content-Length was received.' }
-        } finally {
-            try {
-                if ($file) { $file.Dispose() }
-                if ($source) { $source.Dispose() }
-                if ($response) { $response.Close() }
-            } finally {
-                Write-Progress -Activity $activity -Completed
-            }
-        }
-    }
-
-    function Get-PublishedTool([string]$Name, [string]$Url, [switch]$Idea) {
+    function Get-PublishedTool([string]$Name) {
         if (-not $toolHashes.ContainsKey($Name)) { throw "Missing SHA-256 for $Name." }
-        $target = Join-Path $published $Name
-        if (Test-Path -LiteralPath $target) {
-            Assert-ExamLabProtectedPath $target
-            if ((Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash -ieq $toolHashes[$Name]) { return $target }
-            [IO.File]::Delete($target)
+        $path = Join-Path $published $Name
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            throw "Missing package $Name. Run Prefetch with the verified Start-ExamLab.cmd."
         }
-        $temporary = Join-Path $stage $Name
-        if ($Idea) { Get-IdeaDownload $Url $temporary }
-        else { Get-Download $Url $temporary }
-        Assert-Sha256 $temporary $toolHashes[$Name]
-        [IO.File]::Move($temporary, $target)
-        return $target
+        Assert-ExamLabProtectedPath $path
+        Assert-Sha256 $path $toolHashes[$Name]
+        return $path
     }
 
     function New-SetupDirectory([string]$Path, [switch]$ReadOnlyForUsers) {
@@ -141,7 +89,7 @@
                 throw 'An existing ExamLabGradleCache requires administrator review.'
             }
         } else {
-            $archive = Get-PublishedTool 'gradle-exam-cache.zip' '@GRADLE_CACHE_URL@'
+            $archive = Get-PublishedTool 'gradle-exam-cache.zip'
             $unpacked = Join-Path $stage 'gradle-cache'
             New-SetupDirectory $unpacked -ReadOnlyForUsers
             Expand-Archive -LiteralPath $archive -DestinationPath $unpacked
@@ -246,6 +194,52 @@
         }
     }
 
+    function Copy-CurrentTaskReport([string]$Name, [DateTime]$Before) {
+        $source = Join-Path $examLabStatePath "$Name.log"
+        try {
+            if ([IO.File]::GetLastWriteTimeUtc($source) -gt $Before) {
+                Assert-ExamLabProtectedPath $source
+                [IO.File]::Copy($source, (Join-Path $diagnosticReport "system-$Name.log"))
+            }
+        } catch { Write-Warning "Could not preserve the $Name task report: $_" }
+    }
+
+    function Get-CachedBundle {
+        $zip = Join-Path $published 'exam-lab-@REVISION@.zip'
+        Assert-ExamLabProtectedPath $zip
+        Assert-Sha256 $zip '@BUNDLE_SHA256@'
+        $destination = Join-Path $stage 'package'
+        Expand-Archive -LiteralPath $zip -DestinationPath $destination
+        return $destination
+    }
+
+    function Test-LocalInstallation($TaskChecks) {
+        $reportFile = Join-Path $diagnosticReport 'software.json'
+        $errors = [Collections.Generic.List[string]]::new()
+        try {
+            Invoke-Setup 'Prepare-ExamLab.ps1' @('-Action', 'Verify', '-HumanOutput', '-ReportPath', $reportFile)
+            Invoke-Setup 'Install-ExamLabIdea.ps1' @('-Verify', '-SoftwareReportPath', $reportFile)
+        }
+        catch { $errors.Add($_.Exception.Message) }
+        foreach ($task in $TaskChecks) {
+            if (-not $task.Exists -or -not $task.Owned -or -not $task.Enabled -or $task.Differences.Count) {
+                $errors.Add("Unverified task: $($task.Name).")
+            }
+        }
+        $final = $null
+        if (Test-Path -LiteralPath $examLabFinalReport -PathType Leaf) { $final = Read-ExamLabProtectedJson $examLabFinalReport }
+        if (-not $final -or $final.version -cne '@REVISION@') { $errors.Add('This release has no local completion receipt.') }
+        if (Test-Path -LiteralPath $examLabInstallChangesPath) { $errors.Add('The installation has an unfinished change journal.') }
+        $wazuh = Get-Service -Name 'WazuhSvc' -ErrorAction SilentlyContinue
+        if (-not $wazuh) { $errors.Add('The Wazuh service is absent.') }
+        Save-InstallReport 'verification.json' ([ordered]@{
+            Release='@REVISION@'; Completion=$final; Tasks=$TaskChecks; Errors=$errors.ToArray()
+            WazuhService=$(if ($wazuh) { [string]$wazuh.Status }); NetworkProbed=$false; GuestProbed=$false
+        })
+        if ($errors.Count) { throw ($errors -join ' ') }
+        Write-Host 'The installed software, task definitions and completion receipt passed local verification.'
+    }
+
     Add-InstallPhase 'preflight'
     Write-Host 'ExamLab @REVISION@'
     $machine = Get-CimInstance Win32_ComputerSystem
@@ -253,75 +247,44 @@
     if ($machine.PartOfDomain -or [int]$os.ProductType -ne 1 -or [int]$os.BuildNumber -lt 19041) {
         throw 'The test installation requires a standalone Windows client, build 19041 or newer.'
     }
-    $ordinaryRoster = @(Get-ExamLabEnrollmentRoster)
-
     $programFiles = $examLabProgramFiles
+    $published = Join-Path $examLabReportsPath 'Downloads'
+    Assert-ExamLabProtectedPath $examLabReportsPath
+    Assert-ExamLabProtectedPath $published
+    $stage = Join-Path $diagnosticDirectory 'setup-stage'
     $maintenance = $null
-    $stage = $null
-    $pollWasEnabled = $false
-    $componentsChanged = $false
+    $systemChanges = $false
+    $residuals = [Collections.Generic.List[string]]::new()
     try {
-        $maintenance = Open-ExamLabMaintenanceLock
+        if ($Action -eq 'Apply') {
+            $maintenance = Open-ExamLabMaintenanceLock
+            Add-InstallPhase 'recover-interrupted-installation'
+            $recovery = [Collections.Generic.List[object]]::new()
+            try { Invoke-ExamLabInstallRecovery | ForEach-Object { $recovery.Add($_) } }
+            finally { Save-InstallReport 'previous-attempt-recovery.json' ($recovery.ToArray()) }
+        }
+        $taskChecks = @(Get-ExamLabTaskCheck)
+        Save-InstallReport 'task-checks-before.json' $taskChecks
+        New-SetupDirectory $stage
+        $package = Get-CachedBundle
+        $setup = Join-Path $package 'setup'
+        if ($Action -eq 'Verify') {
+            Test-LocalInstallation $taskChecks
+            return
+        }
+        foreach ($task in $taskChecks) { Assert-ExamLabTaskCheck $task -RequireOwnership }
+        $ordinaryRoster = @(Get-ExamLabEnrollmentRoster)
         $ownership = Read-ExamLabOwnership
         if ($ownership.Removing) { throw 'Finish the previous local uninstall before installing ExamLab again.' }
         if ($ownership.Disabled) { throw 'Enable the locally disabled ExamLab installation before updating it.' }
         Assert-ExamLabArp $ownership
-        $boot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o')
+        $boot = $os.LastBootUpTime.ToUniversalTime().ToString('o')
         if ($ownership.RebootBootUtc -ceq $boot) { exit 3010 }
-        Add-InstallPhase 'verify-certificate-trust'
-        $pollWasEnabled = Suspend-ExamLabPolling
-        $bootstrapAddedFirstRoot = $env:EXAMLAB_BOOTSTRAP_CA_ADDED -ceq '1'
-        Set-ExamLabRootTrust $ownership $examLabStartCertificates -BootstrapAddedFirstRoot:$bootstrapAddedFirstRoot
-        if ($bootstrapAddedFirstRoot) {
-            $marker = Join-Path $env:EXAMLAB_DIAGNOSTICS_DIR 'bootstrap-ca-managed'
-            $stream = [IO.File]::Open($marker, 'CreateNew', 'Write', 'None')
-            try {
-                $stream.WriteByte(49)
-                $stream.Flush($true)
-            } finally { $stream.Dispose() }
-            $caSha256 = (Get-CertificateSha256 $examLabStartCertificates[0].RawData).ToLowerInvariant()
-            $pending = Join-Path $examLabProgramFiles ('.exam-lab-controller-' + $caSha256 + '.pending')
-            if (Test-Path -LiteralPath $pending) {
-                Assert-ExamLabProtectedPath $pending -Readable
-                if ([IO.File]::ReadAllText($pending).Trim() -cne $caSha256) {
-                    throw 'The controller CA pending record does not match the verified certificate.'
-                }
-                [IO.File]::Delete($pending)
-            }
-        }
-        if ($pollWasEnabled) {
-            Start-ExamLabPolling
-            $pollWasEnabled = $false
-        }
 
-        $stage = Join-Path $programFiles ('ExamLabSetup-' + [Guid]::NewGuid().ToString('N'))
-        New-SetupDirectory $stage
-        $zip = Join-Path $stage 'exam-lab.zip'
-        Get-Download '@BUNDLE_URL@' $zip
-        Assert-Sha256 $zip '@BUNDLE_SHA256@'
-        $package = Join-Path $stage 'package'
-        Expand-Archive -LiteralPath $zip -DestinationPath $package
-        $setup = Join-Path $package 'setup'
-        Add-InstallPhase 'enroll-pc'
-        Import-Module (Join-Path $package 'windows\ExamNetwork.psm1') -Scope Local -ErrorAction Stop
-        $enrollment = Get-ExamLabEnrollmentInputs (Join-Path $examLabReportsPath 'Enrollment') '@ENROLLMENT_URL@' '@CONTROLLER_URL@' $ordinaryRoster
-        $pcPath = $enrollment.ComputerConfigPath
-        $registrationPath = $enrollment.RegistrationPath
-        $wazuhKey = $enrollment.WazuhKeyPath
-        $manager = $enrollment.ManagerIPv4
-        $pc = Read-ExamLabProtectedJson $pcPath
-        $published = Join-Path $examLabReportsPath 'Downloads'
-        if (-not (Test-Path -LiteralPath $published)) { New-SetupDirectory $published }
-        Assert-ExamLabProtectedPath $published
-        $lgpoZip = Get-PublishedTool 'LGPO.zip' '@LGPO_URL@'
-        $pfeZip = Get-PublishedTool 'PolicyFileEditor-3.0.1.zip' '@PFE_URL@'
-        $msi = Get-PublishedTool 'wazuh-agent-4.14.10-1.msi' '@WAZUH_URL@'
-        $idea = 'ideaIC-2025.2.6.4.exe'
-        $null = Get-PublishedTool $idea "@TOOLS_URL@/$idea" -Idea
-        foreach ($name in 'OpenJDK25U-jdk_x64_windows_hotspot_25.0.5_8.msi',
-            'Git-2.56.1-64-bit.exe', 'gradle-9.8.2-bin.zip') {
-            $null = Get-PublishedTool $name "@TOOLS_URL@/$name"
-        }
+        $lgpoZip = Get-PublishedTool 'LGPO.zip'
+        $pfeZip = Get-PublishedTool 'PolicyFileEditor-3.0.1.zip'
+        $msi = Get-PublishedTool 'wazuh-agent-4.14.10-1.msi'
+        $gradleArchive = Get-PublishedTool 'gradle-9.8.2-bin.zip'
         Add-InstallPhase 'verify-policy-tools'
         $lgpoRoot = Join-Path $stage 'lgpo'
         Expand-Archive -LiteralPath $lgpoZip -DestinationPath $lgpoRoot
@@ -329,16 +292,8 @@
         $pfe = Join-Path $stage 'pfe'
         Expand-Archive -LiteralPath $pfeZip -DestinationPath $pfe
 
-        Add-InstallPhase 'check-local-ownership'
-        $pollWasEnabled = Suspend-ExamLabPolling
-        foreach ($name in $examLabTaskNames) {
-            $pendingProtection = Test-ExamLabTaskNeedsProtection $ownership $name
-            $task = Get-ExamLabTask $name -AllowPendingProtection:$pendingProtection
-            Register-ExamLabResource $ownership $name ([bool]$task)
-        }
-        foreach ($path in @($examLabCodePath, $examLabStatePath, $examLabArpKey, 'HKLM:\SOFTWARE\ExamLabAlertPilot')) {
-            Register-ExamLabResource $ownership $path (Test-Path -LiteralPath $path)
-        }
+        $alertKey = 'HKLM:\SOFTWARE\ExamLabAlertPilot'
+        Register-ExamLabResource $ownership $alertKey (Test-Path -LiteralPath $alertKey)
         Register-ExamLabResource $ownership 'ExamLab-Alert event source' ([Diagnostics.EventLog]::SourceExists('ExamLab-Alert'))
         foreach ($name in 'ExamLabAlert', 'ExamLabBrowser', 'ExamLabIdea', 'ExamLabGradleCache') {
             $path = Join-Path $programFiles $name
@@ -348,25 +303,12 @@
             $path = Join-Path ([Environment]::GetFolderPath('CommonDesktopDirectory')) $name
             Register-ExamLabResource $ownership $path (Test-Path -LiteralPath $path)
         }
-        $installedRegistration = Join-Path $examLabStatePath 'controller-registration.json'
-        Register-ExamLabResource $ownership $installedRegistration (Test-Path -LiteralPath $installedRegistration)
 
-        $runReports = Join-Path $examLabReportsPath 'LatestAttempt'
-        if (-not (Test-Path -LiteralPath $runReports)) { New-SetupDirectory $runReports }
-        Assert-ExamLabProtectedPath $runReports
-        $softwareReport = Join-Path $runReports 'software.json'
-        $machineReport = Join-Path $runReports 'installation.json'
+        $softwareReport = Join-Path $diagnosticReport 'software.json'
+        $machineReport = Join-Path $diagnosticReport 'installation.json'
         $prepareArguments = @('-Action', 'Prepare', '-HumanOutput', '-ReportPath', $softwareReport,
-            '-CacheDirectory', $published, '-UsePublishedInstallers')
-        $pilotArguments = @('-HumanOutput', '-ReportPath', $machineReport, '-DeferPolling', '-UsePublishedInstallers')
-        $wazuhArguments = @('-Action', 'Install', '-MsiPath', $msi, '-ManagerIPv4', $manager, '-AgentKeyPath', $wazuhKey,
-            '-UsePublishedInstallers')
-        # The old completion marker cannot attest to a partially changed installation.
-        if (Test-Path -LiteralPath $examLabFinalReport) {
-            Assert-ExamLabProtectedPath $examLabFinalReport
-            [IO.File]::Delete($examLabFinalReport)
-        }
-        $componentsChanged = $true
+            '-CacheDirectory', $published, '-UsePublishedInstallers',
+            '-ExpectedPlanPath', (Join-Path $diagnosticReport 'early-check.json'))
         $restartRequired = $false
         Write-Host 'Checking and preparing IDEA, JDK, Git, and Gradle.'
         Invoke-Setup 'Prepare-ExamLab.ps1' $prepareArguments -RestartRequired ([ref]$restartRequired)
@@ -376,11 +318,44 @@
             exit 3010
         }
         $ownership.RebootBootUtc = $null
+        Save-ExamLabOwnership $ownership
         Add-InstallPhase 'prepare-gradle-cache'
         Install-PilotGradleCache
         Invoke-Setup 'Install-ExamLabIdea.ps1' @('-SoftwareReportPath', $softwareReport,
-            '-GradleCachePath', (Join-Path $programFiles 'ExamLabGradleCache'),
-            '-GradleArchivePath', (Join-Path $published 'gradle-9.8.2-bin.zip'))
+            '-GradleCachePath', (Join-Path $programFiles 'ExamLabGradleCache'), '-GradleArchivePath', $gradleArchive)
+        foreach ($name in 'ExamLabIdea', 'ExamLabGradleCache') {
+            Save-ExamLabOwnedTree $ownership (Join-Path $programFiles $name)
+        }
+        Save-ExamLabOwnedFile $ownership (Join-Path ([Environment]::GetFolderPath('CommonDesktopDirectory')) 'ExamLab - IDEA.lnk')
+
+        $enrollmentDirectory = Join-Path $examLabReportsPath 'Enrollment'
+        if ($Offline) {
+            $ledger = Join-Path $enrollmentDirectory 'enrollment.json'
+            $receipt = if (Test-Path -LiteralPath $ledger -PathType Leaf) { (Read-ExamLabProtectedJson $ledger).receipt }
+            if (-not $receipt) {
+                Add-InstallPhase 'pending-enrollment'
+                Save-InstallReport 'pending-enrollment.json' ([ordered]@{
+                    Release='@REVISION@'; LocalSoftwarePrepared=$true; RegistrationRequired=$true
+                })
+                Write-Host 'Local software preparation completed. Run Apply with network access to enroll this computer.'
+                exit 10
+            }
+        }
+
+        Add-InstallPhase 'begin-system-changes'
+        Start-ExamLabInstallChanges
+        $systemChanges = $true
+        Add-InstallPhase 'verify-certificate-trust'
+        Set-ExamLabRootTrust $ownership $examLabStartCertificates
+        Add-InstallPhase 'enroll-pc'
+        Import-Module (Join-Path $package 'windows\ExamNetwork.psm1') -Scope Local -ErrorAction Stop
+        $enrollment = Get-ExamLabEnrollmentInputs $enrollmentDirectory '@ENROLLMENT_URL@' '@CONTROLLER_URL@' $ordinaryRoster
+        $pcPath = $enrollment.ComputerConfigPath
+        $registrationPath = $enrollment.RegistrationPath
+        $pc = Read-ExamLabProtectedJson $pcPath
+        $null = Suspend-ExamLabPolling
+        $pilotArguments = @('-HumanOutput', '-ReportPath', $machineReport, '-DeferPolling', '-UsePublishedInstallers',
+            '-InstallAttemptId', (Read-ExamLabInstallChanges).Id)
         Invoke-Setup 'Install-LocalPilot.ps1' (@('-LGPOPath', $lgpo.FullName, '-PolicyFileEditorPath', $pfe,
             '-ConfigurationPath', $pcPath, '-ControllerConfigurationPath', $registrationPath,
             '-EnableLabControllerPolicyProbe') + $pilotArguments)
@@ -388,40 +363,60 @@
         $machine = Read-ExamLabProtectedJson $machineReport
         $verifiedCode = @($machine.Files | Where-Object Path -Like "$examLabCodePath\*").Path
         Add-InstallPhase 'register-alert-event-source'
+        $residuals.Add('ExamLab alert event source and configuration were reached. Verify their current state before removing them.')
         Set-UpAlert
-        Invoke-Setup 'Install-ExamLabWazuh.ps1' $wazuhArguments
+        $residuals.Add('Wazuh agent installation was reached. Validate its MSI and service state.')
+        Invoke-Setup 'Install-ExamLabWazuh.ps1' @('-Action', 'Install', '-MsiPath', $msi, '-ManagerIPv4', $enrollment.ManagerIPv4,
+            '-AgentKeyPath', $enrollment.WazuhKeyPath, '-UsePublishedInstallers')
         Add-InstallPhase 'system-prepare'
-        $prepared = Invoke-ExamLabSystemTask 'prepare' 610
+        $residuals.Add('Shared PC preparation was reached. Its policy state requires review after a failed attempt.')
+        $before = [IO.File]::GetLastWriteTimeUtc((Join-Path $examLabStatePath 'prepare.log'))
+        try { $prepared = Invoke-ExamLabSystemTask 'prepare' 610 }
+        finally { Copy-CurrentTaskReport 'prepare' $before }
         if ($prepared.Prepared -ne $true -or $prepared.SharedPCTargetMatches -ne $true -or $prepared.Conflicts.Count) {
-            throw 'Shared PC preparation is unconfirmed. See prepare.log.'
+            throw 'Shared PC preparation is unconfirmed. See system-prepare.log.'
         }
         Add-InstallPhase 'system-normal'
-        $normal = Invoke-ExamLabSystemTask 'normal'
+        $before = [IO.File]::GetLastWriteTimeUtc((Join-Path $examLabStatePath 'normal.log'))
+        try { $normal = Invoke-ExamLabSystemTask 'normal' }
+        finally { Copy-CurrentTaskReport 'normal' $before }
         if ($normal.OwnSourceNormal -ne $true -or $normal.Normal.SourceCleanupCompleted -ne $true -or
             $normal.Conflicts.Count -or $normal.Normal.Collection.Errors.Count) {
-            throw 'Local normal was not verified. See normal.log.'
+            throw 'Local normal was not verified. See system-normal.log.'
         }
         Add-InstallPhase 'publish-local-installation'
         Install-PilotMoodleShortcut
         Save-ExamLabOwnedTree $ownership $examLabCodePath $verifiedCode
-        foreach ($name in 'ExamLabAlert', 'ExamLabBrowser', 'ExamLabIdea', 'ExamLabGradleCache') {
+        foreach ($name in 'ExamLabAlert', 'ExamLabBrowser') {
             Save-ExamLabOwnedTree $ownership (Join-Path $programFiles $name)
         }
-        foreach ($name in 'ExamLab - Moodle.lnk', 'ExamLab - IDEA.lnk') {
-            Save-ExamLabOwnedFile $ownership (Join-Path ([Environment]::GetFolderPath('CommonDesktopDirectory')) $name)
-        }
-        Assert-ExamLabProtectedPath $installedRegistration
-        Save-ExamLabOwnedFile $ownership $installedRegistration
+        Save-ExamLabOwnedFile $ownership (Join-Path ([Environment]::GetFolderPath('CommonDesktopDirectory')) 'ExamLab - Moodle.lnk')
+        Save-ExamLabOwnedFile $ownership (Join-Path $examLabStatePath 'controller-registration.json')
         Save-ExamLabAlertRegistration $ownership
         Complete-ExamLabInstallation $ownership '@REVISION@'
+        Complete-ExamLabInstallChanges
+        $systemChanges = $false
         Add-InstallPhase 'complete'
         Write-Host 'ExamLab installation and Shared PC preparation completed.'
+    } catch {
+        $failure = $_
+        if ($systemChanges) {
+            Add-InstallPhase 'rollback'
+            $changes = [Collections.Generic.List[object]]::new()
+            try { Undo-ExamLabInstallChanges | ForEach-Object { $changes.Add($_) } }
+            catch { $changes.Add([pscustomobject]@{ Status='Conflict'; Error=$_.Exception.ToString() }) }
+            try { Save-InstallReport 'rollback.json' ([ordered]@{ Changes=$changes.ToArray(); Residuals=$residuals.ToArray() }) }
+            catch { Write-Warning "Could not write the rollback report: $_" }
+        }
+        throw $failure
     } finally {
         try {
-            if ($pollWasEnabled -and -not $componentsChanged) { Start-ExamLabPolling }
-        } finally {
-            if ($maintenance) { $maintenance.Dispose() }
-            if ($stage -and (Test-Path -LiteralPath $stage)) { Remove-Item -LiteralPath $stage -Recurse -Force }
-        }
+            if (Test-Path -LiteralPath $examLabInstallChangesPath -PathType Leaf) {
+                Assert-ExamLabProtectedPath $examLabInstallChangesPath
+                [IO.File]::Copy($examLabInstallChangesPath, (Join-Path $diagnosticReport 'installation-pending.json'))
+            }
+            if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
+        } catch { Write-Warning "Installation staging cleanup failed: $_" }
+        finally { if ($maintenance) { $maintenance.Dispose() } }
     }
 }

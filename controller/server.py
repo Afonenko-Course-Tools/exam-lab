@@ -7,6 +7,7 @@ import fcntl
 import hashlib
 from html import escape
 from http import HTTPStatus
+from http.client import HTTPException, HTTPSConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 import json
@@ -16,13 +17,13 @@ import pwd
 import re
 import secrets
 import sqlite3
+import ssl
 import stat
 from tempfile import NamedTemporaryFile, TemporaryDirectory
-from threading import Lock
 from time import monotonic
 import unicodedata
 from uuid import uuid4
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 from zipfile import is_zipfile
 
 from teacher_access import serve_teacher
@@ -32,6 +33,9 @@ POLL_PATH = "/exam/v1/poll"
 ENROLLMENT_PATH = "/install/enroll"
 ENROLLMENT_CLAIM = re.compile(r"[0-9a-f]{64}")
 ENROLLMENT_KEY = re.compile(rb"[0-9]{3,8} [A-Za-z0-9_.-]+ [A-Za-z0-9.:/_-]+ [A-Fa-f0-9]{64}")
+DIAGNOSTIC_DEVICE_ID = re.compile(r"diag-[0-9a-f]{32}")
+WAZUH_AGENT_ID = re.compile(r"(?!0+\Z)[0-9]{3,8}")
+WAZUH_API_TOKEN = re.compile(r"[A-Za-z0-9._-]{1,4096}")
 MAX_ENROLLMENT_RECEIPT = 16384
 FILE_TRACE_EXAM_PREFIX = "file-trace-"
 TEACHER_PATH = "/exam/teacher/readiness"
@@ -108,6 +112,14 @@ CREATE TABLE IF NOT EXISTS assignments (
     UNIQUE (device_id, exam_id)
 );
 """ + READINESS_SCHEMA + CAMPAIGN_SCHEMA
+DIAGNOSTIC_ENROLLMENT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS diagnostic_claims (
+    claim_digest BLOB PRIMARY KEY NOT NULL,
+    device_id TEXT NOT NULL UNIQUE,
+    receipt TEXT,
+    revoked INTEGER NOT NULL DEFAULT 0
+);
+"""
 
 
 class RequestError(ValueError):
@@ -1034,8 +1046,20 @@ def file_trace_authorized(db, device_id, token, revision):
     return exam_id is not None and exam_id.startswith(FILE_TRACE_EXAM_PREFIX)
 
 
-def private_trace_directory(metadata):
+def private_directory(metadata):
     return stat.S_ISDIR(metadata.st_mode) and stat.S_IMODE(metadata.st_mode) == 0o700 and metadata.st_uid == os.geteuid()
+
+
+@contextmanager
+def locked_private_directory(path):
+    directory = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        if not private_directory(os.fstat(directory)):
+            raise ValueError("Каталог должен принадлежать контроллеру и иметь права 0700")
+        fcntl.flock(directory, fcntl.LOCK_EX)
+        yield directory
+    finally:
+        os.close(directory)
 
 
 def new_enrollment_device(db, device):
@@ -1087,16 +1111,8 @@ class EnrollmentSlot:
         self.path = path
         self.state = path / "receipt.json"
 
-    @contextmanager
     def locked(self):
-        directory = os.open(self.path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        try:
-            if not private_trace_directory(os.fstat(directory)):
-                raise ValueError("Каталог регистрации должен принадлежать контроллеру и иметь права 0700")
-            fcntl.flock(directory, fcntl.LOCK_EX)
-            yield directory
-        finally:
-            os.close(directory)
+        return locked_private_directory(self.path)
 
     def write(self, directory, state):
         with NamedTemporaryFile(mode="w", encoding="utf-8", dir=self.path, delete=False) as stream:
@@ -1170,13 +1186,195 @@ class EnrollmentSlot:
             return HTTPStatus.NOT_FOUND, {"error": "enrollment-closed"}
 
 
+class WazuhEnrollmentError(Exception):
+    pass
+
+
+class WazuhEnrollment:
+    def __init__(self, config):
+        url = urlsplit(config["url"])
+        if (
+            url.scheme != "https" or url.path not in ("", "/") or not url.hostname
+            or url.username is not None or url.query or url.fragment
+            or url.port == 0 or not config["username"] or ":" in config["username"] or not config["password"]
+        ):
+            raise ValueError
+        self.host = url.hostname
+        self.port = url.port or 443
+        self.context = ssl.create_default_context(cafile=config["caFile"])
+        credentials = f"{config['username']}:{config['password']}".encode("utf-8")
+        self.authorization = "Basic " + base64.b64encode(credentials).decode("ascii")
+
+    def request(self, method, path, authorization, payload=None):
+        headers = {"Authorization": authorization, "Accept": "application/json"}
+        body = None
+        if payload is not None:
+            headers["Content-Type"] = "application/json"
+            body = json.dumps(payload).encode("utf-8")
+        try:
+            with closing(HTTPSConnection(self.host, self.port, timeout=2, context=self.context)) as connection:
+                connection.request(method, path, body=body, headers=headers)
+                response = connection.getresponse()
+                if response.status != HTTPStatus.OK:
+                    raise WazuhEnrollmentError
+                response = json.loads(response.read(65536))
+                if response["error"] != 0:
+                    raise WazuhEnrollmentError
+                return response["data"]
+        except (OSError, HTTPException, ValueError, KeyError, TypeError, RecursionError):
+            raise WazuhEnrollmentError from None
+
+    def authorize(self):
+        result = self.request("POST", "/security/user/authenticate", self.authorization)
+        token = result.get("token") if isinstance(result, dict) else None
+        if not valid_code(WAZUH_API_TOKEN, token):
+            raise WazuhEnrollmentError
+        return "Bearer " + token
+
+    def find_agent(self, authorization, name):
+        query = urlencode({"name": name, "select": "id,name", "limit": 2})
+        result = self.request("GET", f"/agents?{query}", authorization)
+        agents = result.get("affected_items") if isinstance(result, dict) else None
+        if agents == []:
+            return None
+        if (
+            not isinstance(agents, list) or len(agents) != 1 or not isinstance(agents[0], dict)
+            or agents[0].get("name") != name or not valid_code(WAZUH_AGENT_ID, agents[0].get("id"))
+        ):
+            raise WazuhEnrollmentError
+        return agents[0]["id"]
+
+    def get_or_create(self, name):
+        authorization = self.authorize()
+        agent_id = self.find_agent(authorization, name)
+        if agent_id is None:
+            agent = self.request("POST", "/agents", authorization, {"name": name, "ip": "any"})
+        else:
+            result = self.request("GET", f"/agents/{agent_id}/key", authorization)
+            items = result.get("affected_items") if isinstance(result, dict) else None
+            if not isinstance(items, list) or len(items) != 1:
+                raise WazuhEnrollmentError
+            agent = items[0]
+        key = agent.get("key") if isinstance(agent, dict) else None
+        try:
+            decoded = base64.b64decode(key, validate=True)
+            if not ENROLLMENT_KEY.fullmatch(decoded):
+                raise ValueError
+            key_id, key_name, ip, _ = decoded.decode("ascii").split()
+            if (
+                not valid_code(WAZUH_AGENT_ID, key_id) or key_id != agent.get("id")
+                or key_name != name or ip.lower() != "any" or (agent_id is not None and agent_id != key_id)
+            ):
+                raise ValueError
+        except (ValueError, TypeError):
+            raise WazuhEnrollmentError from None
+        return key
+
+    def revoke(self, name):
+        authorization = self.authorize()
+        agent_id = self.find_agent(authorization, name)
+        if agent_id is None:
+            return
+        query = urlencode({"agents_list": agent_id, "status": "all", "older_than": "0s", "purge": "true"})
+        result = self.request("DELETE", f"/agents?{query}", authorization)
+        if not isinstance(result, dict) or result.get("affected_items") != [agent_id]:
+            raise WazuhEnrollmentError
+
+
+class DiagnosticEnrollment:
+    def __init__(self, state_path, controller_url, network, wazuh):
+        self.path = state_path / "diagnostic-enrollment"
+        self.path.mkdir(mode=0o700, exist_ok=True)
+        self.controller_url = controller_url
+        self.network = network
+        self.wazuh = wazuh
+
+    def claim(self, claim, db):
+        digest = token_digest(claim)
+        with locked_private_directory(self.path):
+            row = db.execute("SELECT * FROM diagnostic_claims WHERE claim_digest = ?", (digest,)).fetchone()
+            if row is not None and row["revoked"]:
+                return HTTPStatus.GONE, {"error": "diagnostic-enrollment-revoked"}
+            if row is not None and row["receipt"] is not None:
+                receipt = json.loads(row["receipt"])
+                registration = receipt["registration"]
+                authenticated_device(db, registration["deviceId"], registration["token"])
+                return HTTPStatus.OK, receipt
+
+            if row is None:
+                device_id = f"diag-{uuid4().hex}"
+                # Сохраняем имя до вызова Wazuh, чтобы после обрыва найти уже выданный ключ.
+                with db:
+                    db.execute("INSERT INTO diagnostic_claims (claim_digest, device_id) VALUES (?, ?)", (digest, device_id))
+            else:
+                device_id = row["device_id"]
+            key = self.wazuh.get_or_create(device_id)
+            with db:
+                token = register(db, device_id)
+                receipt = {
+                    "network": self.network,
+                    "registration": {"url": self.controller_url, "deviceId": device_id, "token": token},
+                    "wazuhKey": key,
+                }
+                db.execute("UPDATE diagnostic_claims SET receipt = ? WHERE claim_digest = ?", (json.dumps(receipt), digest))
+            return HTTPStatus.OK, receipt
+
+    def revoke(self, device_id, db):
+        with locked_private_directory(self.path):
+            with db:
+                db.execute("BEGIN IMMEDIATE")
+                row = db.execute("SELECT revoked FROM diagnostic_claims WHERE device_id = ?", (device_id,)).fetchone()
+                if row is None:
+                    raise ValueError("Тестовая регистрация не найдена")
+                if not row["revoked"]:
+                    if device_row(db, device_id) is not None:
+                        assign_locked(db, device_id, None)
+                        db.execute("UPDATE devices SET token_digest = ? WHERE device_id = ?", (secrets.token_bytes(32), device_id))
+                    db.execute("UPDATE diagnostic_claims SET receipt = NULL, revoked = 1 WHERE device_id = ?", (device_id,))
+            # Сбой менеджера не возвращает доступ к контроллеру. Повтор команды завершает отзыв Wazuh.
+            self.wazuh.revoke(device_id)
+
+
+def diagnostic_enrollment(path, state_path):
+    flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW
+    with os.fdopen(os.open(path, flags), "rb") as source:
+        metadata = os.fstat(source.fileno())
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o077 or metadata.st_uid != os.geteuid():
+            raise ValueError("Файл тестовой регистрации должен принадлежать контроллеру и иметь права 0600")
+        contents = source.read(MAX_ENROLLMENT_RECEIPT + 1)
+    try:
+        if len(contents) > MAX_ENROLLMENT_RECEIPT:
+            raise ValueError
+        config = json.loads(contents, object_pairs_hook=unique_keys)
+        if not isinstance(config, dict) or config.keys() != {"controllerUrl", "network", "wazuhApi"}:
+            raise ValueError
+        url = urlsplit(config["controllerUrl"])
+        network = config["network"]
+        if (
+            url.scheme != "https" or url.path != POLL_PATH or url.query or url.fragment or not url.hostname
+            or url.username is not None or url.port == 0
+            or network["ControllerEndpoint"] != {"IP": url.hostname, "Port": url.port or 443}
+            or network["WazuhEndpoint"]["Port"] != 1514
+        ):
+            raise ValueError
+        wazuh = config["wazuhApi"]
+        if not isinstance(wazuh, dict) or wazuh.keys() != {"url", "caFile", "username", "password"}:
+            raise ValueError
+        if not all(isinstance(value, str) and value for value in wazuh.values()) or not Path(wazuh["caFile"]).is_absolute():
+            raise ValueError
+        wazuh = WazuhEnrollment(wazuh)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, RecursionError):
+        raise ValueError("Недопустимая конфигурация тестовой регистрации или сертификата Wazuh API") from None
+    return DiagnosticEnrollment(state_path, config["controllerUrl"], network, wazuh)
+
+
 class FileTraceStore:
     def __init__(self, path):
         self.path = path
 
     def available(self):
         try:
-            return private_trace_directory(self.path.lstat())
+            return private_directory(self.path.lstat())
         except FileNotFoundError:
             return False
 
@@ -1221,7 +1419,7 @@ class FileTraceStore:
         final = self.path / report_id
         directory = os.open(self.path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
-            if not private_trace_directory(os.fstat(directory)):
+            if not private_directory(os.fstat(directory)):
                 raise FileTraceError(HTTPStatus.NOT_FOUND, "not-found")
             if self.already_sealed(final, digest, length):
                 self.copy_and_check(incoming, set_timeout, length, digest)
@@ -1259,38 +1457,46 @@ class FileTraceStore:
 class DiagnosticStore:
     def __init__(self, path):
         self.path = path
-        self.lock = Lock()
 
     def available(self):
         try:
-            metadata = self.path.lstat()
+            return private_directory(self.path.lstat())
         except FileNotFoundError:
             return False
-        return (
-            stat.S_ISDIR(metadata.st_mode)
-            and not metadata.st_mode & 0o077
-            and metadata.st_uid == os.geteuid()
-        )
 
     def save(self, body):
-        with self.lock:
+        report_id = hashlib.sha256(body).hexdigest()[:32]
+        final = self.path / f"{report_id}.zip"
+        with locked_private_directory(self.path) as directory:
+            if final.exists():
+                flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW
+                with os.fdopen(os.open(final, flags), "rb") as source:
+                    metadata = os.fstat(source.fileno())
+                    if (
+                        not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o600
+                        or metadata.st_uid != os.geteuid() or metadata.st_size != len(body)
+                        or source.read(len(body)) != body
+                    ):
+                        raise OSError("diagnostics-archive-mismatch")
+                os.fsync(directory)
+                return report_id
+
             archives = [entry.stat() for entry in self.path.glob("*.zip")]
             if (
                 len(archives) >= MAX_DIAGNOSTICS_REPORTS
                 or sum(entry.st_size for entry in archives) + len(body) > MAX_DIAGNOSTICS_STORAGE
             ):
                 return None
-            report_id = uuid4().hex
-            temporary = self.path / f".{report_id}.tmp"
-            try:
-                descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-                with os.fdopen(descriptor, "wb") as stream:
+            with NamedTemporaryFile(dir=self.path, prefix=".incoming-", delete=False) as stream:
+                temporary = Path(stream.name)
+                try:
                     stream.write(body)
                     stream.flush()
                     os.fsync(stream.fileno())
-                temporary.rename(self.path / f"{report_id}.zip")
-            finally:
-                temporary.unlink(missing_ok=True)
+                    temporary.rename(final)
+                    os.fsync(directory)
+                finally:
+                    temporary.unlink(missing_ok=True)
             return report_id
 
 
@@ -1417,14 +1623,18 @@ class PollHandler(BaseHTTPRequestHandler):
                 raise RequestError("invalid-json") from None
             if not isinstance(payload, dict) or payload.keys() != {"claim"} or not valid_code(ENROLLMENT_CLAIM, payload["claim"]):
                 raise RequestError("invalid-enrollment-claim")
-            with closing(connect(self.server.db_path, read_only=True)) as db:
-                status_code, response = EnrollmentSlot(self.server.db_path.parent / "windows-enrollment").claim(payload["claim"], db)
+            pilot = getattr(self.server, "diagnostic_enrollment", None)
+            slot = pilot or EnrollmentSlot(self.server.db_path.parent / "windows-enrollment")
+            with closing(connect(self.server.db_path, read_only=pilot is None)) as db:
+                status_code, response = slot.claim(payload["claim"], db)
         except RequestError as error:
             status_code, response = HTTPStatus.BAD_REQUEST, {"error": str(error)}
         except TimeoutError:
             status_code, response = HTTPStatus.REQUEST_TIMEOUT, {"error": "enrollment-timeout"}
         except PermissionError:
             status_code, response = HTTPStatus.GONE, {"error": "enrollment-unavailable"}
+        except WazuhEnrollmentError:
+            status_code, response = HTTPStatus.SERVICE_UNAVAILABLE, {"error": "diagnostic-wazuh-unavailable"}
         except (OSError, sqlite3.Error, ValueError, KeyError, TypeError):
             status_code, response = HTTPStatus.SERVICE_UNAVAILABLE, {"error": "enrollment-unavailable"}
         self.reply(status_code, response)
@@ -1504,8 +1714,9 @@ class PollHandler(BaseHTTPRequestHandler):
                 self.reply(HTTPStatus.BAD_REQUEST, {"error": "invalid-zip"})
                 return
             report_id = store.save(body)
-        except OSError:
-            self.reply(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "diagnostics-unavailable"})
+        except (OSError, ValueError) as error:
+            code = "diagnostics-capacity" if getattr(error, "errno", None) in (errno.ENOSPC, errno.EDQUOT) else "diagnostics-unavailable"
+            self.reply(HTTPStatus.SERVICE_UNAVAILABLE, {"error": code})
             return
         if report_id is None:
             self.reply(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "diagnostics-capacity"})
@@ -1545,6 +1756,7 @@ def main():
     serve_cmd = commands.add_parser("serve", help="Запустить HTTP за локальным Nginx")
     serve_cmd.add_argument("--port", default=21651, type=int, metavar="PORT")
     serve_cmd.add_argument("--teacher-proxy-token-file", type=Path, metavar="PATH")
+    serve_cmd.add_argument("--diagnostic-enrollment-config", type=Path, metavar="PATH")
     serve_cmd.add_argument("--teacher-socket", type=Path, metavar="PATH")
     serve_cmd.add_argument("--teacher-version", metavar="VERSION")
     serve_cmd.add_argument("--owner-uid", type=int, metavar="UID")
@@ -1555,6 +1767,9 @@ def main():
     arm.add_argument("--receipt", required=True, action="append", type=Path, metavar="PATH")
     arm.add_argument("--minutes", type=int, default=20, choices=range(5, 61), metavar="MINUTES")
     commands.add_parser("close-enrollment", help="Закрыть окно регистрации и удалить временные данные")
+    revoke = commands.add_parser("revoke-diagnostic-enrollment", help="Отозвать ключи тестового ПК")
+    revoke.add_argument("device_id")
+    revoke.add_argument("--diagnostic-enrollment-config", required=True, type=Path, metavar="PATH")
     commands.add_parser("readiness", help="Показать готовность зарегистрированных ПК")
     commands.choices["assign"].add_argument("mode", choices=("normal", "exam"))
     commands.choices["assign"].add_argument("--exam-id")
@@ -1579,6 +1794,8 @@ def main():
         parser.error("Для Unix-сокета TUI задайте версию комплекта, ненулевой UID владельца и, при необходимости, UID преподавателей")
     if hasattr(args, "device_id") and not valid_code(IDENTIFIER, args.device_id):
         parser.error("Недопустимый идентификатор устройства")
+    if command == "revoke-diagnostic-enrollment" and not valid_code(DIAGNOSTIC_DEVICE_ID, args.device_id):
+        parser.error("Требуется идентификатор тестового устройства")
     if command == "assign" and (
         (args.mode == "exam" and not valid_code(IDENTIFIER, args.exam_id))
         or (args.mode == "normal" and args.exam_id is not None)
@@ -1593,8 +1810,12 @@ def main():
         parser.error("Недопустимая ревизия, время загрузки или идентификатор сеанса Guest")
     try:
         path = private_db_path(args.db)
-        with closing(connect(path, create=command == "register")) as db, db:
-            db.executescript(SCHEMA if command == "register" else READINESS_SCHEMA + CAMPAIGN_SCHEMA)
+        pilot_config = getattr(args, "diagnostic_enrollment_config", None)
+        pilot = diagnostic_enrollment(pilot_config, path.parent) if pilot_config else None
+        create = command == "register" or (command == "serve" and pilot is not None)
+        with closing(connect(path, create=create)) as db, db:
+            schema = SCHEMA if create else READINESS_SCHEMA + CAMPAIGN_SCHEMA
+            db.executescript(schema + (DIAGNOSTIC_ENROLLMENT_SCHEMA if pilot is not None else ""))
             if command == "serve":
                 db.execute("SELECT 1 FROM devices LIMIT 1")
             elif command in ("register", "rotate-token"):
@@ -1605,6 +1826,9 @@ def main():
                 result = confirm_guest(db, args.device_id, args.revision, args.boot_utc, args.guest_session_id)
             elif command == "readiness":
                 result = readiness_table(db)
+            elif command == "revoke-diagnostic-enrollment":
+                pilot.revoke(args.device_id, db)
+                result = "Ключи тестового ПК отозваны"
             elif command in ("arm-enrollment", "close-enrollment"):
                 slot = EnrollmentSlot(path.parent / "windows-enrollment")
                 if command == "arm-enrollment":
@@ -1638,12 +1862,15 @@ def main():
                 )
             with ControllerHTTPServer(("127.0.0.1", args.port), PollHandler) as server, teacher:
                 server.db_path = path
+                server.diagnostic_enrollment = pilot
                 server.diagnostics_store = DiagnosticStore(path.parent / "diagnostics")
                 server.file_trace_store = FileTraceStore(path.parent / "file-traces")
                 server.teacher_proxy_token = teacher_proxy_token
                 server.serve_forever()
         else:
             print(result if isinstance(result, str) else json.dumps(result, indent=2))
+    except WazuhEnrollmentError:
+        parser.exit(1, "Отзыв на контроллере сохранён. Повторите команду после восстановления Wazuh API.\n")
     except (OSError, ValueError, sqlite3.Error) as error:
         parser.exit(1, f"Ошибка контроллера: {error}\n")
     except KeyboardInterrupt:

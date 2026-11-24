@@ -293,6 +293,40 @@ class CampaignTest(TestCase):
         self.run_tui(teacher, self.teacher)
         self.run_tui(owner)
 
+    def test_tui_manual_submission_check_remains_visible_when_pc_stops_polling(self):
+        self.action("bind", deviceId="pc-01", student="Учебный Студент")
+        active = self.assign()
+        target = {"revision": active["revision"], "bootUtc": self.boot, "guestSessionId": self.session}
+        self.send(self.applied(active), guest="present", session=self.session)
+        self.action("guest", deviceId="pc-01", target=target, checks=["file", "project", "wazuh"])
+
+        async def exercise(app):
+            app.POLL_SECONDS = 60
+            async with app.run_test(size=(57, 18)) as pilot:
+                await app.workers.wait_for_complete()
+                selected = app.query_one("#selected", Static)
+                self.assertIn("Связь с ПК · есть", selected.content.plain)
+                self.assertIn("Отчёт ПК · политики ПК применены", selected.content.plain)
+                self.assertIn("Сверка сдачи · отметки преподавателя пока нет", selected.content.plain)
+                await pilot.press("down")
+                self.assertIn("Связь с ПК · первого опроса ещё не было", selected.content.plain)
+                await pilot.press("up", "enter")
+                await app.workers.wait_for_complete()
+                self.assertTrue(await pilot.click("#submit"))
+                self.assertIsInstance(app.screen, ConfirmDialog)
+                self.assertIn("PrairieLearn", app.screen.message)
+                self.assertTrue(await pilot.click("#confirm"))
+                await app.workers.wait_for_complete()
+                self.assertTrue(self.current()["submitted"])
+                self.advance(READINESS_TIMEOUT)
+                app.action_reload()
+                await app.workers.wait_for_complete()
+                self.assertIn("Связь с ПК · нет свежего опроса", selected.content.plain)
+                self.assertIn("Отчёт ПК · нет свежего результата", selected.content.plain)
+                self.assertIn("Сверка сдачи · преподаватель сверил в PrairieLearn", selected.content.plain)
+
+        self.run_tui(exercise)
+
     def test_tui_file_trace_switch_is_owner_only_and_scopes_requests(self):
         file_trace_exam = "file-trace-20261124"
         old_started, old_release, hold_old_list = Event(), Event(), Event()

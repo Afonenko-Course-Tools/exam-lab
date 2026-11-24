@@ -52,6 +52,8 @@ using System.Runtime.InteropServices;
 
 public static class ExamLabFileIoMemory
 {
+    public sealed record Sample(ulong Total, ulong Available);
+
     [StructLayout(LayoutKind.Sequential)]
     private struct MemoryStatus
     {
@@ -70,12 +72,12 @@ public static class ExamLabFileIoMemory
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool GlobalMemoryStatusEx(ref MemoryStatus status);
 
-    public static ulong AvailableBytes()
+    public static Sample Read()
     {
         var status = new MemoryStatus { Size = (uint)Marshal.SizeOf<MemoryStatus>() };
         if (!GlobalMemoryStatusEx(ref status))
             throw new Win32Exception(Marshal.GetLastWin32Error());
-        return status.AvailablePhysical;
+        return new Sample(status.TotalPhysical, status.AvailablePhysical);
     }
 }
 '@
@@ -104,14 +106,15 @@ function Invoke-Wpr([string[]]$Arguments, [int]$TimeoutSeconds = 10) {
 }
 
 function Wait-TraceTarget([long]$TargetMilliseconds) {
-    while ($recordClock.ElapsedMilliseconds -lt $TargetMilliseconds) {
+    while ($true) {
         if ($StopWhen) {
             $reason = & $StopWhen $StopContext
             if ($reason) { return $reason }
         }
-        $remaining = [math]::Max(0, $TargetMilliseconds - $recordClock.ElapsedMilliseconds)
-        $delay = if ($StopWhen) { [math]::Min(1000, $remaining) } else { $remaining }
-        if ($delay) { Start-Sleep -Milliseconds $delay }
+        $remaining = $TargetMilliseconds - $recordClock.ElapsedMilliseconds
+        if ($remaining -le 0) { return 'timeout' }
+        Start-Sleep -Milliseconds ([math]::Min(1000, $remaining))
+        $memory.Add((Get-MemorySample 'recording'))
     }
 }
 
@@ -124,10 +127,13 @@ function Write-TraceRecord([System.Collections.IDictionary]$Record) {
 }
 
 function Get-MemorySample([string]$Phase) {
+    $snapshot = [ExamLabFileIoMemory]::Read()
     [pscustomobject]@{
         phase = $Phase
         utc = [DateTimeOffset]::UtcNow.ToString('o')
-        availablePhysicalBytes = [ExamLabFileIoMemory]::AvailableBytes()
+        totalPhysicalBytes = $snapshot.Total
+        availablePhysicalBytes = $snapshot.Available
+        usedPhysicalBytes = $snapshot.Total - $snapshot.Available
     }
 }
 
@@ -206,12 +212,7 @@ try {
     $phase = 'record'
     Write-Host "Трасса запущена на $Seconds с. Выполните один короткий контрольный шаг в Guest."
     Write-Host "Команда ручной отмены: wpr -cancel -instancename $instance"
-    $stopReason = Wait-TraceTarget ($Seconds * 500)
-    if (-not $stopReason) {
-        $memory.Add((Get-MemorySample 'mid-recording'))
-        $stopReason = Wait-TraceTarget ($Seconds * 1000)
-    }
-    if (-not $stopReason) { $stopReason = 'timeout' }
+    $stopReason = Wait-TraceTarget ($Seconds * 1000)
     $recordWindowMilliseconds = $recordClock.ElapsedMilliseconds
 
     $phase = 'status'
@@ -254,6 +255,7 @@ try {
         stopMilliseconds = $stopClock.ElapsedMilliseconds
         hashMilliseconds = $hashClock.ElapsedMilliseconds
         memorySamples = $memory.ToArray()
+        sampledPeakUsedPhysicalBytes = ($memory | Measure-Object -Property usedPhysicalBytes -Maximum).Maximum
         loss = $loss
         tracePath = $etl
         bytes = $length
