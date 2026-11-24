@@ -400,13 +400,16 @@ function Get-ReleasePlan($Check, [bool]$RuntimeReady) {
         if ($status -ne 'Cached' -and $supplied) { $status = 'SuppliedUnverified' }
         [pscustomobject]@{ Name=$artifact.Name; Bytes=$artifact.Bytes; CacheStatus=$status }
     }
-    $unknown = @($rows | Where-Object CacheStatus -eq 'UnknownWithoutElevation')
-    $missing = @($rows | Where-Object CacheStatus -eq 'Missing')
+    $unverified = @($rows | Where-Object CacheStatus -ne 'Cached')
+    $unknown = @($unverified | Where-Object CacheStatus -eq 'UnknownWithoutElevation')
+    $missing = @($unverified | Where-Object CacheStatus -eq 'Missing')
+    $missingBytes = if ($missing.Count) { [long](($missing | Measure-Object Bytes -Sum).Sum) } else { 0L }
+    $upperBoundBytes = if ($unverified.Count) { [long](($unverified | Measure-Object Bytes -Sum).Sum) } else { 0L }
     $plan = [ordered]@{
         Release=$release; Attempt=$attempt; Action=$action; Elevated=$admin; Offline=$offline
         PowerShell7Ready=$RuntimeReady; Artifacts=@($rows); Transport='HTTPS; byte ranges tested during delivery'
-        DownloadBytes=$(if (-not $unknown.Count) { [long](($missing | Measure-Object Bytes -Sum).Sum) })
-        DownloadUpperBoundBytes=[long](($rows | Where-Object CacheStatus -ne 'Cached' | Measure-Object Bytes -Sum).Sum)
+        DownloadBytes=$(if (-not $unknown.Count) { $missingBytes })
+        DownloadUpperBoundBytes=$upperBoundBytes
         CacheDriveFreeBytes=([IO.DriveInfo]::new([IO.Path]::GetPathRoot($programFiles))).AvailableFreeSpace
     }
     $plan | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $report 'release-plan.json') -Encoding UTF8

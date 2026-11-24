@@ -80,6 +80,16 @@ try {
     $null = Invoke-ExamLabInstallRecovery
     Assert-FileContent $target 'committed'
 
+    Start-ExamLabInstallChanges
+    Save-ExamLabInstallTemporaryFile $staged $false
+    [IO.File]::WriteAllText($staged, 'interrupted write')
+    Add-ExamLabInstallResidual 'Shared PC' 'Effective policy requires inspection.'
+    $result = @(Invoke-ExamLabInstallRecovery)
+    if ($result.Count -ne 2 -or $result[0].Status -cne 'ReviewRequired' -or
+        $result[0].Target -cne 'Shared PC' -or (Test-Path -LiteralPath $staged)) {
+        throw 'Recovery lost the interrupted staging file or durable residual report.'
+    }
+
     if ((ConvertTo-ExamLabTaskDuration 'PT72H') -cne (ConvertTo-ExamLabTaskDuration 'P3D')) {
         throw 'Equivalent Task Scheduler durations have different representations.'
     }
