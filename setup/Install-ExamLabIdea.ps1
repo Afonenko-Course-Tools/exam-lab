@@ -17,8 +17,11 @@ $distributionHash = '21bd5da2de49b642904077f38c0efdc7778e92b3ed0889392dca61b97e3
 $scriptName = 'Install-ExamLabIdea.ps1'
 $configName = 'exam-lab-idea.json'
 $utf8 = [Text.UTF8Encoding]::new($false)
-# The published 6ee9951 launcher uses the same schema and Start-ExamLabIdea behavior.
-$compatibleLauncherHash = 'a83948fc317c678bc50004acace7c5e70cc6cce5570580be318db0f04ba9c6e0'
+# These published launchers use the same schema and Start-ExamLabIdea behavior.
+$compatibleLauncherHashes = @(
+    'a83948fc317c678bc50004acace7c5e70cc6cce5570580be318db0f04ba9c6e0' # 6ee9951
+    '420ea4cf21e4e453ca304d3be6f91e11bcce2b113910f5b3bc440e225285c8c2' # c9d5719
+)
 
 function Set-LocalText([string]$Path, [string]$Text) {
     if ([IO.File]::Exists($Path) -and [IO.File]::ReadAllText($Path) -ceq $Text) { return }
@@ -143,6 +146,27 @@ function Assert-ProtectedItem([string]$Path, [bool]$Directory) {
     }
 }
 
+function New-IdeaAccessControl([switch]$Directory, [switch]$Private) {
+    if ($Directory) {
+        $acl = [Security.AccessControl.DirectorySecurity]::new()
+        $inheritance = 'ContainerInherit, ObjectInherit'
+    } else {
+        $acl = [Security.AccessControl.FileSecurity]::new()
+        $inheritance = 'None'
+    }
+    $acl.SetAccessRuleProtection($true, $false)
+    $rights = @{ 'S-1-5-18' = 'FullControl'; 'S-1-5-32-544' = 'FullControl' }
+    if (-not $Private) {
+        $rights['S-1-5-32-545'] = 'ReadAndExecute'
+        $rights['S-1-5-32-546'] = 'ReadAndExecute'
+    }
+    foreach ($sid in $rights.Keys) {
+        $id = [Security.Principal.SecurityIdentifier]::new($sid)
+        $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($id, $rights[$sid], $inheritance, 'None', 'Allow'))
+    }
+    $acl
+}
+
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 if (-not [Environment]::Is64BitProcess -or -not ([Security.Principal.WindowsPrincipal]$identity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     throw 'Install or verify ExamLab IDEA from elevated 64-bit PowerShell 7.'
@@ -174,7 +198,10 @@ $entry = Join-Path $installation $scriptName
 $configPath = Join-Path $installation $configName
 $installedArchive = Join-Path $installation $distribution
 $shell = New-Object -ComObject WScript.Shell
-$shortcutPath = Join-Path ([Environment]::GetFolderPath('CommonDesktopDirectory')) 'ExamLab - IDEA.lnk'
+$desktop = [Environment]::GetFolderPath('CommonDesktopDirectory')
+Assert-ProtectedItem $desktop $true
+$shortcutName = 'ExamLab - IDEA.lnk'
+$shortcutPath = Join-Path $desktop $shortcutName
 $powershell = Join-Path $programFiles 'PowerShell\7\pwsh.exe'
 $arguments = '-NoLogo -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -Launch' -f $entry
 $shortcutExists = Test-Path -LiteralPath $shortcutPath
@@ -194,7 +221,7 @@ if (Test-Path -LiteralPath $installation) {
     $launcherHash = (Get-FileHash -LiteralPath $entry).Hash
     if ((Get-FileHash -LiteralPath $installedArchive -Algorithm SHA256).Hash -ine $distributionHash -or
         [IO.File]::ReadAllText($configPath) -cne $configText -or
-        $launcherHash -notin @((Get-FileHash -LiteralPath $PSCommandPath).Hash, $compatibleLauncherHash)) {
+        $launcherHash -notin ($compatibleLauncherHashes + (Get-FileHash -LiteralPath $PSCommandPath).Hash)) {
         throw 'An existing ExamLab IDEA setup differs from this release. Review its protected files.'
     }
 } else {
@@ -202,16 +229,7 @@ if (Test-Path -LiteralPath $installation) {
     if (-not $GradleArchivePath) { throw 'The verified Gradle distribution ZIP is required for first setup.' }
     Assert-ProtectedItem $GradleArchivePath $false
     $staging = "$installation-$([Guid]::NewGuid().ToString('N'))"
-    $acl = [Security.AccessControl.DirectorySecurity]::new()
-    $acl.SetAccessRuleProtection($true, $false)
-    $rights = @{ 'S-1-5-18' = 'FullControl'; 'S-1-5-32-544' = 'FullControl';
-        'S-1-5-32-545' = 'ReadAndExecute'; 'S-1-5-32-546' = 'ReadAndExecute' }
-    foreach ($sid in $rights.Keys) {
-        $id = [Security.Principal.SecurityIdentifier]::new($sid)
-        $rule = [Security.AccessControl.FileSystemAccessRule]::new($id, $rights[$sid], 'ContainerInherit, ObjectInherit', 'None', 'Allow')
-        $acl.AddAccessRule($rule)
-    }
-    [void][IO.FileSystemAclExtensions]::CreateDirectory($acl, $staging)
+    [void][IO.FileSystemAclExtensions]::CreateDirectory((New-IdeaAccessControl -Directory), $staging)
     try {
         $archive = Join-Path $staging $distribution
         Copy-NewFile $GradleArchivePath $archive
@@ -232,11 +250,24 @@ if ($Verify) {
     return
 }
 if (-not $shortcutExists) {
-    $shortcut = $shell.CreateShortcut($shortcutPath)
-    $shortcut.TargetPath = $powershell
-    $shortcut.Arguments = $arguments
-    $shortcut.IconLocation = "$idea,0"
-    $shortcut.WindowStyle = 7
-    $shortcut.Save()
+    # Stage under the checked desktop so that publication stays on its actual volume.
+    $shortcutStage = Join-Path $desktop ('.ExamLabIdeaShortcut-' + [Guid]::NewGuid().ToString('N'))
+    [void][IO.FileSystemAclExtensions]::CreateDirectory((New-IdeaAccessControl -Directory -Private), $shortcutStage)
+    try {
+        $stagedShortcut = Join-Path $shortcutStage $shortcutName
+        $shortcut = $shell.CreateShortcut($stagedShortcut)
+        $shortcut.TargetPath = $powershell
+        $shortcut.Arguments = $arguments
+        $shortcut.IconLocation = "$idea,0"
+        $shortcut.WindowStyle = 7
+        $shortcut.Save()
+        # Seal the new file before publishing it into a directory with its own inheritable rules.
+        Set-Acl -LiteralPath $stagedShortcut -AclObject (New-IdeaAccessControl)
+        Assert-ProtectedItem $stagedShortcut $false
+        [IO.File]::Move($stagedShortcut, $shortcutPath)
+        Assert-ProtectedItem $shortcutPath $false
+    } finally {
+        [IO.Directory]::Delete($shortcutStage, $true)
+    }
 }
-Write-Host 'Desktop shortcut created: ExamLab - IDEA'
+Write-Host 'Desktop shortcut ready: ExamLab - IDEA'
