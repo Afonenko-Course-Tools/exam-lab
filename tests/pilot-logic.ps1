@@ -112,6 +112,26 @@ try {
         @($serviceSpecs | Where-Object {$_.Direction -ne 'Outbound' -or $_.Protocol -ne 'TCP' -or $_.RemoteAddress -ne '192.0.2.10'}).Count -or
         $controllerSpec.RemotePort -ne '443' -or $wazuhSpec.RemotePort -ne '1514') { throw 'FAIL точные исходящие правила контроллера и агента.' }
     'PASS Network: описание исходящих правил контроллера и Wazuh; фильтры Windows не испытывались.'
+    & $networkModule {
+        $own = New-NetInstanceIndex @(
+            [pscustomobject]@{InstanceID='unique'}, [pscustomobject]@{InstanceID='duplicate'},
+            [pscustomobject]@{InstanceID='collision'}, [pscustomobject]@{InstanceID='missing'},
+            [pscustomobject]@{InstanceID='rule-collision'}, [pscustomobject]@{InstanceID='RULE-COLLISION'}
+        )
+        $unique = [pscustomobject]@{InstanceID='unique'; Marker=42}
+        $filters = New-NetInstanceIndex @(
+            $unique, [pscustomobject]@{InstanceID='duplicate'}, [pscustomobject]@{InstanceID='duplicate'},
+            [pscustomobject]@{InstanceID='collision'}, [pscustomobject]@{InstanceID='COLLISION'},
+            [pscustomobject]@{InstanceID='foreign'}, [pscustomobject]@{Other='no identifier'}
+        ) $own
+        if ((Find-NetInstance $filters 'unique').Marker -ne 42 -or $filters.ContainsKey('foreign') -or
+            (Find-NetInstance $filters 'UNIQUE') -or (Find-NetInstance $filters 'duplicate') -or
+            (Find-NetInstance $filters 'collision') -or (Find-NetInstance $filters 'missing') -or
+            (Find-NetInstance $own 'rule-collision')) {
+            throw 'FAIL Network: bulk join требует единственный точный собственный CIM InstanceID.'
+        }
+    }
+    'PASS Network: точный ключ CIM, пропуск чужих фильтров, отказ отсутствующим и неоднозначным bulk keys.'
     Test-Config 'TechnicalAccess explicit address/local port' ($withNetwork.Replace('[]','[{"RemoteIP":"192.0.2.20","LocalPort":5985}]')) $true
     Test-Config 'TechnicalAccess arbitrary direction refused' ($withNetwork.Replace('[]','[{"RemoteIP":"192.0.2.20","LocalPort":5985,"Direction":"Inbound"}]')) $false
     Test-Config 'TechnicalAccess duplicate refused' ($withNetwork.Replace('[]','[{"RemoteIP":"192.0.2.20","LocalPort":5985},{"RemoteIP":"192.0.2.20","LocalPort":5985}]')) $false

@@ -12,6 +12,7 @@ $script:Group='ExamLab Network v1'
 $script:ControllerProgram=$env:ProgramFiles + '\PowerShell\7\pwsh.exe'
 $script:WazuhProgram='%ProgramFiles(x86)%\ossec-agent\wazuh-agent.exe'
 $script:SystemLocalUser='D:(A;;CC;;;SY)'
+$script:FilterKinds=@('Address','Port','Application','Service','Security','Interface','InterfaceType')
 
 function Assert-NetEndpointIP($Value){
  $ip=$null
@@ -164,14 +165,56 @@ function Assert-NetApplyAddress($Config){
 }
 function Join-Values($value){(@($value)|ForEach-Object{[string]$_}|Sort-Object) -join ','}
 function Default-Any($value){$text=Join-Values $value;if($text -in @('','Any')){'Any'}else{$text}}
-function Read-RuleSignature($rule){
- $address=$rule|Get-NetFirewallAddressFilter
- $port=$rule|Get-NetFirewallPortFilter
- $app=$rule|Get-NetFirewallApplicationFilter
- $service=$rule|Get-NetFirewallServiceFilter
- $security=$rule|Get-NetFirewallSecurityFilter
- $interface=$rule|Get-NetFirewallInterfaceFilter
- $interfaceType=$rule|Get-NetFirewallInterfaceTypeFilter
+
+function New-NetInstanceIndex([object[]]$Items,$RuleIds){
+ $index=@{}
+ foreach($item in $Items){
+  $property=$item.PSObject.Properties['InstanceID']
+  if(-not $property -or $property.Value -isnot [string] -or [string]::IsNullOrWhiteSpace($property.Value)){continue}
+  $id=$property.Value
+  if($RuleIds -and -not $RuleIds.ContainsKey($id)){continue}
+  if($index.ContainsKey($id)){$index[$id]=$null}
+  else{$index.Add($id,$item)}
+ }
+ return $index
+}
+
+function Find-NetInstance($Index,[string]$Id){
+ if([string]::IsNullOrWhiteSpace($Id)){return}
+ $candidate=$Index[$Id]
+ if($candidate -and $candidate.InstanceID -ceq $Id){return $candidate}
+}
+
+function Read-NetStoreFilterIndex([string]$PolicyStore,[object[]]$Rules){
+ $index=@{Rules=(New-NetInstanceIndex $Rules);Filters=@{}}
+ if(-not $index.Rules.Count){return $index}
+ foreach($kind in $script:FilterKinds){
+  $command="Get-NetFirewall${kind}Filter"
+  try{$index.Filters[$kind]=New-NetInstanceIndex @(& $command -PolicyStore $PolicyStore -ErrorAction Stop) $index.Rules}
+  catch{Write-Verbose "Пакетное чтение фильтров $kind недоступно, используется штатная ассоциация."}
+ }
+ return $index
+}
+
+function Read-RuleSignature($rule,$index){
+ $property=$rule.PSObject.Properties['InstanceID']
+ $id=if($property -and $property.Value -is [string]){$property.Value}
+ $indexedRule=Find-NetInstance $index.Rules $id
+ $filters=@{}
+ foreach($kind in $script:FilterKinds){
+  $filter=$null
+  if($indexedRule -and $index.Filters.ContainsKey($kind)){$filter=Find-NetInstance $index.Filters[$kind] $id}
+  if(-not $filter){
+   # Неоднозначный или неизвестный ключ bulk не заменяет штатную ассоциацию правила.
+   $command="Get-NetFirewall${kind}Filter"
+   $associated=@($rule | & $command -ErrorAction Stop)
+   if($associated.Count -ne 1){throw "Не подтверждён единственный фильтр $kind для правила $($rule.Name)."}
+   $filter=$associated[0]
+  }
+  $filters[$kind]=$filter
+ }
+ $address=$filters.Address; $port=$filters.Port; $app=$filters.Application; $service=$filters.Service
+ $security=$filters.Security; $interface=$filters.Interface; $interfaceType=$filters.InterfaceType
  [ordered]@{
   Name=[string]$rule.Name;DisplayName=[string]$rule.DisplayName;Description=[string]$rule.Description;Group=[string]$rule.Group
   Enabled=[string]$rule.Enabled;Profile=[string]$rule.Profile;Direction=[string]$rule.Direction;Action=[string]$rule.Action
@@ -207,6 +250,8 @@ function Read-NetView($Config,[string]$Revision){
  $gpoRules=@(Get-NetFirewallRule -PolicyStore localhost)
  $specs=@()
  if($state){$specs=@(Get-NetSpecs $Config)}
+ $ownNames=@($specs | ForEach-Object Name)
+ $filterIndex=Read-NetStoreFilterIndex localhost @($gpoRules | Where-Object {$_.Name -cin $ownNames})
  foreach($p in $gpoProfiles){
   foreach($name in $script:Fields.Keys){
    $value=[string]$p.$name
@@ -224,7 +269,8 @@ function Read-NetView($Config,[string]$Revision){
    $applyIssues+=('Чужое local GPO правило '+$rule.Name)
    if($rule.Name -like 'ExamLab.Network.*'){$issues+=$applyIssues[-1]};continue
   }
-  if((Read-RuleSignature $rule) -cne (Expected-RuleSignature $spec[0] $state.RunId)){$issues+=('Изменены собственные filters '+$rule.Name)}
+  if($rule.Name -cin $present){$issues+=('Повтор собственного GPO правила '+$rule.Name);continue}
+  if((Read-RuleSignature $rule $filterIndex) -cne (Expected-RuleSignature $spec[0] $state.RunId)){$issues+=('Изменены собственные filters '+$rule.Name)}
   $present+=[string]$rule.Name
  }
  if($present.Count -ne $specs.Count){$complete=$false}
@@ -236,9 +282,23 @@ function Update-NetPolicy {
  if($code -ne 0){throw 'gpupdate отказал; own intent сохранён, Normal отдельно.'}
 }
 function Assert-NetActive($View,[switch]$RulesOnly){
- foreach($spec in $View.Specs){
-  $active=@(Get-NetFirewallRule -PolicyStore ActiveStore -TracePolicyStore -Name $spec.Name)
-  if($active.Count -ne 1 -or [string]$active[0].PolicyStoreSourceType -cne 'GroupPolicy' -or (Read-RuleSignature $active[0]) -cne (Expected-RuleSignature $spec $View.Intent.RunId)){throw ('ActiveStore не подтвердил собственное правило '+$spec.Name)}
+ if($View.Specs.Count){
+  $names=@($View.Specs | ForEach-Object Name)
+  $active=@(Get-NetFirewallRule -PolicyStore ActiveStore -TracePolicyStore -Name $names)
+  $byName=@{}
+  foreach($rule in $active){
+   if($rule.Name -cnotin $names -or $byName.ContainsKey($rule.Name) -or [string]$rule.PolicyStoreSourceType -cne 'GroupPolicy'){
+    throw ('ActiveStore не подтвердил собственное правило '+$rule.Name)
+   }
+   $byName.Add($rule.Name,$rule)
+  }
+  if($byName.Count -ne $names.Count){throw 'ActiveStore не подтвердил все собственные правила.'}
+  $filterIndex=Read-NetStoreFilterIndex ActiveStore $active
+  foreach($spec in $View.Specs){
+   if((Read-RuleSignature $byName[$spec.Name] $filterIndex) -cne (Expected-RuleSignature $spec $View.Intent.RunId)){
+    throw ('ActiveStore не подтвердил собственное правило '+$spec.Name)
+   }
+  }
  }
  if(-not $RulesOnly){
   $profiles=@(Get-NetFirewallProfile -PolicyStore ActiveStore -Name $script:Profiles)
