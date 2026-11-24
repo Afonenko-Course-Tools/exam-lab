@@ -1,20 +1,38 @@
 [CmdletBinding()]
-param([Parameter(Mandatory)][string]$OutputPath)
+param(
+    [Parameter(Mandatory)][string]$OutputPath,
+    [Parameter(Mandatory)][string]$Release,
+    [Parameter(Mandatory)][string]$Attempt,
+    [Parameter(Mandatory)][int]$CheckExit
+)
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2
 $env:PSModulePath = Join-Path $PSHOME 'Modules'
 $storage = 'root/Microsoft/Windows/Storage'
 $unknown = 'недоступно'
-$raw = Join-Path ([IO.Path]::GetDirectoryName($OutputPath)) 'inventory-raw'
+$report = [IO.Path]::GetDirectoryName($OutputPath)
+$raw = Join-Path $report 'inventory-raw'
 [void][IO.Directory]::CreateDirectory($raw)
+$sourceStatus = [ordered]@{}
+
+function Get-InventoryReadFailure($Failure) {
+    if ($Failure.CategoryInfo.Category -in 'PermissionDenied', 'SecurityError' -or
+        $Failure.Exception -is [UnauthorizedAccessException] -or
+        ($Failure.Exception -is [Microsoft.Management.Infrastructure.CimException] -and
+            $Failure.Exception.StatusCode -eq 'AccessDenied')) { return 'Отказано в чтении' }
+    if ($Failure.Exception -is [Management.Automation.ItemNotFoundException]) { return 'Отсутствует' }
+    return 'Ошибка источника'
+}
 
 function Read-InventoryData([string]$Name, [scriptblock]$Read) {
     try {
         $data = @(& $Read)
         Export-Clixml -InputObject $data -LiteralPath (Join-Path $raw "$Name.clixml") -Depth 4
+        $sourceStatus[$Name] = if ($data.Count) { 'Прочитан' } else { 'Нет данных' }
         $data
     } catch {
+        $sourceStatus[$Name] = Get-InventoryReadFailure $_
         $_ | Format-List * -Force | Out-File -LiteralPath (Join-Path $raw "$Name-error.txt") -Encoding UTF8
         throw
     }
@@ -26,7 +44,7 @@ function Section([string]$Title, [scriptblock]$Read) {
     try {
         $rows = @(& $Read)
         if ($rows.Count) { $rows } else { 'Нет данных.' }
-    } catch { 'Недоступно в текущем сеансе Windows.' }
+    } catch { "$(Get-InventoryReadFailure $_). Подробности в архиве." }
 }
 
 function Size($Value) {
@@ -50,7 +68,8 @@ function AssociationDeviceId($Reference) {
 }
 
 function Read-InventoryPolicy([string]$Path) {
-    if (-not (Test-Path -LiteralPath $Path)) { return }
+    try { $null = Get-Item -LiteralPath $Path }
+    catch [Management.Automation.ItemNotFoundException] { return }
     Get-ItemProperty -LiteralPath $Path
     foreach ($child in Get-ChildItem -LiteralPath $Path) { Get-ItemProperty -LiteralPath $child.PSPath }
 }
@@ -66,9 +85,20 @@ function Code($Value, $Names) {
     "код $([int]$Value)"
 }
 
-function VersionText($Value) {
-    $match = [regex]::Match([string]$Value, '\A[0-9]+(?:[._+-][0-9]+){0,6}(?:\.windows\.[0-9]+)?\z')
-    if ($match.Success -and $match.Length -le 40) { $match.Value }
+function Read-Report([string]$Name) {
+    $path = Join-Path $report $Name
+    if ([IO.File]::Exists($path)) { Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json }
+}
+
+function Read-PolicyConsole([string]$Name, [string]$Executable, [string[]]$Arguments) {
+    $ErrorActionPreference = 'Continue'
+    & (Join-Path ([Environment]::GetFolderPath('System')) $Executable) @Arguments 2>&1 |
+        Out-File -LiteralPath (Join-Path $raw "$Name.txt") -Encoding UTF8 -ErrorAction Stop
+    $code = $LASTEXITCODE
+    "ExitCode=$code" | Set-Content -LiteralPath (Join-Path $raw "$Name-exit.txt") -Encoding UTF8 -ErrorAction Stop
+    if ($code -eq 0) { return 'Прочитан' }
+    if ($code -in 5, -2147024891) { return 'Отказано в чтении' }
+    'Ошибка источника'
 }
 
 $driveTypes = @{0='неизвестно';1='нет корня';2='съёмный';3='локальный';5='оптический';6='RAM-диск'}
@@ -79,11 +109,14 @@ $media = @{
     15='Token Ring'; 16='IrDA'; 17='проводная WAN'; 18='проводная CoWAN'; 19='другой'
 }
 
+$check = Read-Report 'early-check.json'
+$releasePlan = Read-Report 'release-plan.json'
 $lines = @(
     'ExamLab — инвентаризация Windows'
+    "Выпуск $Release. Обследование $Attempt. Код проверки предпосылок $CheckExit."
     'Локальная проверка чтения. Возможности провайдеров зависят от прав и редакции Windows.'
     Section 'Windows и системные диски' {
-        $os = Read-InventoryData 'windows' { Get-CimInstance Win32_OperatingSystem -Property Caption,Version,BuildNumber,OSArchitecture,SystemDrive -OperationTimeoutSec 8 }
+        $os = Read-InventoryData 'windows' { Get-CimInstance Win32_OperatingSystem -Property Caption,Version,BuildNumber,OSArchitecture,SystemDrive,OSLanguage,MUILanguages,Locale -OperationTimeoutSec 8 }
         $versionKey = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
         $edition = Get-ItemPropertyValue -LiteralPath $versionKey -Name EditionID -ErrorAction SilentlyContinue
         $display = Get-ItemPropertyValue -LiteralPath $versionKey -Name DisplayVersion -ErrorAction SilentlyContinue
@@ -94,7 +127,10 @@ $lines = @(
         $build = if ($null -eq $ubr) { $os.BuildNumber } else { "$($os.BuildNumber).$ubr" }
         "ОС: $(Text $os.Caption), редакция: $(Text $edition), выпуск: $(Text $display)"
         "Версия: $(Text $os.Version), сборка: $(Text $build), архитектура: $(Text $env:PROCESSOR_ARCHITECTURE), разрядность ОС: $(Text $os.OSArchitecture)"
+        "Язык интерфейса пользователя: $((Get-UICulture).Name), установленный язык Windows: $([Globalization.CultureInfo]::InstalledUICulture.Name)"
+        "Языки интерфейса Windows: $(@($os.MUILanguages) -join ', '), локаль ОС: $($os.Locale)"
         "Системный диск Windows: $(Letter $os.SystemDrive), диск TEMP: $(Letter $env:TEMP)"
+        'Редакция, сборка и язык нужны для сопоставления предпосылок Shared PC и установочных отказов.'
     }
     Section 'Компьютер и процессор' {
         $pc = Read-InventoryData 'computer' { Get-CimInstance Win32_ComputerSystem -Property Manufacturer,Model,TotalPhysicalMemory,PartOfDomain,Domain,PCSystemType -OperationTimeoutSec 8 }
@@ -103,6 +139,7 @@ $lines = @(
         foreach ($cpu in @(Read-InventoryData 'processors' { Get-CimInstance Win32_Processor -Property Name,NumberOfCores,NumberOfLogicalProcessors,Architecture,MaxClockSpeed -OperationTimeoutSec 8 })) {
             "Процессор: $(Text $cpu.Name), ядер: $($cpu.NumberOfCores), логических процессоров: $($cpu.NumberOfLogicalProcessors)"
         }
+        'Конфигурация CPU и памяти нужна для сравнения нагрузки IDEA на ПК и VM.'
     }
     Section 'BIOS и UEFI' {
         $bios = Read-InventoryData 'bios' { Get-CimInstance Win32_BIOS -Property Manufacturer,SMBIOSBIOSVersion,ReleaseDate -OperationTimeoutSec 8 }
@@ -172,6 +209,7 @@ $lines = @(
                 "$(Letter $volume.DeviceID) | $(Code $volume.DriveType $driveTypes) | $(Text $volume.FileSystem) | размер $(Size $volume.Size) | свободно $(Size $volume.FreeSpace)"
             }
         }
+        'Разметка, файловая система и свободное место нужны для выбора томов установки и оценки области файловых ограничений.'
     }
     Section 'BitLocker' {
         $protection = @{0='выключена';1='включена';2='неизвестно'}
@@ -200,73 +238,84 @@ $lines = @(
         }
         "TPM готов: $ready"
     }
-    Section 'Активные сетевые подключения' {
-        $adapters = @(Read-InventoryData 'adapters' { Get-CimInstance -Namespace 'root/StandardCimv2' -ClassName MSFT_NetAdapter -OperationTimeoutSec 8 } | Where-Object MediaConnectState -eq 1)
-        if (-not $adapters.Count) { 'Подключённых интерфейсов не обнаружено.'; return }
+    Section 'Сетевые интерфейсы' {
+        $adapters = @(Read-InventoryData 'adapters' { Get-CimInstance -Namespace 'root/StandardCimv2' -ClassName MSFT_NetAdapter -OperationTimeoutSec 8 })
         $types = foreach ($adapter in $adapters) {
-            if ($adapter.HardwareInterface -eq $false) { 'виртуальный' }
-            elseif ($media.ContainsKey([int]$adapter.NdisPhysicalMedium)) { $media[[int]$adapter.NdisPhysicalMedium] }
-            else { 'другой или неизвестный' }
+            $type = if ($adapter.HardwareInterface -eq $false) { 'виртуальный' }
+                elseif ($media.ContainsKey([int]$adapter.NdisPhysicalMedium)) { $media[[int]$adapter.NdisPhysicalMedium] }
+                else { 'другой или неизвестный' }
+            $connected = if ($adapter.MediaConnectState -eq 1) { 'подключён' }
+                elseif ($adapter.MediaConnectState -eq 2) { 'отключён' } else { 'состояние неизвестно' }
+            "$type ($connected)"
         }
-        $types | Group-Object | Sort-Object Name | ForEach-Object { "$($_.Name): $($_.Count)" }
+        if ($types) { $types | Group-Object | Sort-Object Name | ForEach-Object { "$($_.Name): $($_.Count)" } }
+        else { 'Интерфейсы не обнаружены.' }
+        'Тип интерфейса помогает сопоставить результаты измерений Ethernet, Wi-Fi и VM.'
     }
-    Section 'Версии выбранных программ' {
-        $patterns = [ordered]@{
-            'IntelliJ IDEA' = '^IntelliJ IDEA(?:\s|$)'
-            'Java / JDK' = '^(?:Java(?:\s|$)|JDK(?:\s|$)|OpenJDK(?:\s|$)|Eclipse Temurin(?:\s|$)|Amazon Corretto(?:\s|$)|Microsoft Build of OpenJDK(?:\s|$)|Zulu(?:\s|$))'
-            'Gradle' = '^Gradle(?:\s|$)'
-            'Git' = '^Git(?:\s+version|\s+[0-9]|$)'
-            'PowerShell 7' = '^PowerShell 7(?:[.\s]|$)'
-            'WinDirStat' = '^WinDirStat(?:\s|$)'
+    Section 'Версии, пути и план программ' {
+        if (-not $check -or -not $check.Before) {
+            'Общий план программ недоступен. Сведения из реестра установок сохранены в архиве.'
+        } else {
+            $softwareNames = [ordered]@{ IDEA='IntelliJ IDEA'; JDK='Java / JDK'; Git='Git'; Gradle='Gradle'; WinDirStat='WinDirStat' }
+            foreach ($kind in $softwareNames.Keys) {
+                $tool = $check.Before.$kind
+                $name = $softwareNames[$kind]
+                if ($tool.State -eq 'Missing') { "$name — в проверенных местах не найдено."; continue }
+                foreach ($candidate in @($tool.Candidates)) {
+                    $version = if ($candidate.Version) { $candidate.Version } else { 'версия не подтверждена' }
+                    $state = if ($candidate.Compatible) { 'подходит' }
+                        elseif ($candidate.Error) { "проверка: $($candidate.Error)" } else { 'совместимость не подтверждена' }
+                    "$name — $version; $($candidate.Path); $state."
+                }
+                foreach ($registered in @($tool.Registered | Where-Object { $_.Location -notin @($tool.Candidates | ForEach-Object Path) })) {
+                    "$name — запись реестра: $($registered.Version); $($registered.Location)."
+                }
+            }
+            $steps = if ($check.Plan) { $check.Plan.Actions }
+            foreach ($step in $steps) {
+                $operation = switch ($step.Operation) {
+                    'Keep' { 'сохранить' }
+                    'Install' { 'установить' }
+                    'Block' { 'нужно решение администратора' }
+                    default { $step.Operation }
+                }
+                "План $($step.Name) — $operation; путь $($step.Destination)."
+            }
         }
-        $versions = @{}
-        foreach ($name in $patterns.Keys) { $versions[$name] = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase) }
-        $installed = @(Read-InventoryData 'installed-programs' {
-            $roots = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
-                'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall',
-                'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
-            foreach ($root in $roots) {
-                foreach ($key in @(Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue)) {
-                    $displayName = $key.GetValue('DisplayName')
-                    if ($displayName) {
-                        [pscustomobject]@{
-                            Scope=$root; DisplayName=$displayName; DisplayVersion=$key.GetValue('DisplayVersion')
-                            Publisher=$key.GetValue('Publisher'); InstallDate=$key.GetValue('InstallDate')
-                            InstallLocation=$key.GetValue('InstallLocation'); EstimatedSize=$key.GetValue('EstimatedSize')
-                        }
+        'Версии и пути показывают, какие программы можно сохранить и какие пакеты потребуются.'
+    }
+    Section 'Докачка и дисковое место' {
+        if (-not $releasePlan) {
+            'Оценка выпуска недоступна. Причины смотрите в отчёте проверки предпосылок.'
+        } else {
+            $runtime = if ($releasePlan.PowerShell7Ready) { 'подходящий файл найден; запуск не проверялся' }
+                else { 'подходящий файл не подтверждён; учтён установщик' }
+            "PowerShell 7 x64: $runtime."
+            "Ожидаемая докачка: $(Size $releasePlan.DownloadBytes). Верхняя оценка: $(Size $releasePlan.DownloadUpperBoundBytes)."
+            $space = $releasePlan.SpaceChecks | Select-Object -Last 1
+            if ($space) {
+                "Дополнительное место после установки: $(Size $space.EstimatedAdditionalInstalledBytes)."
+                foreach ($volume in $space.Volumes) {
+                    $state = switch ($volume.Status) {
+                        'Available' { 'по оценке достаточно' }
+                        'InsufficientSpace' { 'не хватает места' }
+                        'EstimatedSpaceRisk' { 'пик может превысить свободное место' }
+                        default { 'доступное место не подтверждено' }
                     }
+                    "$($volume.MountPath) — свободно $(Size $volume.AvailableBytes); кэш $(Size $volume.CacheGrowthBytes); прирост $(Size $volume.AdditionalInstalledBytes); оценка пика $(Size $volume.EstimatedPeakBytes); $state."
                 }
             }
-        })
-        foreach ($product in $installed) {
-            foreach ($name in $patterns.Keys) {
-                if ($product.DisplayName -match $patterns[$name]) {
-                    $version = VersionText $product.DisplayVersion
-                    if ($version) { [void]$versions[$name].Add($version) }
-                    break
-                }
-            }
+            'Пик включает кэш, временные копии и оценку работы установщиков. Закрытый кэш учитывается как верхняя оценка.'
         }
-        $programFiles = [Environment]::GetFolderPath('ProgramFiles')
-        $binaries = @{ 'Git'='Git\cmd\git.exe'; 'PowerShell 7'='PowerShell\7\pwsh.exe'; 'WinDirStat'='WinDirStat\WinDirStat.exe' }
-        foreach ($name in $binaries.Keys) {
-            $binary = Join-Path $programFiles $binaries[$name]
-            if ([IO.File]::Exists($binary)) {
-                try {
-                    $version = VersionText ([Diagnostics.FileVersionInfo]::GetVersionInfo($binary).ProductVersion)
-                    if ($version) { [void]$versions[$name].Add($version) }
-                } catch { }
-            }
-        }
-        foreach ($directory in @(Get-ChildItem -LiteralPath $programFiles -Directory -Filter 'gradle-*' -ErrorAction SilentlyContinue)) {
-            if ($directory.Name -match '\Agradle-([0-9]+(?:\.[0-9]+){1,4})\z' -and [IO.File]::Exists((Join-Path $directory.FullName 'bin\gradle.bat'))) {
-                [void]$versions['Gradle'].Add($Matches[1])
-            }
-        }
-        foreach ($name in $patterns.Keys) {
-            $version = if ($versions[$name].Count) { ($versions[$name] | Sort-Object) -join ', ' } else { 'не найдено в выбранных источниках' }
-            "$name`: $version"
-        }
+    }
+    Section 'Предпосылки установки' {
+        $preflight = Read-Report 'pilot-preflight.json'
+        $reasons = @(
+            if ($check) { $check.Errors }
+            if ($preflight) { $preflight.Blockers }
+        ) | Where-Object { $_ }
+        if ($reasons) { $reasons } elseif ($CheckExit -eq 0) { 'Проверка предпосылок завершена.' }
+        else { 'См. подробный отчёт и дисковую оценку.' }
     }
 )
 
@@ -290,6 +339,24 @@ $additional = [ordered]@{
     'local-accounts' = { Get-LocalUser }
     'local-profiles' = { Get-CimInstance Win32_UserProfile -OperationTimeoutSec 8 }
     'defender-status' = { Get-MpComputerStatus }
+    'installed-programs' = {
+        foreach ($root in 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+            'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall',
+            'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall') {
+            try { $entries = Get-ChildItem -LiteralPath $root }
+            catch [Management.Automation.ItemNotFoundException] { continue }
+            foreach ($key in $entries) {
+                $displayName = $key.GetValue('DisplayName')
+                if ($displayName) {
+                    [pscustomobject]@{
+                        Scope=$root; DisplayName=$displayName; DisplayVersion=$key.GetValue('DisplayVersion')
+                        Publisher=$key.GetValue('Publisher'); InstallDate=$key.GetValue('InstallDate')
+                        InstallLocation=$key.GetValue('InstallLocation'); EstimatedSize=$key.GetValue('EstimatedSize')
+                    }
+                }
+            }
+        }
+    }
     'usb-storage-service' = { Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Services\USBSTOR' -Name Start }
     'removable-storage-computer' = { Read-InventoryPolicy 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\RemovableStorageDevices' }
     'removable-storage-user' = { Read-InventoryPolicy 'HKCU:\SOFTWARE\Policies\Microsoft\Windows\RemovableStorageDevices' }
@@ -302,23 +369,50 @@ $additional = [ordered]@{
     }
     'shared-pc-mdm' = { Get-CimInstance -Namespace 'root/cimv2/mdm/dmmap' -ClassName MDM_SharedPC -OperationTimeoutSec 8 }
     'shared-pc-policy' = { Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\SharedPC' }
-    'examlab-tasks' = { Get-ScheduledTask -TaskName 'ExamLab*' }
-    'examlab-services' = { Get-Service -Name 'WazuhSvc' }
+    'examlab-tasks' = { Get-ScheduledTask | Where-Object TaskName -like 'ExamLab-*' | Select-Object TaskName,TaskPath,State }
+    'examlab-services' = {
+        Get-CimInstance Win32_Service -Filter "Name='WazuhSvc' OR Name LIKE 'ExamLab%'" `
+            -Property Name,DisplayName,StartMode,State,Status,ProcessId -OperationTimeoutSec 8
+    }
+    'applocker-local' = { Get-AppLockerPolicy -Local -Xml }
+    'applocker-effective' = { Get-AppLockerPolicy -Effective -Xml }
+    'software-restriction-computer' = { Read-InventoryPolicy 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Safer\CodeIdentifiers' }
+    'software-restriction-user' = { Read-InventoryPolicy 'HKCU:\SOFTWARE\Policies\Microsoft\Windows\Safer\CodeIdentifiers' }
+    'local-root-acls' = {
+        foreach ($disk in @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType = 3' -Property DeviceID -OperationTimeoutSec 8)) {
+            $root = "$($disk.DeviceID)\"
+            try {
+                $acl = Get-Acl -LiteralPath $root
+                [pscustomobject]@{ Path=$root; Status='Прочитан'; Owner=$acl.Owner; Sddl=$acl.Sddl; Error=$null }
+            } catch {
+                [pscustomobject]@{ Path=$root; Status=(Get-InventoryReadFailure $_); Owner=$null; Sddl=$null; Error=$_.ToString() }
+            }
+        }
+    }
 }
-$available = 0
+$shown = 'usb-storage-service', 'removable-storage-computer', 'removable-storage-user', 'device-install-restrictions',
+    'storage-mdm-policy', 'shared-pc-mdm', 'shared-pc-policy', 'examlab-tasks', 'examlab-services', 'applocker-effective',
+    'applocker-local', 'firewall-profiles', 'software-restriction-computer', 'software-restriction-user', 'local-root-acls'
+$observations = @{}
 foreach ($name in $additional.Keys) {
-    try { $null = Read-InventoryData $name $additional[$name]; $available++ } catch { }
+    try {
+        $data = @(Read-InventoryData $name $additional[$name])
+        if ($name -in $shown) { $observations[$name] = $data }
+    } catch { }
 }
+$policyConsole = [ordered]@{}
 foreach ($scope in 'USER', 'COMPUTER') {
     try {
-        $ErrorActionPreference = 'Continue'
-        & (Join-Path ([Environment]::GetFolderPath('System')) 'gpresult.exe') /SCOPE $scope /Z 2>&1 |
-            Out-File -LiteralPath (Join-Path $raw "gpresult-$scope.txt") -Encoding UTF8
-        $code = $LASTEXITCODE
-        "ExitCode=$code" | Set-Content -LiteralPath (Join-Path $raw "gpresult-$scope-exit.txt") -Encoding UTF8
+        $policyConsole["gpresult-$scope"] = Read-PolicyConsole "gpresult-$scope" 'gpresult.exe' @('/SCOPE', $scope, '/Z')
     } catch {
+        $policyConsole["gpresult-$scope"] = Get-InventoryReadFailure $_
         $_ | Format-List * -Force | Out-File -LiteralPath (Join-Path $raw "gpresult-$scope-error.txt") -Encoding UTF8
-    } finally { $ErrorActionPreference = 'Stop' }
+    }
+}
+try { $policyConsole['auditpol'] = Read-PolicyConsole 'auditpol' 'auditpol.exe' @('/get', '/category:*', '/r') }
+catch {
+    $policyConsole['auditpol'] = Get-InventoryReadFailure $_
+    $_ | Format-List * -Force | Out-File -LiteralPath (Join-Path $raw 'auditpol-error.txt') -Encoding UTF8
 }
 
 $examlab = Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'ExamLab'
@@ -338,6 +432,40 @@ try {
     }
 } catch { }
 
+$lines += @(
+    Section 'Задачи и службы ExamLab' {
+        "Задачи, видимые текущему пользователю: $($sourceStatus['examlab-tasks'])."
+        foreach ($task in $observations['examlab-tasks']) { "$($task.TaskPath)$($task.TaskName) — $($task.State)." }
+        "Службы ExamLab и Wazuh: $($sourceStatus['examlab-services'])."
+        foreach ($service in $observations['examlab-services']) { "$($service.Name) — $($service.State), запуск $($service.StartMode)." }
+        'Имена и состояния нужны для обнаружения прежней или частичной установки.'
+    }
+    Section 'Действующие политики в пределах текущих прав' {
+        "Аудит Windows: $($policyConsole['auditpol'])."
+        "Групповые политики пользователя: $($policyConsole['gpresult-USER']); компьютера: $($policyConsole['gpresult-COMPUTER'])."
+        $policyNames = [ordered]@{
+            'applocker-local'='AppLocker, локальная политика'; 'applocker-effective'='AppLocker, результирующая политика';
+            'software-restriction-computer'='Ограничение запуска компьютера (SRP)'; 'software-restriction-user'='Ограничение запуска пользователя (SRP)';
+            'removable-storage-computer'='Доступ к съёмным носителям компьютера'; 'removable-storage-user'='Доступ к съёмным носителям пользователя';
+            'device-install-restrictions'='Ограничения установки устройств'; 'storage-mdm-policy'='Ограничения MDM для хранилищ';
+            'usb-storage-service'='Драйвер USBSTOR'; 'shared-pc-mdm'='Shared PC в MDM'; 'shared-pc-policy'='Shared PC в реестре';
+            'firewall-profiles'='Действующие профили брандмауэра'; 'local-root-acls'='Права корней локальных томов'
+        }
+        foreach ($name in $policyNames.Keys) { "$($policyNames[$name]) — $($sourceStatus[$name])." }
+        foreach ($profile in $observations['firewall-profiles']) {
+            "$($profile.Name) — вход $($profile.DefaultInboundAction), выход $($profile.DefaultOutboundAction), включён $($profile.Enabled)."
+        }
+        foreach ($value in $observations['applocker-effective']) {
+            foreach ($collection in ([xml]$value).SelectNodes('/AppLockerPolicy/RuleCollection')) {
+                "AppLocker $($collection.GetAttribute('Type')) — $($collection.GetAttribute('EnforcementMode')), правил $($collection.SelectNodes('*').Count)."
+            }
+        }
+        foreach ($root in $observations['local-root-acls']) { "$($root.Path) — $($root.Status)." }
+        'Эти сведения помогают обнаружить действующие ограничения и возможные конфликты с подготовкой.'
+    }
+)
+$sourceStatus | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $raw 'source-status.json') -Encoding UTF8
+$available = @($additional.Keys | Where-Object { $sourceStatus[$_] -in 'Прочитан', 'Нет данных' }).Count
 $lines += '', '[Подробные данные]', "Дополнительные источники прочитаны: $available из $($additional.Count).",
     'Данные и ошибки доступа находятся в папке inventory-raw внутри архива Check.'
 [IO.File]::WriteAllLines($OutputPath, [string[]]$lines, [Text.UTF8Encoding]::new($true))

@@ -3,10 +3,8 @@
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2
 
-$launcher = Join-Path $PSScriptRoot '../setup/Start-ExamLab.cmd'
-$parts = [IO.File]::ReadAllText($launcher) -split '(?m)^:NativePowerShell\r?\n', 2
-if ($parts.Count -ne 2) { throw 'Не найден PowerShell-блок CMD.' }
-$source = $parts[1] -creplace '@[A-Z0-9_]+@', '0'
+$launcher = Join-Path $PSScriptRoot '../setup/Start-ExamLab.Native.ps1.in'
+$source = [IO.File]::ReadAllText($launcher) -creplace '@[A-Z0-9_]+@', '0'
 $parseErrors = $null
 $ast = [Management.Automation.Language.Parser]::ParseInput($source, [ref]$null, [ref]$parseErrors)
 if ($parseErrors.Count) { throw ($parseErrors | Out-String) }

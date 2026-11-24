@@ -115,7 +115,14 @@ def bootstrap_payload(name, script):
 
 def render_cmd(template, substitutions):
     cmd = fill_template(template, {name: str(value) for name, value in substitutions.items()})
-    return cmd.replace("\r\n", "\n").replace("\n", "\r\n").encode("ascii")
+    return cmd.replace("\r\n", "\n").replace("\n", "\r\n").encode("utf-8")
+
+
+def build_check_script(native, substitutions):
+    payloads = (substitutions["EARLY_CHECK_PAYLOAD"], substitutions["INVENTORY_PAYLOAD"])
+    comments = "\n".join(f"# {line}" for payload in payloads for line in payload.splitlines())
+    script = fill_template(native, {**substitutions, "CHECK_ONLY": "$true"})
+    return f"{comments}\n\n{script}".encode("utf-8-sig")
 
 
 def bootstrap_private_paths(core):
@@ -136,6 +143,7 @@ def main():
     parser.add_argument("--revision", default="HEAD", help="Точная Git-ревизия исходников")
     parser.add_argument("--launcher", type=Path, required=True, help="Путь к файлу Start-ExamLab.cmd для HTTP")
     parser.add_argument("--check-launcher", type=Path, help="Путь к Check-ExamLab.cmd для запуска только Check")
+    parser.add_argument("--check-script-base-url", default="", help="Адрес каталога сценариев Check по HTTP или HTTPS")
     parser.add_argument("--controller-ca", type=Path, required=True, help="Публичный CA контроллера в DER")
     parser.add_argument("--squid-ca", type=Path, required=True, help="Публичный CA Squid в DER")
     parser.add_argument("--tools-dir", type=Path, required=True, help="Проверенные файлы для HTTPS-публикации пилота")
@@ -162,6 +170,16 @@ def main():
         or args.check_launcher.resolve() == args.launcher.resolve()
     ):
         parser.error("--check-launcher: укажите отдельный путь .cmd вне каталога HTTPS-публикации")
+    check_base = args.check_script_base_url.rstrip("/")
+    if args.check_script_base_url:
+        if not args.check_launcher or not re.fullmatch(r"https?://[A-Za-z0-9.-]+(?::[0-9]+)?/[A-Za-z0-9/_-]+", check_base):
+            parser.error("--check-script-base-url требует --check-launcher и адрес каталога публикации")
+        try:
+            check_port = urlsplit(check_base).port
+        except ValueError:
+            parser.error("--check-script-base-url: неверный номер порта")
+        if check_port == 0:
+            parser.error("--check-script-base-url: неверный номер порта")
     try:
         certificate = read_root(args.controller_ca)
         squid_certificate = read_root(args.squid_ca)
@@ -204,10 +222,20 @@ def main():
     tools_url = f"{base}/exam-lab-{revision}/tools"
     tools_pins = ";\n        ".join(f"'{name}' = '{pin}'" for name, pin in tools_hashes.items())
     cmd = git("show", f"{revision}:setup/Start-ExamLab.cmd").decode("ascii")
-    check_markers = "@CHECK_ONLY@", "@BOOTSTRAP_ARGUMENTS@", "@INVENTORY_PAYLOAD@"
-    if args.check_launcher and not all(marker in cmd for marker in check_markers):
+    native = ""
+    if "@NATIVE_SCRIPT@" in cmd:
+        native = git("show", f"{revision}:setup/Start-ExamLab.Native.ps1.in").decode("utf-8-sig")
+    if args.check_launcher and (
+        "@CHECK_ONLY@" not in (native or cmd)
+        or "@BOOTSTRAP_ARGUMENTS@" not in cmd
+        or "@INVENTORY_PAYLOAD@" not in cmd
+    ):
         parser.error("--check-launcher требует ревизию с поддержкой входа Check")
-    include_expanded_sizes = "@BUNDLE_EXPANDED_BYTES@" in cmd
+    if args.check_launcher and native and not check_base:
+        parser.error("--check-launcher для раздельной поставки требует --check-script-base-url")
+    if check_base and not native:
+        parser.error("--check-script-base-url требует ревизию с отдельным сценарием Check")
+    include_expanded_sizes = "@BUNDLE_EXPANDED_BYTES@" in (native or cmd)
     bootstrap_tools = []
     for name, pin in tools_hashes.items():
         if name == PWSH_MSI:
@@ -285,7 +313,7 @@ def main():
         "BOOTSTRAP_TOOLS": "@(" + ", ".join(bootstrap_tools) + ")",
         "EARLY_CHECK_PAYLOAD": bootstrap_payload("EARLY_CHECK", files["setup/Prepare-ExamLab.ps1"]),
     }
-    if "@BOOTSTRAP_PRIVATE_PATHS@" in cmd:
+    if "@BOOTSTRAP_PRIVATE_PATHS@" in (native or cmd):
         cmd_substitutions["BOOTSTRAP_PRIVATE_PATHS"] = bootstrap_private_paths(files["setup/ExamLabMaintenance.Core.ps1"])
     if "@INVENTORY_PAYLOAD@" in cmd:
         inventory = git("show", f"{revision}:setup/ExamLabInventory.ps1")
@@ -294,11 +322,26 @@ def main():
         cmd_substitutions["BOOTSTRAP_ARGUMENTS"] = "\n".join(
             f'set "EXAMLAB_ARG{number}=%~{number}"' for number in range(1, 5)
         )
+    if native:
+        cmd_substitutions["NATIVE_SCRIPT"] = fill_template(native, cmd_substitutions)
     launcher_bytes = render_cmd(cmd, cmd_substitutions)
+    check_script_path = None
     if args.check_launcher:
-        check_launcher_bytes = render_cmd(cmd, {
-            **cmd_substitutions, "CHECK_ONLY": "$true", "BOOTSTRAP_ARGUMENTS": "",
-        })
+        if native:
+            check_script_name = f"check-{revision}.ps1"
+            check_script_path = args.check_launcher.with_name(check_script_name)
+            check_script_bytes = build_check_script(native, cmd_substitutions)
+            check_script_url = f"{check_base}/{check_script_name}"
+            check_cmd = git("show", f"{revision}:setup/Check-ExamLab.cmd").decode("ascii")
+            check_launcher_bytes = render_cmd(check_cmd, {
+                "CHECK_SCRIPT_URL": check_script_url,
+                "CHECK_SCRIPT_BYTES": len(check_script_bytes),
+                "CHECK_SCRIPT_SHA256": sha256(check_script_bytes),
+            })
+        else:
+            check_launcher_bytes = render_cmd(cmd, {
+                **cmd_substitutions, "CHECK_ONLY": "$true", "BOOTSTRAP_ARGUMENTS": "",
+            })
     args.output.mkdir(parents=True, exist_ok=True)
     (args.output / filename).write_bytes(bundle)
     (args.output / installer_name).write_bytes(installer_bytes)
@@ -308,6 +351,10 @@ def main():
     print(f"{filename}  SHA-256 {digest}")
     print(f"{args.launcher}  SHA-256 {sha256(launcher_bytes)}")
     if args.check_launcher:
+        if check_script_path:
+            check_script_path.write_bytes(check_script_bytes)
+            print(check_script_url)
+            print(f"{check_script_path}  SHA-256 {sha256(check_script_bytes)}")
         args.check_launcher.write_bytes(check_launcher_bytes)
         print(f"{args.check_launcher}  SHA-256 {sha256(check_launcher_bytes)}")
 
