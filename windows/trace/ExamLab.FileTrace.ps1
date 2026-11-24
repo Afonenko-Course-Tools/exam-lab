@@ -2,14 +2,14 @@ $script:FileTraceAuthorization = Join-Path $script:CodeRoot 'file-trace-exam.txt
 $script:FileTraceAttempt = Join-Path $script:DataRoot 'file-trace-attempt.json'
 $script:FileTraceLease = Join-Path $script:DataRoot 'file-trace-worker.lock'
 
-function Test-ExamLabFileTraceAuthorization([string]$ExamId) {
+function Test-ExamLabFileTraceAuthorization([string]$ExamId, [string]$Path) {
     if ($ExamId -cnotmatch '\Afile-trace-[A-Za-z0-9._-]{1,53}\z' -or
-        -not (Test-ExistingFile $script:FileTraceAuthorization)) { return $false }
-    $file = Get-Item -LiteralPath $script:FileTraceAuthorization -Force
+        -not (Test-ExistingFile $Path)) { return $false }
+    $file = Get-Item -LiteralPath $Path -Force
     if ($file.Length -eq 0) { return $false }
     if ($file.Length -gt 64) { throw 'Некорректная настройка файлового экзамена.' }
-    Assert-SafePath $script:FileTraceAuthorization -Readable
-    return [IO.File]::ReadAllText($script:FileTraceAuthorization) -ceq $ExamId
+    Assert-SafePath $Path -Readable
+    return [IO.File]::ReadAllText($Path) -ceq $ExamId
 }
 
 function Test-ExamLabFileTraceAssignment($State, $Attempt) {
@@ -22,8 +22,8 @@ function Test-ExamLabFileTraceAssignment($State, $Attempt) {
 function Get-ExamLabFileTraceStopReason($Context) {
     try {
         $attempt = $Context.Attempt
-        if (-not (Test-ExamLabFileTraceAuthorization $attempt.examId)) { return 'opt-out' }
-        $state = Read-ControllerState $script:ControllerStateFile $attempt.deviceId
+        if (-not (Test-ExamLabFileTraceAuthorization $attempt.examId $Context.AuthorizationPath)) { return 'opt-out' }
+        $state = Read-ControllerState $Context.StatePath $attempt.deviceId
         if (-not (Test-ExamLabFileTraceAssignment $state $attempt)) { return 'assignment-ended' }
         $current = Get-ControllerConsoleLogon
         if (-not $current -or
@@ -75,7 +75,7 @@ function Stop-ExamLabOrphanedFileTrace([string]$BootUtc) {
 
 function Invoke-ExamLabFileTraceAssignment($Assignment, $Configuration, $Snapshot, $Observation) {
     if ($Assignment.mode -cne 'exam' -or $Assignment.examId -cnotmatch '\Afile-trace-[A-Za-z0-9._-]+\z' -or
-        -not (Test-ExamLabFileTraceAuthorization $Assignment.examId)) { return }
+        -not (Test-ExamLabFileTraceAuthorization $Assignment.examId $script:FileTraceAuthorization)) { return }
     if (-not $Observation.Readiness -or -not $Observation.Readiness.machineReady -or
         $Observation.Readiness.revision -ne $Assignment.revision) { return }
     $lockPath = Join-Path $script:DataRoot 'operation.lock'
@@ -107,7 +107,10 @@ function Invoke-ExamLabFileTraceAssignment($Assignment, $Configuration, $Snapsho
                 runId = [guid]::NewGuid().ToString('N')
                 phase = 'pending'
             }
-            if (Get-ExamLabFileTraceStopReason @{Attempt=$attempt; Token=$Configuration.token}) { return }
+            if (Get-ExamLabFileTraceStopReason @{
+                Attempt=$attempt; Token=$Configuration.token
+                AuthorizationPath=$script:FileTraceAuthorization; StatePath=$script:ControllerStateFile
+            }) { return }
             $entry = Join-Path $script:CodeRoot 'exam-lab.ps1'
             Assert-SafePath $entry -Readable
             Assert-SafePath (Join-Path $script:CodeRoot 'windows-fileio-light.ps1') -Readable
@@ -157,7 +160,7 @@ function Start-ExamLabFileTraceExport($State) {
         $attempt = Read-ExamLabFileTraceAttempt
         if (-not $attempt -or $attempt.phase -cne 'finished' -or $attempt.PSObject.Properties['exportRequestedUtc'] -or
             -not (Test-ExamLabFileTraceNormal $State $attempt) -or
-            -not (Test-ExamLabFileTraceAuthorization $attempt.examId)) { return }
+            -not (Test-ExamLabFileTraceAuthorization $attempt.examId $script:FileTraceAuthorization)) { return }
         if ($attempt.runId -cnotmatch '\A[0-9a-f]{32}\z' -or
             ($attempt.revision -isnot [int] -and $attempt.revision -isnot [long]) -or
             $attempt.revision -lt 1 -or $attempt.revision -gt [int]::MaxValue) {
@@ -220,7 +223,11 @@ function Invoke-ExamLabFileTraceProbe([guid]$TraceRunId) {
         $attempt = Read-ExamLabFileTraceAttempt
         if (-not $attempt -or $attempt.phase -cne 'pending' -or
             $attempt.runId -cne $TraceRunId.ToString('N') -or $attempt.deviceId -cne $configuration.deviceId) { return }
-        $context = @{Attempt=$attempt; Token=$configuration.token}
+        # Обратный вызов из сценария захвата использует его собственную область script:.
+        $context = @{
+            Attempt=$attempt; Token=$configuration.token
+            AuthorizationPath=$script:FileTraceAuthorization; StatePath=$script:ControllerStateFile
+        }
         if (Get-ExamLabFileTraceStopReason $context) { return }
         $guest = Get-ExamLabControllerGuestBinding
         if (-not $guest -or $guest.Revision -ne $attempt.revision -or $guest.BootUtc -cne $attempt.bootUtc -or
