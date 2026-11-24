@@ -336,30 +336,33 @@
         }
         Save-ExamLabOwnedFile $ownership (Join-Path ([Environment]::GetFolderPath('CommonDesktopDirectory')) 'ExamLab - IDEA.lnk')
 
+        Add-InstallPhase 'enrollment-prerequisites'
         $enrollmentDirectory = Join-Path $examLabReportsPath 'Enrollment'
-        if ($Offline) {
-            $ledger = Join-Path $enrollmentDirectory 'enrollment.json'
-            $receipt = if (Test-Path -LiteralPath $ledger -PathType Leaf) { (Read-ExamLabProtectedJson $ledger).receipt }
-            if (-not $receipt) {
-                Add-InstallPhase 'pending-enrollment'
-                Save-InstallReport 'pending-enrollment.json' ([ordered]@{
-                    Release='@REVISION@'; LocalSoftwarePrepared=$true; RegistrationRequired=$true
-                })
-                Write-Host 'Local software preparation completed. Run Apply with network access to enroll this computer.'
-                exit 10
-            }
+        $enrollmentRecord = Read-ExamLabEnrollmentRecord $enrollmentDirectory '@ENROLLMENT_URL@'
+        if ($Offline -and ($null -eq $enrollmentRecord -or $null -eq $enrollmentRecord.receipt)) {
+            Add-InstallPhase 'pending-enrollment'
+            Save-InstallReport 'pending-enrollment.json' ([ordered]@{
+                Release='@REVISION@'; LocalSoftwarePrepared=$true; RegistrationRequired=$true
+            })
+            Write-Host 'Local software preparation completed. Run Apply with network access to enroll this computer.'
+            exit 10
         }
 
-        Add-InstallPhase 'enrollment-prerequisites'
-        Import-Module (Join-Path $package 'windows\ExamLab.psm1') -Function Get-ExamLabSetupAccountIssue -Scope Local -ErrorAction Stop
-        $ordinaryRoster = @(Get-ExamLabEnrollmentRoster)
+        Import-Module (Join-Path $package 'windows\ExamNetwork.psm1') -Scope Local -ErrorAction Stop
+        Import-Module (Join-Path $package 'windows\ExamLab.psm1') `
+            -Function Get-ExamLabSetupAccountIssue, Get-ExamLabGuestRosterEvidence -Scope Local -ErrorAction Stop
+        $ordinaryRoster = @(if ($null -eq $enrollmentRecord) { Get-ExamLabEnrollmentRoster }
+            else {
+                $previouslyPrepared = Test-ExamLabPreviouslyPreparedEnrollment $enrollmentRecord '@CONTROLLER_URL@'
+                Get-ExamLabEnrollmentRoster -SavedOrdinaryAccounts $enrollmentRecord.ordinaryAccounts `
+                    -PreviouslyPrepared:$previouslyPrepared
+            })
         Add-InstallPhase 'begin-system-changes'
         Start-ExamLabInstallChanges
         $systemChanges = $true
         Add-InstallPhase 'verify-certificate-trust'
         Set-ExamLabRootTrust $ownership $examLabStartCertificates
         Add-InstallPhase 'enroll-pc'
-        Import-Module (Join-Path $package 'windows\ExamNetwork.psm1') -Scope Local -ErrorAction Stop
         $enrollment = Get-ExamLabEnrollmentInputs $enrollmentDirectory '@ENROLLMENT_URL@' '@CONTROLLER_URL@' $ordinaryRoster
         $pcPath = $enrollment.ComputerConfigPath
         $registrationPath = $enrollment.RegistrationPath

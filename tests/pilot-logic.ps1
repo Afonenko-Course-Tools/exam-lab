@@ -177,6 +177,50 @@ try {
         throw 'FAIL: исключение roster должно действовать только для точного наблюдённого SID'
     }
     'PASS: исключение roster действует только на подтверждённый SID наблюдаемого сеанса'
+    $inactive = [pscustomobject]@{Name='shpctac0ffee'; SID=$guest.SID; Enabled=$false}
+    $similar = [pscustomobject]@{Name='SHPCTAC0FFEF'; SID=$other.SID; Enabled=$false}
+    $profile = [pscustomobject]@{SID=$inactive.SID.Value; Loaded=$false; Special=$false}
+    function Assert-InactiveGuestEvidence([bool]$Expected, [object[]]$Profiles, [int]$CreationCount) {
+        $allowed = & $module { param($Account,$Profiles,$Count) Test-ExamLabInactiveGuestEvidence $Account $Profiles $Count } `
+            $inactive $Profiles $CreationCount
+        if ($allowed -ne $Expected) { throw 'FAIL подтверждение неактивного Guest' }
+    }
+    if (-not (& $module { param($Account) Test-ExamLabInactiveGuestAccount $Account } $inactive) -or
+        (& $module { param($Account) Test-ExamLabInactiveGuestAccount $Account } $similar)) {
+        throw 'FAIL неактивный Guest требует канонического регистра имени'
+    }
+    $inactive.Enabled = $true
+    if (& $module { param($Account) Test-ExamLabInactiveGuestAccount $Account } $inactive) {
+        throw 'FAIL неактивный Guest не может быть включён'
+    }
+    $inactive.Enabled = $false
+    Assert-InactiveGuestEvidence $true @($profile) 1
+    Assert-InactiveGuestEvidence $false @($profile) 0
+    Assert-InactiveGuestEvidence $false @($profile) 2
+    Assert-InactiveGuestEvidence $false @() 1
+    Assert-InactiveGuestEvidence $false @($profile,$profile) 1
+    $profile.Loaded = $true
+    Assert-InactiveGuestEvidence $false @($profile) 1
+    $profile.Loaded = $false
+    $profile.SID = $similar.SID.Value
+    Assert-InactiveGuestEvidence $false @($profile) 1
+    $prefixOnly = New-AccountData 'S-1-5-21-1-2-3-1004' 'shpctac-teacher'
+    $identified = @(Get-ExamLabGuestRosterEvidence -LocalAccounts @($student,$inactive,$similar,$prefixOnly) -OrdinaryAccounts @() -IdentifyOnly)
+    if ($identified.Count -ne 2 -or @($identified | Where-Object VerifiedInactive).Count) {
+        throw 'FAIL первая регистрация выявляет только точную форму Guest с любым регистром'
+    }
+    $repeatRoster = @([pscustomobject]@{Sid=$inactive.SID.Value; Name=$inactive.Name})
+    $notDeclared = @(Get-ExamLabGuestRosterEvidence -LocalAccounts @($inactive,$similar) -OrdinaryAccounts $repeatRoster -IdentifyOnly)
+    if ($notDeclared.Count -ne 1 -or $notDeclared[0].Sid -cne $similar.SID.Value) {
+        throw 'FAIL ранее сохранённая обычная учётная запись не является остатком Guest'
+    }
+    $rosterException = & $module {param($c,$a,$sid) Test-LiveRoster $c $a -InactiveGuestSids @($sid) -AllowDrift} `
+        $rosterConfig @($student,$inactive,$similar) $inactive.SID.Value
+    if (-not $rosterException.IdentityUnconfirmed -or $rosterException.UnlistedAccounts.Count -ne 1 -or
+        $rosterException.UnlistedAccounts[0].Sid -cne $similar.SID.Value) {
+        throw 'FAIL только точный подтверждённый остаток исключается из списка расхождений'
+    }
+    'PASS остаточный Guest: отключённое каноническое имя, единственные профиль и событие, неизменный ordinary roster.'
     $setupAccount = [pscustomobject]@{Name='defaultuser0'; SID=$guest.SID; Enabled=$false}
     function Assert-SetupAccount([bool]$Expected) {
         $accepted = & $module { param($Account) Test-ExamLabSetupAccount $Account } $setupAccount
@@ -227,8 +271,20 @@ try {
     'PASS SharedPC unset: all-null принят, configured 0/false отклонены без default/coercion'
     $target=[pscustomobject]@{State='Observed';Instance=[pscustomobject]@{EnableSharedPCMode=$true;EnableAccountManager=$true;AccountModel=2;DeletionPolicy=0;SetEduPolicies=$false;SetPowerPolicies=$false;RestrictLocalStorage=$false}}
     if (-not (& $module {param($s) Test-SharedPCTarget $s} $target)) { throw 'FAIL explicit SharedPC target.' }
+    $mdmDenied = [pscustomobject]@{State='Unknown'; Count=$null; AccessDenied=$true}
+    $mdmUnavailable = [pscustomobject]@{State='Unknown'; Count=$null; AccessDenied=$false}
+    $mdmNoInstance = [pscustomobject]@{State='Unknown'; Count=0; AccessDenied=$false}
+    if (-not (& $module { param($s) Test-SharedPCGuestRosterReady $s } $target) -or
+        (& $module { param($s) Test-SharedPCGuestRosterReady $s } $mdmDenied) -or
+        -not (& $module { param($s) Test-SharedPCGuestRosterReady $s -PreviouslyPrepared } $mdmDenied) -or
+        (& $module { param($s) Test-SharedPCGuestRosterReady $s -PreviouslyPrepared } $mdmUnavailable) -or
+        (& $module { param($s) Test-SharedPCGuestRosterReady $s -PreviouslyPrepared } $mdmNoInstance)) {
+        throw 'FAIL сохранённая подготовка заменяет только подтверждённый отказ доступа к WMI Bridge'
+    }
     $target.Instance.DeletionPolicy=$null
-    if (& $module {param($s) Test-SharedPCTarget $s} $target) { throw 'FAIL target DeletionPolicy null не является выбранным0.' }
+    if (& $module {param($s) Test-SharedPCGuestRosterReady $s -PreviouslyPrepared} $target) {
+        throw 'FAIL сохранённая подготовка не заменяет прочитанное расхождение Shared PC'
+    }
     'PASS SharedPC target: explicit0 принят, null не приводится к0'
     $missing=Join-Path $temporary 'missing.json'
     if (& $module {param($p) Test-ExistingFile $p} $missing) { throw 'FAIL missing file должен быть absent.' }
@@ -290,9 +346,11 @@ try {
     $setupGuards=@($readContext.FindAll({param($n)
         $n -is [Management.Automation.Language.IfStatementAst] -and
         $n.Clauses[0].Item1.Extent.Text -eq '-not $AllowRosterDriftOnlyForNormal' -and
-        @(Get-CommandNodes $n.Clauses[0].Item2 'Get-ExamLabSetupAccountIssue').Count -eq 1
+        @(Get-CommandNodes $n.Clauses[0].Item2 'Get-ExamLabSetupAccountIssue').Count -eq 1 -and
+        @(Get-CommandNodes $n.Clauses[0].Item2 'Get-ExamLabGuestRosterEvidence').Count -eq 1
     },$true))
-    if ($setupGuards.Count -ne 1 -or @(Get-CommandNodes $readContext.Body 'Get-ExamLabSetupAccountIssue').Count -ne 1) {
+    if ($setupGuards.Count -ne 1 -or @(Get-CommandNodes $readContext.Body 'Get-ExamLabSetupAccountIssue').Count -ne 1 -or
+        @(Get-CommandNodes $readContext.Body 'Get-ExamLabGuestRosterEvidence').Count -ne 1) {
         throw 'FAIL Setup/OOBE проверяется только на строгом пути, автономный normal доступен.'
     }
     $observe=Get-FunctionNode $mainAst 'Get-ExamLabControllerObservation'

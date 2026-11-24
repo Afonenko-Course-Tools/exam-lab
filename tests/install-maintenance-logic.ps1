@@ -73,6 +73,25 @@ try {
         return $script:setupAccountIssue
     }
 
+    # Подменяется только классификация Guest. Результат её использования и файлы регистрации настоящие.
+    $script:verifiedInactiveGuestSids = @()
+    $script:guestIdentifyOnly = $false
+    $script:guestPreviouslyPrepared = $false
+    function Get-ExamLabGuestRosterEvidence([object[]]$LocalAccounts, [object[]]$OrdinaryAccounts,
+        [switch]$IdentifyOnly, [switch]$PreviouslyPrepared) {
+        $script:guestIdentifyOnly = [bool]$IdentifyOnly
+        $script:guestPreviouslyPrepared = [bool]$PreviouslyPrepared
+        $declared = @($OrdinaryAccounts | ForEach-Object Sid)
+        foreach ($candidate in $LocalAccounts) {
+            if ($candidate.Name -like 'shpctac*' -and $candidate.Sid.Value -notin $declared) {
+                [pscustomobject]@{
+                    Sid=$candidate.Sid.Value
+                    VerifiedInactive=(-not $IdentifyOnly -and $candidate.Sid.Value -in $script:verifiedInactiveGuestSids)
+                }
+            }
+        }
+    }
+
     $ordinary = [pscustomobject]@{ Sid=[pscustomobject]@{ Value='S-1-5-21-1-2-3-1001' }; Name='Обычный пользователь'; Enabled=$false }
     $placeholder = [pscustomobject]@{ Sid=[pscustomobject]@{ Value='S-1-5-21-1-2-3-1002' }; Name='defaultuser0'; Enabled=$false }
     $script:fakeUsers = @($ordinary, $placeholder)
@@ -95,6 +114,17 @@ try {
     $examLabStatePath = $temporary
     $stateDirectory = Join-Path $temporary 'Enrollment'
     $script:ledgerPath = Join-Path $stateDirectory 'enrollment.json'
+    $guest1 = [pscustomobject]@{ Sid=[pscustomobject]@{ Value='S-1-5-21-1-2-3-1003' }; Name='shpctac012ab'; Enabled=$false }
+    $guest2 = [pscustomobject]@{ Sid=[pscustomobject]@{ Value='S-1-5-21-1-2-3-1004' }; Name='shpctac012ac'; Enabled=$false }
+    $script:fakeUsers = @($ordinary, $placeholder, $guest1)
+    $script:verifiedInactiveGuestSids = @($guest1.Sid.Value)
+    $firstGuestRejected = $false
+    try { $null = Get-ExamLabEnrollmentRoster }
+    catch { $firstGuestRejected = $_.Exception.Message -like '*First ExamLab enrollment*Shared PC account*' }
+    Assert-Expected ($firstGuestRejected -and $script:guestIdentifyOnly -and -not $script:guestPreviouslyPrepared -and
+        -not (Test-Path -LiteralPath $stateDirectory)) $true `
+        'отказа первой регистрации при незакреплённом кандидате Guest без записи реестра регистрации'
+    $script:fakeUsers = @($ordinary, $placeholder)
     $script:postClaims = [Collections.Generic.List[string]]::new()
     $script:pollUrl = 'https://192.0.2.10:21650/exam/v1/poll'
     $enrollmentUrl = 'https://192.0.2.10:21650/install/enroll'
@@ -129,6 +159,57 @@ try {
     $configuration = Read-ExamLabProtectedJson $repeat.ComputerConfigPath
     Assert-Expected ($configuration.OrdinaryAccounts.Count -eq 2 -and
         $configuration.OrdinaryAccounts[1].Sid -ceq $placeholder.Sid.Value) $true 'сохранения SID defaultuser0 в pc.json'
+    $ledgerHash = (Get-FileHash -LiteralPath $script:ledgerPath).Hash
+    $savedEnrollment = Read-ExamLabEnrollmentRecord $stateDirectory $enrollmentUrl
+    Assert-Expected (Test-ExamLabPreviouslyPreparedEnrollment $savedEnrollment $script:pollUrl) $false 'отсутствия state proof'
+    $installedConfiguration = Join-Path $examLabStatePath 'pc.json'
+    $modePath = Join-Path $examLabStatePath 'mode.json'
+    [IO.File]::Copy($repeat.ComputerConfigPath, $installedConfiguration)
+    $metadata = [ordered]@{ Prepared=$true; Revision=('F' * 64); LastCompletedMode='normal' }
+    Write-ExamLabMaintenanceJson $modePath $metadata
+    Assert-Expected (Test-ExamLabPreviouslyPreparedEnrollment $savedEnrollment $script:pollUrl) $false 'несовпадающего SHA-256 pc.json'
+    $metadata.Revision = $computerHash
+    Write-ExamLabMaintenanceJson $modePath $metadata
+    $previouslyPrepared = Test-ExamLabPreviouslyPreparedEnrollment $savedEnrollment $script:pollUrl
+    Assert-Expected $previouslyPrepared $true 'валидного receipt и подтверждённого прежнего prepare'
+    $metadata.LastCompletedMode = 'exam'
+    Write-ExamLabMaintenanceJson $modePath $metadata
+    Assert-Expected (Test-ExamLabPreviouslyPreparedEnrollment $savedEnrollment $script:pollUrl) $true 'прежнего prepare при сохранённом режиме exam'
+    $metadata.LastCompletedMode = 'normal'
+    Write-ExamLabMaintenanceJson $modePath $metadata
+    $invalidReceipt = [pscustomobject]@{ receipt=$null; ordinaryAccounts=$savedEnrollment.ordinaryAccounts }
+    Assert-Expected (Test-ExamLabPreviouslyPreparedEnrollment $invalidReceipt $script:pollUrl) $false 'отсутствия receipt'
+    $modifiedConfig = Read-ExamLabProtectedJson $installedConfiguration
+    $modifiedConfig.OrdinaryAccounts[0].Name = 'Чужой список'
+    Write-ExamLabMaintenanceJson $installedConfiguration $modifiedConfig
+    $metadata.Revision = (Get-FileHash -LiteralPath $installedConfiguration).Hash
+    Write-ExamLabMaintenanceJson $modePath $metadata
+    Assert-Expected (Test-ExamLabPreviouslyPreparedEnrollment $savedEnrollment $script:pollUrl) $false 'несовпадающего roster с правильным SHA-256'
+    [IO.File]::Copy($repeat.ComputerConfigPath, $installedConfiguration, $true)
+    $metadata.Revision = $computerHash
+    Write-ExamLabMaintenanceJson $modePath $metadata
+    $script:fakeUsers = @($ordinary, $placeholder, $guest1, $guest2)
+    $script:verifiedInactiveGuestSids = @($guest1.Sid.Value, $guest2.Sid.Value)
+    $verifiedRoster = @(Get-ExamLabEnrollmentRoster -SavedOrdinaryAccounts $savedEnrollment.ordinaryAccounts `
+        -PreviouslyPrepared:$previouslyPrepared)
+    $repeatWithGuests = Get-ExamLabEnrollmentInputs $stateDirectory $enrollmentUrl $script:pollUrl $verifiedRoster
+    Assert-Expected (-not $script:guestIdentifyOnly -and $script:guestPreviouslyPrepared -and $verifiedRoster.Count -eq 2 -and
+        $script:postClaims.Count -eq 2 -and (Get-FileHash -LiteralPath $script:ledgerPath).Hash -ceq $ledgerHash -and
+        (Get-FileHash -LiteralPath $repeatWithGuests.ComputerConfigPath).Hash -ceq $computerHash) $true `
+        'повтора с подтверждёнными Guest и сохранения реестра регистрации и pc.json'
+
+    $script:verifiedInactiveGuestSids = @($guest1.Sid.Value)
+    $unknownRejected = $false
+    try { $null = Get-ExamLabEnrollmentRoster -SavedOrdinaryAccounts $savedEnrollment.ordinaryAccounts }
+    catch { $unknownRejected = $_.Exception.Message -like '*1004*could not be verified as inactive*' }
+    Assert-Expected $unknownRejected $true 'отказа при неподтверждённом Guest'
+
+    $renamedOrdinary = [pscustomobject]@{ Sid=$ordinary.Sid; Name='Переименованный пользователь'; Enabled=$false }
+    $script:fakeUsers = @($renamedOrdinary, $placeholder, $guest1)
+    $renamedRejected = $false
+    try { $null = Get-ExamLabEnrollmentRoster -SavedOrdinaryAccounts $savedEnrollment.ordinaryAccounts }
+    catch { $renamedRejected = $_.Exception.Message -like '*differ from the saved ExamLab roster*' }
+    Assert-Expected $renamedRejected $true 'отказа при переименованной обычной учётке до регистрации'
     $script:fakeUsers = @($ordinary)
     $changedRoster = @(Get-ExamLabEnrollmentRoster)
     $driftRejected = $false

@@ -10,6 +10,7 @@ $script:ControllerStateFile = Join-Path $script:DataRoot 'controller-state.json'
 $script:ControllerHealthFile = Join-Path $script:DataRoot 'controller-health.json'
 $script:ControllerProbeOptIn = Join-Path $script:DataRoot 'controller-policy-probe.enabled'
 $script:ControllerProbeStatusFile = Join-Path $script:DataRoot 'controller-policy-probe.json'
+$script:SharedPcGuestName = '\Ashpctac[0-9a-f]{5}\z'
 Import-Module (Join-Path $PSScriptRoot 'ExamLab.Controller.psm1')
 $script:Namespace = 'root\cimv2\mdm\dmmap'
 $script:LoadedSourceHash = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash
@@ -113,7 +114,7 @@ function Test-DeclaredConfig {
 }
 
 function Test-LiveRoster {
-    param($Config, [object[]]$LocalAccounts, [switch]$AllowDrift, [string]$ObservedGuestSid)
+    param($Config, [object[]]$LocalAccounts, [switch]$AllowDrift, [string]$ObservedGuestSid, [string[]]$InactiveGuestSids)
     $missing=@(); $renamed=@()
     foreach ($account in @($Config.OrdinaryAccounts)) {
         $actual=@($LocalAccounts | Where-Object {$_.SID.Value -ceq $account.Sid})
@@ -123,10 +124,10 @@ function Test-LiveRoster {
             $renamed += [pscustomobject]@{Sid=$account.Sid; DeclaredName=$account.Name; ActualName=$actual[0].Name}
         }
     }
-    # Только наблюдение готовности исключает уже проверенный текущий Guest.
+    # Исключения действуют только для наблюдённого Guest и доказанных неактивных остатков.
     $declared=@($Config.OrdinaryAccounts | ForEach-Object {$_.Sid})
     $unlisted=@($LocalAccounts | Where-Object { [int]($_.SID.Value.Split('-')[-1]) -ge 1000 -and
-        $_.SID.Value -notin $declared -and $_.SID.Value -cne $ObservedGuestSid } |
+        $_.SID.Value -notin $declared -and $_.SID.Value -cne $ObservedGuestSid -and $_.SID.Value -cnotin $InactiveGuestSids } |
         ForEach-Object {[pscustomobject]@{Sid=$_.SID.Value; Name=$_.Name}})
     $unconfirmed=($missing.Count -gt 0 -or $renamed.Count -gt 0 -or $unlisted.Count -gt 0)
     if ($unconfirmed -and -not $AllowDrift) { throw 'Локальный roster изменён: отсутствует SID, изменено имя или есть неописанный SID. Нужна отдельная административная проверка; список не расширяется автоматически.' }
@@ -179,8 +180,74 @@ function Get-ExamLabSetupAccountIssue([object[]]$LocalAccounts) {
     } catch { return 'Состояние установки Windows или профиля defaultuser0 недоступно для чтения.' }
 }
 
+function Get-ExamLabGuestCreationEvent([string]$Sid, [string]$Name, [int]$MaxEvents = 1) {
+    if ($Sid -cnotmatch '\AS-1-5-21-[0-9]+-[0-9]+-[0-9]+-[0-9]+\z' -or
+        $Name -cnotmatch $script:SharedPcGuestName) { return }
+    $filter = "*[System[Provider[@Name='Microsoft-Windows-Security-Auditing'] and EventID=4720] and " +
+        "EventData[Data[@Name='TargetSid']='$Sid' and Data[@Name='TargetUserName']='$Name' and Data[@Name='SubjectUserSid']='S-1-5-18']]"
+    $readError = if ($MaxEvents -gt 1) { 'Stop' } else { 'SilentlyContinue' }
+    Get-WinEvent -LogName Security -FilterXPath $filter -MaxEvents $MaxEvents -ErrorAction $readError
+}
+
+function Test-ExamLabInactiveGuestAccount($Account) {
+    $sid = [regex]::Match($Account.SID.Value, '\AS-1-5-21-[0-9]+-[0-9]+-[0-9]+-(?<Rid>[0-9]+)\z')
+    [uint32]$rid = 0
+    return ($Account.Name -cmatch $script:SharedPcGuestName -and $Account.Enabled -is [bool] -and -not $Account.Enabled -and
+        $sid.Success -and [uint32]::TryParse($sid.Groups['Rid'].Value, [ref]$rid) -and $rid -ge 1000)
+}
+
+function Test-ExamLabInactiveGuestEvidence($Account, [object[]]$Profiles, [int]$CreationCount) {
+    if ($CreationCount -ne 1 -or $Profiles.Count -ne 1) { return $false }
+    $profile = $Profiles[0]
+    $loaded = $profile.PSObject.Properties['Loaded']
+    $special = $profile.PSObject.Properties['Special']
+    return ($profile.SID -ceq $Account.SID.Value -and $loaded -and $loaded.Value -is [bool] -and -not $loaded.Value -and
+        $special -and $special.Value -is [bool] -and -not $special.Value)
+}
+
+function Get-ExamLabGuestRosterEvidence([object[]]$LocalAccounts, [object[]]$OrdinaryAccounts, [switch]$IdentifyOnly, [switch]$PreviouslyPrepared, $ObservedGuest) {
+    $declared = @(foreach ($account in $OrdinaryAccounts) { $account.Sid })
+    $observedSid = if ($ObservedGuest) { $ObservedGuest.Sid }
+    $candidates = @($LocalAccounts | Where-Object {
+        $_.Name -match $script:SharedPcGuestName -and $_.SID.Value -cnotin $declared -and $_.SID.Value -cne $observedSid
+    })
+    if (-not $candidates.Count) { return }
+
+    $verified = @()
+    if (-not $IdentifyOnly) {
+        # При недоступном WTS, MDM или SAM все кандидаты остаются расхождениями.
+        try {
+            $eligible = @($candidates | Where-Object { Test-ExamLabInactiveGuestAccount $_ })
+            $observedName = if ($ObservedGuest) {
+                $observed = @($LocalAccounts | Where-Object { $_.SID.Value -ceq $observedSid })
+                if ($observed.Count -eq 1 -and $observed[0].Name -cmatch $script:SharedPcGuestName) { $observed[0].Name }
+            }
+            if ($eligible.Count -and (-not $ObservedGuest -or $observedName) -and
+                (Test-SharedPCGuestRosterReady (Get-SharedPCState) -PreviouslyPrepared:($PreviouslyPrepared -and -not $ObservedGuest)) -and
+                (Test-ControllerNoGuestSession $ObservedGuest $observedName)) {
+                $admins = @(Get-LocalGroupMember -SID 'S-1-5-32-544' -ErrorAction Stop | ForEach-Object { $_.SID.Value })
+                # Для WQL ниже используются только SID, проверенные Test-ExamLabInactiveGuestAccount.
+                $profileFilter = ($eligible | ForEach-Object { "SID='$($_.SID.Value)'" }) -join ' OR '
+                $profileSnapshot = @(Get-CimInstance Win32_UserProfile -Filter $profileFilter -ErrorAction Stop)
+                $verified = @(foreach ($account in $eligible) {
+                    $sid = $account.SID.Value
+                    if ($sid -cin $admins) { continue }
+                    $exemption = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\Microsoft\Windows\CurrentVersion\SharedPC\Exemptions\'+$sid)
+                    if ($exemption) { $exemption.Dispose(); continue }
+                    $profiles = @($profileSnapshot | Where-Object SID -ceq $sid)
+                    $creations = @(Get-ExamLabGuestCreationEvent $sid $account.Name 2)
+                    if (Test-ExamLabInactiveGuestEvidence $account $profiles $creations.Count) { $sid }
+                })
+            }
+        } catch { $verified = @() }
+    }
+    foreach ($candidate in $candidates) {
+        [pscustomobject]@{ Sid=$candidate.SID.Value; VerifiedInactive=($candidate.SID.Value -cin $verified) }
+    }
+}
+
 function Read-Context {
-    param([switch]$AllowRosterDriftOnlyForNormal, [string]$ObservedGuestSid)
+    param([switch]$AllowRosterDriftOnlyForNormal, $ObservedGuest)
     Assert-Host
     if ($PSScriptRoot -ne $script:CodeRoot -or
         (Get-FileHash -LiteralPath (Join-Path $script:CodeRoot 'ExamLab.psm1') -Algorithm SHA256).Hash -cne $script:LoadedSourceHash) {
@@ -206,11 +273,16 @@ function Read-Context {
     }
     # Ошибка чтения SAM остаётся отказом; только успешная enumeration даёт drift.
     $localAccounts=@(Get-LocalUser -ErrorAction Stop)
+    $observedSid = if ($ObservedGuest) { $ObservedGuest.Sid }
+    $inactiveGuestSids = @()
     if (-not $AllowRosterDriftOnlyForNormal) {
         $setupAccountIssue = Get-ExamLabSetupAccountIssue -LocalAccounts $localAccounts
         if ($setupAccountIssue) { throw $setupAccountIssue }
+        $inactiveGuestSids = @(Get-ExamLabGuestRosterEvidence -LocalAccounts $localAccounts `
+            -OrdinaryAccounts $config.OrdinaryAccounts -ObservedGuest $ObservedGuest | Where-Object VerifiedInactive | ForEach-Object Sid)
     }
-    $roster=Test-LiveRoster $config $localAccounts -AllowDrift:$AllowRosterDriftOnlyForNormal -ObservedGuestSid $ObservedGuestSid
+    $roster=Test-LiveRoster $config $localAccounts -AllowDrift:$AllowRosterDriftOnlyForNormal `
+        -ObservedGuestSid $observedSid -InactiveGuestSids $inactiveGuestSids
     $lgpo=Join-Path $script:CodeRoot 'LGPO.exe'
     if ((Get-FileHash -LiteralPath $lgpo -Algorithm SHA256).Hash -ne '0C97F29543418B30340C4FF5D930D31E6196DD59C2CC74B6B890FA7B90C910C7') { throw 'Неизвестный LGPO.exe.' }
     $signature=Get-AuthenticodeSignature -LiteralPath $lgpo
@@ -225,9 +297,14 @@ function Read-Context {
 function Get-SharedPCState {
     try {
         $instances=@(Get-CimInstance -Namespace $script:Namespace -ClassName MDM_SharedPC)
-        if ($instances.Count -ne 1) { return [pscustomobject]@{ State='Unknown'; Count=$instances.Count; Instance=$null; Reason="MDM_SharedPC instances=$($instances.Count)" } }
-        [pscustomobject]@{ State='Observed'; Count=1; Instance=$instances[0]; Reason=$null }
-    } catch { [pscustomobject]@{ State='Unknown'; Count=$null; Instance=$null; Reason=$_.Exception.Message } }
+        if ($instances.Count -ne 1) { return [pscustomobject]@{ State='Unknown'; Count=$instances.Count; Instance=$null; Reason="MDM_SharedPC instances=$($instances.Count)"; AccessDenied=$false } }
+        [pscustomobject]@{ State='Observed'; Count=1; Instance=$instances[0]; Reason=$null; AccessDenied=$false }
+    } catch {
+        $accessDenied = $_.Exception -is [Microsoft.Management.Infrastructure.CimException] -and
+            ($_.Exception.NativeErrorCode -eq [Microsoft.Management.Infrastructure.NativeErrorCode]::AccessDenied -or
+                $_.CategoryInfo.Category -eq [Management.Automation.ErrorCategory]::PermissionDenied)
+        [pscustomobject]@{ State='Unknown'; Count=$null; Instance=$null; Reason=$_.Exception.Message; AccessDenied=$accessDenied }
+    }
 }
 
 function Get-ComponentStatus {
@@ -247,6 +324,13 @@ function Test-SharedPCTarget {
     return ($i.EnableSharedPCMode -eq $true -and $i.EnableAccountManager -eq $true -and
         [int]$i.AccountModel -eq 2 -and $null -ne $i.DeletionPolicy -and [int]$i.DeletionPolicy -eq 0 -and
         $i.SetEduPolicies -eq $false -and $i.SetPowerPolicies -eq $false -and $i.RestrictLocalStorage -eq $false)
+}
+
+function Test-SharedPCGuestRosterReady($Shared, [switch]$PreviouslyPrepared) {
+    if (Test-SharedPCTarget $Shared) { return $true }
+    # Только повторная установка вправе опереться на собственную проверенную подготовку,
+    # когда повышенному администратору закрыт SYSTEM-раздел WMI Bridge.
+    return ($PreviouslyPrepared -and $Shared.State -ceq 'Unknown' -and $null -eq $Shared.Count -and $Shared.AccessDenied)
 }
 
 function Test-SharedPCUnset {
@@ -735,13 +819,11 @@ function Get-ExamLabActiveGuest([DateTime]$Boot) {
     $account = Get-LocalUser -SID ([Security.Principal.SecurityIdentifier]::new($logon.Sid))
     # Префикс наблюдался у временных учётных записей на эталонной Windows.
     # Запись аудита дополнительно связывает имя и SID с созданием от SYSTEM.
-    if (-not $account.Enabled -or $account.Name -cnotmatch '\Ashpctac[0-9a-f]{5}\z' -or
+    if (-not $account.Enabled -or $account.Name -cnotmatch $script:SharedPcGuestName -or
         $logon.Sid -cin @(Get-LocalGroupMember -SID 'S-1-5-32-544' | ForEach-Object {$_.SID.Value})) {
         return [pscustomobject]@{Logon=$null; Status='GuestAccountUnconfirmed'}
     }
-    $filter = "*[System[Provider[@Name='Microsoft-Windows-Security-Auditing'] and EventID=4720] and " +
-        "EventData[Data[@Name='TargetSid']='$($logon.Sid)' and Data[@Name='TargetUserName']='$($account.Name)' and Data[@Name='SubjectUserSid']='S-1-5-18']]"
-    $created = Get-WinEvent -LogName Security -FilterXPath $filter -MaxEvents 1 -ErrorAction SilentlyContinue
+    $created = Get-ExamLabGuestCreationEvent $logon.Sid $account.Name
     if (-not $created -or $created.TimeCreated.ToUniversalTime() -lt $Boot) {
         return [pscustomobject]@{Logon=$null; Status='GuestCreationUnconfirmed'}
     }
@@ -749,8 +831,7 @@ function Get-ExamLabActiveGuest([DateTime]$Boot) {
 }
 
 function Get-ExamLabControllerPolicyReadback($Guest) {
-    $guestSid = if ($Guest) { $Guest.Sid }
-    $context = Read-Context -ObservedGuestSid $guestSid
+    $context = Read-Context -ObservedGuest $Guest
     $status = Get-Status $context
     $usb = $status.Components.Usb
     if ($status.Prepared -and $usb.State -ceq 'Applied' -and $usb.OwnSourceEntries -eq 1 -and
@@ -1032,4 +1113,4 @@ if ($PSScriptRoot -eq $script:CodeRoot) {
     $script:FileTraceLoaded = $true
 }
 
-Export-ModuleMember -Function Get-ExamLabStatus,Initialize-ExamLab,Set-ExamLabMode,Invoke-ExamLabControllerLoop,Get-ExamLabControllerGuestBinding,Invoke-ExamLabFileTraceProbe,Test-ExamLabFileTraceNormal,Get-ExamLabSetupAccountIssue
+Export-ModuleMember -Function Get-ExamLabStatus,Initialize-ExamLab,Set-ExamLabMode,Invoke-ExamLabControllerLoop,Get-ExamLabControllerGuestBinding,Invoke-ExamLabFileTraceProbe,Test-ExamLabFileTraceNormal,Get-ExamLabSetupAccountIssue,Get-ExamLabGuestRosterEvidence
