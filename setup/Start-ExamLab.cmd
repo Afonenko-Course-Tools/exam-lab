@@ -2,10 +2,7 @@
 setlocal EnableExtensions DisableDelayedExpansion
 set "ERRORLEVEL="
 set "EXAMLAB_LAUNCHER=%~f0"
-set "EXAMLAB_ARG1=%~1"
-set "EXAMLAB_ARG2=%~2"
-set "EXAMLAB_ARG3=%~3"
-set "EXAMLAB_ARG4=%~4"
+@BOOTSTRAP_ARGUMENTS@
 set "NATIVE=%SystemRoot%\System32"
 if exist "%SystemRoot%\Sysnative\WindowsPowerShell\v1.0\powershell.exe" set "NATIVE=%SystemRoot%\Sysnative"
 "%NATIVE%\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "try { $launcherText = [IO.File]::ReadAllText($env:EXAMLAB_LAUNCHER); $script = ($launcherText -split '(?m)^:NativePowerShell\r?$', 2)[1]; . ([ScriptBlock]::Create($script)) } catch { [Console]::Error.WriteLine($_.ToString()); exit 1 }"

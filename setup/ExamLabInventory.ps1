@@ -74,7 +74,10 @@ function VersionText($Value) {
 $driveTypes = @{0='неизвестно';1='нет корня';2='съёмный';3='локальный';5='оптический';6='RAM-диск'}
 $bus = @{0='неизвестно';1='SCSI';2='ATAPI';3='ATA';4='IEEE 1394';6='Fibre Channel';7='USB';8='RAID';9='iSCSI';10='SAS';11='SATA';12='SD';13='MMC';14='виртуальный';15='файловый виртуальный';16='Storage Spaces';17='NVMe';18='SCM';19='UFS'}
 $styles = @{0='RAW';1='MBR';2='GPT'}
-$media = @{1='Wi-Fi';8='Wi-Fi';9='Wi-Fi';10='Bluetooth';14='Ethernet';15='проводной другой';16='беспроводной другой';17='WiMAX';18='мобильный';19='мобильный'}
+$media = @{
+    1='Wi-Fi'; 8='беспроводная WAN'; 9='Wi-Fi'; 10='Bluetooth'; 12='WiMAX'; 14='Ethernet'
+    15='Token Ring'; 16='IrDA'; 17='проводная WAN'; 18='проводная CoWAN'; 19='другой'
+}
 
 $lines = @(
     'ExamLab — инвентаризация Windows'

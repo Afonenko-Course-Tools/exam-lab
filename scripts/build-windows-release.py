@@ -204,7 +204,8 @@ def main():
     tools_url = f"{base}/exam-lab-{revision}/tools"
     tools_pins = ";\n        ".join(f"'{name}' = '{pin}'" for name, pin in tools_hashes.items())
     cmd = git("show", f"{revision}:setup/Start-ExamLab.cmd").decode("ascii")
-    if args.check_launcher and "@CHECK_ONLY@" not in cmd:
+    check_markers = "@CHECK_ONLY@", "@BOOTSTRAP_ARGUMENTS@", "@INVENTORY_PAYLOAD@"
+    if args.check_launcher and not all(marker in cmd for marker in check_markers):
         parser.error("--check-launcher требует ревизию с поддержкой входа Check")
     include_expanded_sizes = "@BUNDLE_EXPANDED_BYTES@" in cmd
     bootstrap_tools = []
@@ -290,9 +291,14 @@ def main():
         inventory = git("show", f"{revision}:setup/ExamLabInventory.ps1")
         cmd_substitutions["INVENTORY_PAYLOAD"] = bootstrap_payload("INVENTORY", inventory)
         cmd_substitutions["CHECK_ONLY"] = "$false"
+        cmd_substitutions["BOOTSTRAP_ARGUMENTS"] = "\n".join(
+            f'set "EXAMLAB_ARG{number}=%~{number}"' for number in range(1, 5)
+        )
     launcher_bytes = render_cmd(cmd, cmd_substitutions)
     if args.check_launcher:
-        check_launcher_bytes = render_cmd(cmd, {**cmd_substitutions, "CHECK_ONLY": "$true"})
+        check_launcher_bytes = render_cmd(cmd, {
+            **cmd_substitutions, "CHECK_ONLY": "$true", "BOOTSTRAP_ARGUMENTS": "",
+        })
     args.output.mkdir(parents=True, exist_ok=True)
     (args.output / filename).write_bytes(bundle)
     (args.output / installer_name).write_bytes(installer_bytes)
