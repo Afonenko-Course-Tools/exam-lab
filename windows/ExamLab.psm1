@@ -133,6 +133,52 @@ function Test-LiveRoster {
     [pscustomobject]@{IdentityUnconfirmed=$unconfirmed; MissingAccounts=$missing; RenamedAccounts=$renamed; UnlistedAccounts=$unlisted}
 }
 
+function Test-ExamLabSetupAccount($Account) {
+    $sid = [regex]::Match($Account.SID.Value, '\AS-1-5-21-[0-9]+-[0-9]+-[0-9]+-(?<Rid>[0-9]+)\z')
+    [uint32]$rid = 0
+    return ($Account.Name -ceq 'defaultuser0' -and $Account.Enabled -is [bool] -and -not $Account.Enabled -and
+        $sid.Success -and [uint32]::TryParse($sid.Groups['Rid'].Value, [ref]$rid) -and $rid -ge 1000)
+}
+
+function Get-ExamLabSetupCompletionIssue($RegistryImageState, [string]$StateIni, $Setup, [object[]]$Profiles) {
+    $sections = @($StateIni -split '(?m)(?=^[ \t]*\[)' | Where-Object { $_ -match '\A[ \t]*\[State\][ \t]*\r?(?=\n|\z)' })
+    $fields = @(if ($sections.Count -eq 1) {
+        [regex]::Matches($sections[0], '(?im)^[ \t]*ImageState[ \t]*=[ \t]*(?<Value>[^\r\n]*)')
+    })
+    if ($RegistryImageState -isnot [string] -or $RegistryImageState -cne 'IMAGE_STATE_COMPLETE' -or $fields.Count -ne 1 -or
+        $fields[0].Groups['Value'].Value.Trim() -cnotin @('IMAGE_STATE_COMPLETE','"IMAGE_STATE_COMPLETE"')) {
+        return 'Завершение установки Windows при наличии defaultuser0 не подтверждено реестром и State.ini.'
+    }
+    foreach ($name in 'OOBEInProgress','SystemSetupInProgress','SetupType') {
+        $property = $Setup.PSObject.Properties[$name]
+        if (-not $property -or $property.Value -isnot [int] -or $property.Value -ne 0) {
+            return "При наличии defaultuser0 флаг установки Windows $name должен иметь значение DWORD 0."
+        }
+    }
+    $loaded = if ($Profiles.Count -eq 1) { $Profiles[0].PSObject.Properties['Loaded'] }
+    if ($Profiles.Count -gt 1 -or ($Profiles.Count -eq 1 -and
+        (-not $loaded -or $loaded.Value -isnot [bool] -or $loaded.Value))) {
+        return 'При наличии defaultuser0 его профиль загружен или состояние загрузки неизвестно.'
+    }
+}
+
+function Get-ExamLabSetupAccountIssue([object[]]$LocalAccounts) {
+    try {
+        $accounts = @($LocalAccounts | Where-Object Name -eq 'defaultuser0')
+        if ($accounts.Count -eq 0) { return }
+        if ($accounts.Count -ne 1 -or -not (Test-ExamLabSetupAccount $accounts[0])) {
+            return 'Учётная запись Windows defaultuser0 включена или её имя, SID либо состояние не подтверждены.'
+        }
+
+        $imageState = Get-ItemPropertyValue -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Setup\State' -Name ImageState -ErrorAction Stop
+        $stateIni = [IO.File]::ReadAllText((Join-Path ([Environment]::GetFolderPath('Windows')) 'Setup\State\State.ini'))
+        $setup = Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\Setup' -ErrorAction Stop
+        $sid = $accounts[0].SID.Value
+        $profiles = @(Get-CimInstance Win32_UserProfile -Filter "SID='$sid'" -ErrorAction Stop)
+        Get-ExamLabSetupCompletionIssue $imageState $stateIni $setup $profiles
+    } catch { return 'Состояние установки Windows или профиля defaultuser0 недоступно для чтения.' }
+}
+
 function Read-Context {
     param([switch]$AllowRosterDriftOnlyForNormal, [string]$ObservedGuestSid)
     Assert-Host
@@ -160,6 +206,10 @@ function Read-Context {
     }
     # Ошибка чтения SAM остаётся отказом; только успешная enumeration даёт drift.
     $localAccounts=@(Get-LocalUser -ErrorAction Stop)
+    if (-not $AllowRosterDriftOnlyForNormal) {
+        $setupAccountIssue = Get-ExamLabSetupAccountIssue -LocalAccounts $localAccounts
+        if ($setupAccountIssue) { throw $setupAccountIssue }
+    }
     $roster=Test-LiveRoster $config $localAccounts -AllowDrift:$AllowRosterDriftOnlyForNormal -ObservedGuestSid $ObservedGuestSid
     $lgpo=Join-Path $script:CodeRoot 'LGPO.exe'
     if ((Get-FileHash -LiteralPath $lgpo -Algorithm SHA256).Hash -ne '0C97F29543418B30340C4FF5D930D31E6196DD59C2CC74B6B890FA7B90C910C7') { throw 'Неизвестный LGPO.exe.' }
@@ -976,4 +1026,4 @@ if ($PSScriptRoot -eq $script:CodeRoot) {
     $script:FileTraceLoaded = $true
 }
 
-Export-ModuleMember -Function Get-ExamLabStatus,Initialize-ExamLab,Set-ExamLabMode,Invoke-ExamLabControllerLoop,Get-ExamLabControllerGuestBinding,Invoke-ExamLabFileTraceProbe,Test-ExamLabFileTraceNormal
+Export-ModuleMember -Function Get-ExamLabStatus,Initialize-ExamLab,Set-ExamLabMode,Invoke-ExamLabControllerLoop,Get-ExamLabControllerGuestBinding,Invoke-ExamLabFileTraceProbe,Test-ExamLabFileTraceNormal,Get-ExamLabSetupAccountIssue

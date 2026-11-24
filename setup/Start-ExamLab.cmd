@@ -452,6 +452,17 @@ function Invoke-Bootstrap {
             $bootCheck.Add('Windows Local Group Policy components are absent.')
         }
     }
+    $setupAccount = $null
+    $accountObservation = 'Unknown'
+    try {
+        $localAccounts = @(Get-LocalUser -ErrorAction Stop)
+        $placeholder = $localAccounts | Where-Object Name -eq 'defaultuser0'
+        if ($placeholder) {
+            $setupAccount = [pscustomobject]@{ Present=$true; Enabled=[bool]$placeholder.Enabled }
+            Write-Host 'Check: found the Windows Setup placeholder account. Enrollment will check Windows Setup state.'
+        } else { $setupAccount = [pscustomobject]@{ Present=$false; Enabled=$null } }
+        $accountObservation = 'Observed'
+    } catch { $accountObservation = "Unknown: $_" }
     $taskObservation = 'NotCheckedWithoutElevation'
     if ($admin) {
         try {
@@ -467,7 +478,10 @@ function Invoke-Bootstrap {
     }
     $check.Errors | ForEach-Object { Write-Host "Check: $_" }
     $bootCheck | ForEach-Object { Write-Host "Check: $_" }
-    [ordered]@{ Blockers=$bootCheck.ToArray(); NativeCheckExit=$checkExit; InstalledTasks=$taskObservation } | ConvertTo-Json |
+    [ordered]@{
+        Blockers=$bootCheck.ToArray(); NativeCheckExit=$checkExit; InstalledTasks=$taskObservation
+        LocalAccounts=$accountObservation; WindowsSetupAccount=$setupAccount
+    } | ConvertTo-Json |
         Set-Content -LiteralPath (Join-Path $report 'pilot-preflight.json') -Encoding UTF8
     if ($action -ne 'Verify' -and ($checkExit -ne 0 -or $bootCheck.Count)) {
         Write-Host "Check report: $report"

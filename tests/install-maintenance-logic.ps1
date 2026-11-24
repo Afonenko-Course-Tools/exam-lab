@@ -68,16 +68,23 @@ try {
     function Assert-ExamLabProtectedPath([string]$Path) { if (-not (Test-Path -LiteralPath $Path)) { throw 'Путь отсутствует.' } }
     function New-ExamLabPrivateDirectory([string]$Path) { [void][IO.Directory]::CreateDirectory($Path) }
     function Get-LocalUser { $script:fakeUsers }
+    function Get-ExamLabSetupAccountIssue([object[]]$LocalAccounts) {
+        $script:checkedSetupUsers = $LocalAccounts
+        return $script:setupAccountIssue
+    }
 
     $ordinary = [pscustomobject]@{ Sid=[pscustomobject]@{ Value='S-1-5-21-1-2-3-1001' }; Name='Обычный пользователь'; Enabled=$false }
     $placeholder = [pscustomobject]@{ Sid=[pscustomobject]@{ Value='S-1-5-21-1-2-3-1002' }; Name='defaultuser0'; Enabled=$false }
     $script:fakeUsers = @($ordinary, $placeholder)
+    $script:setupAccountIssue = 'Тестовый отказ Windows Setup для defaultuser0.'
     $blocked = $false
-    try { $null = Get-ExamLabEnrollmentRoster } catch { $blocked = $_.Exception.Message -like '*defaultuser0*' }
+    try { $null = Get-ExamLabEnrollmentRoster } catch { $blocked = $_.Exception.Message -ceq $script:setupAccountIssue }
     Assert-Expected $blocked $true 'незавершённой подготовки Windows'
-    $script:fakeUsers = @($ordinary)
+    Assert-Expected ($script:checkedSetupUsers.Count -eq 2) $true 'проверки текущего SAM'
+    $script:setupAccountIssue = $null
     $roster = @(Get-ExamLabEnrollmentRoster)
-    Assert-Expected ($roster.Count -eq 1 -and $roster[0].Name -ceq $ordinary.Name) $true 'отключённой обычной учётки'
+    Assert-Expected ($roster.Count -eq 2 -and $roster[0].Name -ceq $ordinary.Name -and
+        $roster[1].Name -ceq $placeholder.Name -and $roster[1].Sid -ceq $placeholder.Sid.Value) $true 'сохранения обеих отключённых учёток'
 
     $examLabStatePath = $temporary
     $stateDirectory = Join-Path $temporary 'Enrollment'
@@ -113,6 +120,15 @@ try {
     Assert-Expected ($script:postClaims.Count -eq 2 -and $script:postClaims[0] -ceq $script:postClaims[1]) $true 'повтора по тому же claim и локального повтора'
     Assert-Expected ((Test-Path -LiteralPath $repeat.RegistrationPath) -and
         (Get-FileHash -LiteralPath $repeat.ComputerConfigPath).Hash -ceq $computerHash) $true 'восстановления локального входного файла'
+    $configuration = Read-ExamLabProtectedJson $repeat.ComputerConfigPath
+    Assert-Expected ($configuration.OrdinaryAccounts.Count -eq 2 -and
+        $configuration.OrdinaryAccounts[1].Sid -ceq $placeholder.Sid.Value) $true 'сохранения SID defaultuser0 в pc.json'
+    $script:fakeUsers = @($ordinary)
+    $changedRoster = @(Get-ExamLabEnrollmentRoster)
+    $driftRejected = $false
+    try { $null = Get-ExamLabEnrollmentInputs $stateDirectory $enrollmentUrl $script:pollUrl $changedRoster }
+    catch { $driftRejected = $_.Exception.Message -like '*differ from the saved ExamLab roster*' }
+    Assert-Expected $driftRejected $true 'административной проверки после исчезновения сохранённого SID'
     'PASS: переносимая логика регистрации и безопасного повтора ExamLab.'
 } finally {
     $env:ProgramFiles = $previousFiles

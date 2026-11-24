@@ -1,9 +1,8 @@
 # Используется только проверенным установщиком под общей блокировкой обслуживания.
 function Get-ExamLabEnrollmentRoster {
     $users = @(Get-LocalUser -ErrorAction Stop)
-    if ($users | Where-Object Name -eq 'defaultuser0') {
-        throw 'Windows still has the temporary defaultuser0 account. Complete Windows Setup before installing ExamLab.'
-    }
+    $setupAccountIssue = Get-ExamLabSetupAccountIssue -LocalAccounts $users
+    if ($setupAccountIssue) { throw $setupAccountIssue }
     $roster = @(foreach ($user in $users) {
         $sid = $user.SID.Value
         if ($sid -cnotmatch '\AS-1-5-21-[0-9]+-[0-9]+-[0-9]+-(?<Rid>[0-9]+)\z') {

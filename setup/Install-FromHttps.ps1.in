@@ -282,7 +282,6 @@
             return
         }
         foreach ($task in $taskChecks) { Assert-ExamLabTaskCheck $task -RequireOwnership }
-        $ordinaryRoster = @(Get-ExamLabEnrollmentRoster)
         $ownership = Read-ExamLabOwnership
         if ($ownership.Removing) { throw 'Finish the previous local uninstall before installing ExamLab again.' }
         if ($ownership.Disabled) { throw 'Enable the locally disabled ExamLab installation before updating it.' }
@@ -351,6 +350,9 @@
             }
         }
 
+        Add-InstallPhase 'enrollment-prerequisites'
+        Import-Module (Join-Path $package 'windows\ExamLab.psm1') -Function Get-ExamLabSetupAccountIssue -Scope Local -ErrorAction Stop
+        $ordinaryRoster = @(Get-ExamLabEnrollmentRoster)
         Add-InstallPhase 'begin-system-changes'
         Start-ExamLabInstallChanges
         $systemChanges = $true

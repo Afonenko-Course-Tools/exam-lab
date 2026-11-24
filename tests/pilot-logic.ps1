@@ -145,6 +145,47 @@ try {
         throw 'FAIL: исключение roster должно действовать только для точного наблюдённого SID'
     }
     'PASS: исключение roster действует только на подтверждённый SID наблюдаемого сеанса'
+    $setupAccount = [pscustomobject]@{Name='defaultuser0'; SID=$guest.SID; Enabled=$false}
+    function Assert-SetupAccount([bool]$Expected) {
+        $accepted = & $module { param($Account) Test-ExamLabSetupAccount $Account } $setupAccount
+        if ($accepted -ne $Expected) { throw 'FAIL canonical inactive defaultuser0' }
+    }
+    Assert-SetupAccount $true
+    $setupAccount.Enabled = $true
+    Assert-SetupAccount $false
+    $setupAccount.Enabled = $false
+    $setupAccount.Name = 'DefaultUser0'
+    Assert-SetupAccount $false
+    $setupAccount.Name = 'defaultuser0'
+    $setupAccount.SID = $builtin.SID
+    Assert-SetupAccount $false
+    $setupAccount.SID = $guest.SID
+    $setupRoster = [pscustomobject]@{OrdinaryAccounts=@($rosterConfig.OrdinaryAccounts[0],
+        [pscustomobject]@{Sid=$setupAccount.SID.Value;Name=$setupAccount.Name})}
+    $declaredSetup = & $module { param($c,$a) Test-LiveRoster $c $a } $setupRoster @($student,$setupAccount)
+    if ($declaredSetup.IdentityUnconfirmed -or (Get-ExamLabSetupAccountIssue -LocalAccounts @($student))) {
+        throw 'FAIL defaultuser0 сохраняется в обычном roster, чистый список обходится без чтения Setup.'
+    }
+    $completeImage = 'IMAGE_STATE_COMPLETE'
+    $stateIni = "[State]`r`nImageState=`"$completeImage`"`r`n"
+    $setup = [pscustomobject]@{OOBEInProgress=0; SystemSetupInProgress=0; SetupType=0}
+    function Assert-SetupCompletion([bool]$Expected, $Image, [string]$Ini, [object[]]$Profiles) {
+        $issue = & $module { param($r,$i,$s,$p) Get-ExamLabSetupCompletionIssue $r $i $s $p } $Image $Ini $setup $Profiles
+        if ((-not $issue) -ne $Expected) { throw 'FAIL Windows Setup/OOBE completion' }
+    }
+    Assert-SetupCompletion $true $completeImage $stateIni @([pscustomobject]@{Loaded=$false})
+    Assert-SetupCompletion $true $completeImage $stateIni @()
+    Assert-SetupCompletion $false 'IMAGE_STATE_UNDEPLOYABLE' $stateIni @()
+    Assert-SetupCompletion $false $completeImage ($stateIni.Replace('[State]', '[Other]')) @()
+    Assert-SetupCompletion $false $completeImage ($stateIni + 'ImageState=IMAGE_STATE_UNDEPLOYABLE') @()
+    Assert-SetupCompletion $false $completeImage $stateIni @([pscustomobject]@{Loaded=$true})
+    Assert-SetupCompletion $false $completeImage $stateIni @([pscustomobject]@{Loaded=$null})
+    foreach ($flag in $setup.PSObject.Properties) {
+        $flag.Value = 1
+        Assert-SetupCompletion $false $completeImage $stateIni @()
+        $flag.Value = 0
+    }
+    'PASS defaultuser0: канонический SID, два источника, флаги, незагруженный профиль и сохранение в roster.'
     $unset=[pscustomobject]@{EnableSharedPCMode=$null;EnableAccountManager=$null;AccountModel=$null;DeletionPolicy=$null;SetEduPolicies=$null;SetPowerPolicies=$null;RestrictLocalStorage=$null}
     if (-not (& $module {param($s) Test-SharedPCUnset $s} $unset)) { throw 'FAIL all-null SharedPC должен быть unset.' }
     $unset.DeletionPolicy=0
@@ -213,6 +254,15 @@ try {
     $installAst=Get-ParsedSource '..\setup\Install-LocalPilot.ps1'
     $mainAst=Get-ParsedSource '..\windows\ExamLab.psm1'
     $netAst=Get-ParsedSource '..\windows\ExamNetwork.psm1'
+    $readContext=Get-FunctionNode $mainAst 'Read-Context'
+    $setupGuards=@($readContext.FindAll({param($n)
+        $n -is [Management.Automation.Language.IfStatementAst] -and
+        $n.Clauses[0].Item1.Extent.Text -eq '-not $AllowRosterDriftOnlyForNormal' -and
+        @(Get-CommandNodes $n.Clauses[0].Item2 'Get-ExamLabSetupAccountIssue').Count -eq 1
+    },$true))
+    if ($setupGuards.Count -ne 1 -or @(Get-CommandNodes $readContext.Body 'Get-ExamLabSetupAccountIssue').Count -ne 1) {
+        throw 'FAIL Setup/OOBE проверяется только на строгом пути, автономный normal доступен.'
+    }
     $observe=Get-FunctionNode $mainAst 'Get-ExamLabControllerObservation'
     Assert-CallBefore $observe.Body 'Get-ExamLabControllerPolicyReadback' @('Test-ExamLabWazuhRunning')
     foreach ($mutation in @('Restore-ExamLabControllerCollection','Open-ExamLabModeLock','Invoke-ExamLabFileTraceAssignment',
