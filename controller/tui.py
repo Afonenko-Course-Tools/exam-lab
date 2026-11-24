@@ -22,7 +22,8 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Input, Static
 
 
-GREEN, YELLOW, RED, CYAN = "#8fedaf", "#ffd482", "#ff8697", "#8ae8ed"
+GREEN, YELLOW, RED, CYAN = "#145c3d", "#734800", "#912138", "#215973"
+HEADING = "#153c56"
 REPORT = {
     "pending": ("ожидает", YELLOW), "offline": ("нет свежего результата", YELLOW),
     "applied": ("применён", GREEN), "source-applied": ("применён", GREEN),
@@ -33,13 +34,23 @@ CONNECTION = {
     "fresh": ("есть", GREEN), "stale": ("нет свежего опроса", RED),
     "never": ("первого опроса ещё не было", YELLOW),
 }
+CONNECTION_BRIEF = {"fresh": "Есть", "stale": "Нет", "never": "Ждём"}
 ALERT = {
     "received": ("Получена", RED), "shown": ("На экране", RED),
     "acknowledged": ("Снята", GREEN), "requested": ("Снимается", YELLOW),
     "expired": ("Просрочена", RED), "session-ended": ("Сеанс завершён", "dim"),
 }
-ALERT_BRIEF = {"shown": "Экран", "requested": "Снятие", "expired": "Истекла", "session-ended": "Закрыта"}
 ALERT_REASON = {"control-signal": "контрольный сигнал", "canary-read": "чтение контрольного файла"}
+REPORT_REASON = {
+    "full-not-ready": ("Нет допуска", "Полный режим недоступен"),
+    "guest-still-present": ("Guest открыт", "Дождитесь выхода Guest"),
+    "machine-preflight-failed": ("Проверки ПК", "Проверки ПК завершились отказом"),
+    "machine-apply-failed": ("Ошибка политик", "Не удалось применить политики ПК"),
+    "local-action-failed": ("Ошибка режима", "Не удалось переключить режим"),
+    "local-normal-incomplete": ("Снятие не заверш.", "Локальное снятие ограничений не завершено"),
+    "collection-stop-failed": ("Ошибка записи", "Не удалось остановить запись"),
+}
+MANUAL_STUDENT = "ФИО вручную"
 INSTALLATION = {
     "installed": ("✓", GREEN, "Установлен ожидаемый выпуск"),
     "other-release": ("≠", YELLOW, "Установлен другой выпуск"),
@@ -57,14 +68,13 @@ FILE_TRACE_PREFIX = "file-trace-"
 FILE_TRACE_ID = re.compile(FILE_TRACE_PREFIX + r"[A-Za-z0-9._-]{1,53}")
 HELP = """↑ ↓  Выбрать место     Enter  Открыть действия на месте
 Пробел  Отметить ПК     A  Отметить места этого экзамена
-E  Назначить экзамен    N  Вернуть в обычный режим
+E  Включить экзамен     N  Вернуть в обычный режим
 Tab  Перейти к кнопкам   R  Обновить   F1  Справка   Q  Выйти
 
 Мышь выбирает строку и нажимает кнопки. Повторный щелчок по строке открывает её действия.
-Если ПК отмечены, «Экзамен» и «Обычный» действуют на всю отмеченную группу. Иначе используется текущая строка.
-«Обычный» после экзамена требует сверки сдачи преподавателем и выхода Guest.
+Команды применяются к отмеченным ПК или к выбранной строке.
+Возврат в обычный режим после экзамена требует сверки сдачи преподавателем и выхода Guest.
 Сдачу и оценку смотрите в PrairieLearn. В панели видна отметка ручной сверки.
-В узком окне Э означает экзамен, О — обычный режим.
 В колонке «Версия» ✓ означает ожидаемый выпуск по итоговому отчёту, ≠ — другой выпуск, ? — нет подтверждения.
 Для снятия тревоги владелец подтверждает конкретное событие в действиях на месте."""
 
@@ -95,6 +105,28 @@ def exam_places(places, exam_id):
     return {row["deviceId"] for row in places if row["student"] is not None or row["examId"] == exam_id}
 
 
+def place_student(row, *, manual=False):
+    student = row.get("sessionStudent")
+    if student is None and manual:
+        return row["student"]
+    return student
+
+
+def student_for_guest(row, *, manual=False):
+    if manual or row.get("sessionStudentSource") == "lti":
+        return place_student(row, manual=manual)
+    return None
+
+
+def place_title(row, *, manual=False):
+    device = row["deviceId"]
+    student = place_student(row, manual=manual)
+    if not student:
+        return device
+    source = f" · {MANUAL_STUDENT}" if row.get("sessionStudentSource") != "lti" else ""
+    return f"{device}{source} · {student}"
+
+
 def alert_label(alert):
     return ALERT_REASON.get(alert["reason"], alert["reason"])
 
@@ -111,54 +143,116 @@ def machine_report(row):
     return REPORT[row["reportStatus"]]
 
 
-def place_guidance(row, exam_id):
+def reported_mode(row):
     if row["reportReason"] == "local-normal-source-confirmed":
-        return "Проверьте обычный вход после локального снятия.", CYAN
-    if row["connection"] != "fresh":
+        return "Снят", CYAN
+    if row["connection"] == "fresh":
+        if row["reportStatus"] == "applied":
+            return ("Экзамен" if row["assignedMode"] == "exam" else "Обычный"), GREEN
+        if row["reportStatus"] == "source-applied":
+            return ("Подгот." if row["assignedMode"] == "exam" else "Снят"), CYAN
+    return "Неясен", YELLOW
+
+
+def report_reason(row, *, brief=False):
+    if row["reportStatus"] not in ("blocked", "error"):
         return None
+    reason = row["reportReason"]
+    return REPORT_REASON.get(reason, (reason, reason))[0 if brief else 1]
+
+
+def place_guidance(row, exam_id, *, brief=False, owner=False, manual=False):
+    def label(short, full, color):
+        return short if brief else full, color
+
+    if row["connection"] != "fresh":
+        return label("Ждём опрос", "Нет свежей связи с ПК", YELLOW)
+    if row["reportReason"] == "local-normal-source-confirmed":
+        return label("Проверить вход", "Проверьте обычный вход после локального снятия.", CYAN)
     if row["examId"] and row["examId"] != exam_id:
-        return f"Другой экзамен — {row['examId']}", YELLOW
+        return label("Другой экзамен", f"Другой экзамен — {row['examId']}", YELLOW)
+    if row["reportStatus"] in ("blocked", "error"):
+        return report_reason(row, brief=brief) or "Смотреть отказ", RED
     if row["assignedMode"] == "normal":
         if row["reportStatus"] in ("applied", "source-applied"):
-            return "Проверьте обычный вход.", GREEN
-        return None
+            return label("Проверить вход", "Проверьте обычный вход.", GREEN)
+        return label("Ждём отчёт", "Ожидается отчёт о режиме.", YELLOW)
+    alert = row["alert"]
+    if alert and alert["current"]:
+        if alert["status"] == "requested":
+            return label("Снятие тревоги", "Ожидается подтверждение снятия от ПК.", YELLOW)
+        if alert["status"] in ("received", "shown"):
+            return ("Снять тревогу" if owner else "Позвать владельца") + ("" if brief else "."), RED
+        if alert["status"] == "expired":
+            return label("Снятие истекло", "Истёк срок команды снятия тревоги.", RED)
     if row["submitted"]:
-        if row["guestState"] == "absent":
-            return "Guest вышел. Доступен обычный режим.", GREEN
-        return "Дождитесь выхода Guest.", YELLOW
-    if row["guestReady"]:
-        return "Преподаватель сверил Guest. Можно начинать.", GREEN
+        if row.get("canReturnToNormal"):
+            return label("Вернуть режим", "Guest вышел. Доступен обычный режим.", GREEN)
+        return label("Дождаться выхода", "Дождитесь подтверждения выхода Guest.", YELLOW)
+    student = student_for_guest(row, manual=manual)
+    if row["guestReady"] and student:
+        return label("Можно начинать", "Преподаватель сверил Guest. Можно начинать.", GREEN)
+    if row.get("canSubmitAfterExit"):
+        return label("Сверить сдачу", "Guest вышел. Сверьте сдачу в PrairieLearn.", CYAN)
     if row["machineReady"]:
+        if row["guestState"] == "absent":
+            return label("Можно входить", "ПК готов. Можно входить в Guest.", GREEN)
+        if row["guestState"] == "present" and student:
+            return label("Сверить Guest", "Guest открыт. Подтвердите место и проверки.", YELLOW)
+        if row["guestState"] == "present" and row.get("sessionStudentSource") == "manual":
+            return label("Требуется LTI", "Для этого Guest требуется подтверждённая связь через LTI.", YELLOW)
         if row["guestState"] == "present":
-            return "Guest открыт. Подтвердите место и проверки.", YELLOW
-        return "ПК готов. Можно входить в Guest.", GREEN
-    return None
+            return label("Открыть задание", "Ожидает открытия задания через Moodle.", YELLOW)
+        return label("Ждём Guest", "Ожидается подтверждение состояния Guest.", YELLOW)
+    return label("Ждём готовность", "Ожидается подтверждение готовности ПК.", YELLOW)
 
 
-def place_information(row, exam_id, *, compact=False):
+def place_information(row, exam_id, *, compact=False, owner=False, manual=False):
     result = Text()
     connection, connection_color = CONNECTION[row["connection"]]
     report, report_color = machine_report(row)
     result.append("Связь с ПК · ")
     result.append(connection, connection_color)
+    if (age := row.get("connectionAgeSeconds")) is not None:
+        result.append(f" · {age} с назад" if age < 60 else f" · {age // 60} мин назад")
     result.append("\nОтчёт ПК · ")
     result.append(report, report_color)
-    if row["student"]:
+    if reason := report_reason(row):
+        result.append(f" · {reason}", RED)
+    exam_place = row["assignedMode"] == "exam" and row["examId"] == exam_id
+    if exam_place:
+        result.append("\nГотовность ПК · ")
+        result.append("есть" if row["machineReady"] else "не подтверждена", GREEN if row["machineReady"] else YELLOW)
+    guest_separator = " · Guest · " if exam_place and compact else "\nGuest · "
+    last_exit = row.get("lastGuestExit")
+    if row["guestState"] == "present":
+        result.append(f"{guest_separator}открыт")
+    elif row["guestState"] == "absent":
+        state = "вышел" if last_exit and row.get("sessionStudent") else "отсутствует"
+        result.append(f"{guest_separator}{state}")
+    elif exam_place:
+        result.append(f"{guest_separator}состояние неизвестно")
+    if place_student(row, manual=manual) or row["submitted"]:
         result.append("\nСверка сдачи · ")
         if row["submitted"]:
             result.append("преподаватель сверил в PrairieLearn", GREEN)
         else:
             result.append("отметки преподавателя пока нет", YELLOW)
-    state = place_guidance(row, exam_id)
-    if state:
+    if not report_reason(row):
         result.append("\n")
-        result.append(*state)
+        result.append(*place_guidance(row, exam_id, owner=owner, manual=manual))
     alert = row["alert"]
-    if alert and alert["current"]:
+    if alert and (alert["current"] or (row["examId"] == exam_id and alert["status"] == "acknowledged")):
         label, color = ALERT[alert["status"]]
         result.append("\n")
         result.append(f"Тревога · {label} · {alert_label(alert)}", color)
-    if not compact or not (alert and alert["current"]):
+    if last_exit and (not compact or not row.get("sessionStudent")):
+        label = "Прошлый выход" if compact else "Последний подтверждённый выход Guest"
+        source = f"{MANUAL_STUDENT} · " if last_exit.get("source") != "lti" else ""
+        result.append(f"\n{label} · {source}{last_exit['student']}")
+        if not compact:
+            result.append(f" · {last_exit['exitedUtc']}")
+    if not compact:
         _, installation_color, installation = INSTALLATION[row["installation"]["status"]]
         result.append("\n")
         result.append(installation, installation_color)
@@ -239,29 +333,34 @@ class ConfirmDialog(Dialog):
 
 
 class PlaceDialog(Dialog):
-    def __init__(self, detail, exam_id, owner):
+    def __init__(self, detail, exam_id, owner, *, manual=False):
         super().__init__()
         self.detail = detail
         self.exam_id = exam_id
         self.owner = owner
+        self.manual = manual
 
     def compose(self) -> ComposeResult:
         row = self.detail
-        name = f"{row['student'] or 'Свободное место'} — {row['deviceId']}"
+        name = place_title(row, manual=self.manual)
         can_dismiss = any(alert["current"] and alert["status"] in ("received", "shown") for alert in row["alerts"])
-        guest_present = row["guestState"] == "present" and bool(row["student"])
+        guest_confirmable = row["guestState"] == "present" and bool(student_for_guest(row, manual=self.manual))
         with Vertical(classes="dialog"):
             yield Static(name, classes="dialog-title", markup=False)
             with VerticalScroll(classes="dialog-content"):
-                yield Static(place_information(row, self.exam_id), markup=False)
+                yield Static(place_information(row, self.exam_id, owner=self.owner, manual=self.manual), markup=False)
+            if self.manual:
+                with Horizontal(classes="button-row"):
+                    yield Button("Назначить ФИО для пробы", id="bind")
+                    yield Button("Пересадить", id="move", disabled=not row["student"])
             with Horizontal(classes="button-row"):
-                yield Button("Назначить ФИО", id="bind")
-                yield Button("Пересадить", id="move", disabled=not row["student"])
-                yield Button("Подтвердить Guest", id="guest", disabled=not (guest_present and row["machineReady"]))
-            with Horizontal(classes="button-row"):
-                yield Button("Сверка сдачи", id="submit", variant="success", disabled=not row["guestReady"])
+                yield Button("Подтвердить Guest", id="guest", disabled=not (guest_confirmable and row["machineReady"]))
+                yield Button("Сверить сдачу", id="submit", variant="success", disabled=not (
+                    (row["guestReady"] or row.get("canSubmitAfterExit")) and not row["submitted"]
+                ))
                 if self.owner:
                     yield Button("Снять тревогу", id="dismiss-alert", variant="error", disabled=not can_dismiss)
+            with Horizontal(classes="button-row"):
                 yield Button("Отчёт", id="details")
                 yield Button("Закрыть", id="close")
 
@@ -270,11 +369,13 @@ class PlaceDialog(Dialog):
 
 
 class GroupDialog(MessageDialog):
-    def __init__(self, mode, results, exam):
+    def __init__(self, mode, results, exam, *, owner=False, manual=False):
         super().__init__("Экзамен · результаты по ПК" if mode == "exam" else "Обычный режим · результаты по ПК", "")
         self.mode = mode
         self.results = results
         self.exam = exam
+        self.owner = owner
+        self.manual = manual
 
     def update_reports(self, rows, *, fresh=True):
         report = Text()
@@ -289,12 +390,7 @@ class GroupDialog(MessageDialog):
             else:
                 row = rows.get(device)
                 if row and row["assignedMode"] == self.mode and (self.mode == "normal" or row["examId"] == self.exam):
-                    state = place_guidance(row, self.exam)
-                    if state is None:
-                        if row["connection"] == "fresh":
-                            state = machine_report(row)
-                        else:
-                            state = ("Нет свежей связи с ПК", RED)
+                    state = place_guidance(row, self.exam, owner=self.owner, manual=self.manual)
                     if entry["status"] == "unchanged":
                         report.append(f"{label} · ", color)
                     report.append(*state)
@@ -308,37 +404,39 @@ class ExamTUI(App):
     ENABLE_COMMAND_PALETTE = False
     POLL_SECONDS = 3.0
     CSS = """
-    Screen { background: #101822; color: #e6edf3; }
-    #banner { height: 1; background: #245574; color: #f0f8ff; padding: 0 1; text-style: bold; }
-    #scope-controls { height: 1; margin: 0 1; background: #192b3a; }
+    Screen { background: #f5f7fa; color: #233649; }
+    #banner { height: 1; background: #dce8f1; color: #153c56; padding: 0 1; text-style: bold; }
+    #scope-controls { height: 1; margin: 0 1; background: #e8eff5; }
     #scope-state { width: 1fr; height: 1; padding-left: 1; text-wrap: nowrap; }
     #switch-exam { margin: 0; }
-    #summary { height: 1; padding: 0 1; margin-top: 1; color: #9be4e9; }
-    #places-panel { height: 1fr; min-height: 3; margin: 0 1; border: round #416477; }
-    #places { height: 1fr; background: #14232e; color: #edf4f8; scrollbar-size: 1 1; }
-    #places > .datatable--header { background: #254451; color: #d7eff2; text-style: bold; }
-    #places > .datatable--odd-row { background: #182b36; }
-    #places > .datatable--cursor { background: #355873; color: #ffffff; text-style: bold; }
-    #places > .datatable--hover { background: #263d4c; }
-    #places-empty { height: 1; padding: 0 1; color: #bbd0dc; }
-    #selected { height: auto; max-height: 6; padding: 0 1; margin: 0 1; color: #e6edf3; background: #192b3a; }
-    #notice { height: 1; padding: 0 1; color: #bfd0da; }
-    #key-hint { height: 1; padding: 0 1; background: #245574; color: #f0f8ff; }
-    .toolbar { height: 1; grid-size: 6 1; grid-gutter: 0 1; margin: 0 1 1 1; }
+    #summary { height: 1; padding: 0 1; margin-top: 1; color: #215973; }
+    #places-panel { height: 1fr; min-height: 3; margin: 0 1; border: round #8ca3b6; }
+    #places { height: 1fr; background: #ffffff; color: #233649; scrollbar-size: 1 1; }
+    #places > .datatable--header { background: #dce8f1; color: #153c56; text-style: bold; }
+    #places > .datatable--odd-row { background: #f1f5f9; }
+    #places > .datatable--cursor { background: #c9e2f5; color: #153c56; text-style: bold; }
+    #places > .datatable--hover { background: #e2eef7; }
+    #places-empty { height: 1; padding: 0 1; color: #4a6378; }
+    #selected { height: auto; max-height: 8; padding: 0 1; margin: 0 1; background: #e8eff5; }
+    #notice { height: 1; padding: 0 1; color: #4a6378; }
+    #key-hint { height: 1; padding: 0 1; background: #dce8f1; color: #153c56; }
+    .toolbar { height: 1; grid-size: 4 1; grid-gutter: 0 1; margin: 0 1; }
     .toolbar Button { width: 100%; margin: 0; }
+    #mode-actions { grid-size: 2 1; margin-bottom: 1; }
     .button-row { height: 1; }
     Button { border: none !important; height: 1; min-width: 4; width: auto; margin-right: 1; }
     Button:focus { text-style: bold underline; }
-    Dialog { background: #101822 80%; align: center middle; }
+    Dialog { background: #435b70 28%; align: center middle; }
     .dialog { width: 68; max-width: 96%; height: auto; max-height: 94%;
-              padding: 1 2; border: round #67b9d1; background: #182a38; }
-    .dialog-title { color: #b6f0ff; text-style: bold; height: auto; margin-bottom: 1; }
+              padding: 1 2; border: round #8ca3b6; background: #ffffff; }
+    .dialog-title { color: #153c56; text-style: bold; height: auto; margin-bottom: 1; }
     .dialog-content { height: auto; max-height: 14; margin-bottom: 1; scrollbar-size: 1 1; }
     .dialog-content Static { height: auto; }
     .dialog .button-row { margin-top: 1; }
-    #input-error { height: auto; color: #ff818c; }
+    #input-error { height: auto; color: #912138; }
     #answer { height: 3; }
-    Screen.compact .toolbar { grid-size: 3 2; height: 2; margin: 0 1; }
+    Screen.compact #mode-actions { margin-bottom: 0; }
+    Screen.compact #selected { max-height: 7; }
     Screen.compact #summary { margin-top: 0; }
     Screen.compact .dialog { padding: 0 1; }
     """
@@ -355,8 +453,10 @@ class ExamTUI(App):
 
     def __init__(self, args):
         super().__init__()
+        self.theme = "textual-light"
         self.args = args
         self.file_trace_exam = getattr(args, "file_trace_exam", None)
+        self.manual_pilot = getattr(args, "manual_pilot", False)
         self.scope = ExamScope(args.exam)
         self.rows = {}
         self.shown_ids = ()
@@ -389,10 +489,11 @@ class ExamTUI(App):
         with Grid(classes="toolbar"):
             yield Button("Отметить", id="mark")
             yield Button("Группа", id="mark-exam", tooltip="Отметить все места этого экзамена")
-            yield Button("Экзамен", id="exam", variant="primary")
-            yield Button("Обычный", id="normal", variant="success")
             yield Button("Действия", id="actions")
             yield Button("Справка", id="help")
+        with Grid(id="mode-actions", classes="toolbar"):
+            yield Button("Включить экзамен", id="exam", variant="primary")
+            yield Button("Вернуть в обычный режим", id="normal", variant="success")
         yield Static("↑↓ Место  Enter Действия  Space Отметить  R Обновить  Q Выйти", id="key-hint", markup=False)
 
     @property
@@ -402,6 +503,10 @@ class ExamTUI(App):
     @property
     def file_trace_active(self):
         return self.scope.exam_id == self.file_trace_exam
+
+    @property
+    def manual_placement(self):
+        return self.owner and (self.file_trace_active or self.manual_pilot)
 
     def on_mount(self):
         self.terminal_width = self.size.width
@@ -501,10 +606,12 @@ class ExamTUI(App):
         self.query_one("#notice", Static).update(Text(value, style=style))
 
     def update_summary(self):
-        banner = Text(" EXAM LAB ", style="bold white on #356986")
+        banner = Text("Экзаменационные места", style=f"bold {HEADING}")
+        if self.manual_placement:
+            banner.append("  ·  Ручная проба", f"bold {YELLOW}")
         banner.append(f"  {self.scope.exam_id} · {self.args.version[:12]}")
         if self.owner:
-            banner.append("  ·  Владелец", "bold #cef0b8")
+            banner.append("  ·  Владелец", f"bold {GREEN}")
         self.query_one("#banner", Static).update(banner)
         if self.file_trace_exam:
             self.query_one("#scope-controls", Horizontal).display = self.owner
@@ -517,7 +624,7 @@ class ExamTUI(App):
         rows = self.rows.values()
         fresh = sum(row["connection"] == "fresh" for row in rows)
         alerts = sum(bool(row["alert"] and row["alert"]["current"] and row["alert"]["status"] != "acknowledged") for row in rows)
-        ready = sum(row["guestReady"] for row in rows)
+        ready = sum(row["guestReady"] and bool(student_for_guest(row, manual=self.manual_placement)) for row in rows)
         compact = self.terminal_width < 72
         divider = " · " if compact else "  ·  "
         line = Text(f"Опрос ПК {fresh}/{len(rows)}{divider}Guest {ready}{divider}")
@@ -535,13 +642,17 @@ class ExamTUI(App):
         device = self.cursor_device()
         row = self.rows.get(device)
         if row:
-            heading = f"{row['student'] or 'Свободное место'} — {device}"
+            heading = place_title(row, manual=self.manual_placement)
             info = Text(overflow="ellipsis", no_wrap=True)
-            info.append(heading, "bold #b6f0ff")
+            info.append(heading, f"bold {HEADING}")
+            if self.marked:
+                info.append(f" · Команды для отмеченных ПК ({len(self.marked)})")
             if not self.connected:
                 info.append(" · устаревшая сводка", YELLOW)
             info.append("\n")
-            info.append_text(place_information(row, self.scope.exam_id, compact=True))
+            info.append_text(place_information(
+                row, self.scope.exam_id, compact=True, owner=self.owner, manual=self.manual_placement,
+            ))
         else:
             info = Text("Выберите место", style="dim")
         selected = self.query_one("#selected", Static)
@@ -553,59 +664,64 @@ class ExamTUI(App):
         if self.file_trace_exam:
             self.query_one("#switch-exam", Button).disabled = self.mutating
 
-    def table_values(self, row, widths):
-        _, place_width, installation_width, report_width, alert_width = widths
+    def table_values(self, row):
         device = row["deviceId"]
         mark = Text("✓", f"bold {GREEN}") if device in self.marked else Text("·", "dim")
-        device_label = Text(device, style="bold #b6f0ff")
-        device_label.truncate(max(7, place_width // 2), overflow="ellipsis")
-        student = Text(row["student"] or "—", style="" if row["student"] else "dim")
-        student.truncate(place_width - device_label.cell_len - 3, overflow="ellipsis")
-        person = student.append(" — ").append_text(device_label)
+        person = Text(device, style=f"bold {HEADING}")
+        student = place_student(row, manual=self.manual_placement)
+        if student and row.get("sessionStudentSource") != "lti":
+            person.append(" · вручную", YELLOW)
+        person.append(f" · {student}" if student else " · —", style="" if student else "dim")
         installation_symbol, color, _ = INSTALLATION[row["installation"]["status"]]
         installation = Text(installation_symbol, color)
         version = row["installation"].get("version")
         if version:
-            installation.append(f" {version[:installation_width - 2]}")
+            installation.append(f" {version}")
         elif row["connection"] != "fresh":
             installation = Text("—", "dim")
-        report, color = REPORT[row["reportStatus"]]
-        mode = "Экз." if row["assignedMode"] == "exam" else "Обыч."
-        if report_width < 15:
-            mode = mode[0]
-        if row["reportReason"] == "local-normal-source-confirmed":
-            report, color = ("снят локально" if report_width >= 15 else "лок. снят"), CYAN
-        elif row["examId"] and row["examId"] != self.scope.exam_id:
-            report, color = "другой", YELLOW
-        elif row["connection"] != "fresh":
-            report, color = "нет связи", RED
+        connection = Text(CONNECTION_BRIEF[row["connection"]], CONNECTION[row["connection"]][1])
         alert = row["alert"]
-        label, alert_color = "—", "dim"
-        if alert and (alert["current"] or (row["examId"] == self.scope.exam_id and alert["status"] == "acknowledged")):
-            label, alert_color = ALERT[alert["status"]]
-            if alert_width < 12:
-                label = ALERT_BRIEF.get(alert["status"], label)
-        return mark, person, installation, Text(f"{mode} {report}", color), Text(label, alert_color)
+        alert_visible = alert and (alert["current"] or (row["examId"] == self.scope.exam_id and alert["status"] == "acknowledged"))
+        return {
+            "mark": mark, "place": person, "version": installation, "mode": Text(*reported_mode(row)),
+            "connection": connection,
+            "action": Text(*place_guidance(
+                row, self.scope.exam_id, brief=True, owner=self.owner, manual=self.manual_placement,
+            )),
+            "alert": Text(*ALERT[alert["status"]]) if alert_visible else Text("—", "dim"),
+        }
+
+    def row_cells(self, device, columns):
+        values = self.table_values(self.rows[device])
+        for key, _, width in columns:
+            value = values[key]
+            value.truncate(width, overflow="ellipsis")
+            yield value
 
     def render_table(self):
         table = self.table
         # The panel has one cell of margin and one border cell on each side.
-        available = max(51, self.terminal_width - 4)
-        # A cell has padding on both sides. One column is reserved for the scrollbar.
-        widths = (1, available - 48, 10, 16, 10)
-        if available < 69:
-            widths = (1, available - 39, 6, 13, 8)
-        labels = ("•", "Студент — ПК", "Версия", "Режим", "Тревога")
+        available = max(54, self.terminal_width) - 4
+        columns = [("mark", "•", 1), ("place", "ПК · Студент", 0)]
+        if self.terminal_width >= 72:
+            columns.append(("version", "Версия", 7))
+        columns.extend((("mode", "Режим", 8), ("connection", "Связь", 5), ("action", "Действие", 17)))
+        if self.terminal_width >= 100:
+            columns.append(("alert", "Тревога", 10))
+        # Two padding cells per column and one cell for the scrollbar.
+        place_width = available - sum(width + 2 for _, _, width in columns) - 1
+        columns[1] = ("place", "ПК · Студент" if place_width >= 12 else "Место", place_width)
+        widths = tuple(width for _, _, width in columns)
         ids = tuple(self.rows)
         current = self.cursor_device()
         old_index = table.cursor_row
         old_y = table.scroll_y
         if ids != self.shown_ids or widths != self.columns:
             table.clear(columns=True)
-            for i, (label, width) in enumerate(zip(labels, widths)):
-                table.add_column(label, width=width, key=str(i))
+            for key, label, width in columns:
+                table.add_column(label, width=width, key=key)
             for device in ids:
-                table.add_row(*self.table_values(self.rows[device], widths), key=device)
+                table.add_row(*self.row_cells(device, columns), key=device)
             self.columns = widths
             self.shown_ids = ids
             if ids:
@@ -614,8 +730,7 @@ class ExamTUI(App):
                 table.call_after_refresh(table.scroll_to, y=max(0, old_y + new_index - old_index), animate=False)
         else:
             for device in ids:
-                for i, value in enumerate(self.table_values(self.rows[device], widths)):
-                    column = str(i)
+                for (column, _, _), value in zip(columns, self.row_cells(device, columns)):
                     if table.get_cell(device, column) != value:
                         table.update_cell(device, column, value)
         empty = self.query_one("#places-empty", Static)
@@ -674,11 +789,17 @@ class ExamTUI(App):
         if len(selection) > 100:
             self.notice("Контроллер принимает до 100 ПК за одно действие", YELLOW)
             return
-        title = "Назначить экзамен" if mode == "exam" else "Вернуть в обычный режим"
+        title = "Включить экзамен" if mode == "exam" else "Вернуть в обычный режим"
+        target = f"ПК {selection[0]}" if len(selection) == 1 else f"Мест выбрано {len(selection)}\n{', '.join(selection)}"
+        fields = {"devices": selection}
+        if mode == "normal":
+            fields["targets"] = {
+                device: session for device in selection if (session := self.rows[device].get("normalTarget"))
+            }
         scope = self.scope
         self.push_screen(
-            ConfirmDialog(title, self.scoped_message(f"ПК: {', '.join(selection)}")),
-            lambda accepted: self.change(scope, mode, devices=selection) if accepted else None,
+            ConfirmDialog(title, self.scoped_message(target)),
+            lambda accepted: self.change(scope, mode, **fields) if accepted else None,
         )
 
     @work
@@ -696,7 +817,10 @@ class ExamTUI(App):
                 self.notice(str(error), RED)
             return
         if scope == self.scope and self.screen is self.screen_stack[0] and self.cursor_device() == device:
-            self.push_screen(PlaceDialog(detail, scope.exam_id, self.owner), lambda action: self.place_action(scope, detail, action))
+            self.push_screen(
+                PlaceDialog(detail, scope.exam_id, self.owner, manual=self.manual_placement),
+                lambda action: self.place_action(scope, detail, action),
+            )
 
     def place_action(self, scope, detail, action):
         if action is None or scope != self.scope:
@@ -706,14 +830,14 @@ class ExamTUI(App):
             return
         device = detail["deviceId"]
         fields = {"deviceId": device}
-        if action == "bind":
+        if action == "bind" and self.manual_placement:
             self.push_screen(
                 ConfirmDialog("Назначить студента", self.scoped_message(f"Рабочее место {device}"),
                               prompt="Фамилия Имя", value=detail["student"] or ""),
                 lambda answer: self.change(scope, "bind", **fields, student=answer) if answer else None,
             )
             return
-        if action == "move":
+        if action == "move" and self.manual_placement:
             self.push_screen(
                 ConfirmDialog("Пересадить студента", self.scoped_message(f"{detail['student']} — {device}"),
                               prompt="Номер нового ПК"),
@@ -732,20 +856,34 @@ class ExamTUI(App):
             action = "dismiss"
             title = "Снять текущую тревогу"
             question = f"{device} · {alert_label(alert)}\nТекущий Guest · событие {alert['alertId']}"
-        else:
+        elif action in ("guest", "submit"):
             guest = detail["guestObservation"]
-            if not guest or guest["state"] != "present" or not detail["student"]:
-                self.notice("Назначьте студента и откройте Guest", YELLOW)
+            exited = action == "submit" and detail.get("canSubmitAfterExit")
+            if action == "guest":
+                student = student_for_guest(detail, manual=self.manual_placement)
+            else:
+                student = place_student(detail, manual=self.manual_placement)
+            if exited:
+                session = detail["lastGuestExit"]
+                name = session["student"]
+            elif guest and guest["state"] == "present" and student:
+                session = guest
+                name = student
+            else:
+                self.notice("Требуется подтверждённый сеанс Guest", YELLOW)
                 return
-            fields["target"] = {key: guest[key] for key in SESSION_FIELDS}
-            name = f"{detail['student']} — {device}"
+            fields["target"] = {key: session[key] for key in SESSION_FIELDS}
+            place = f"{name} — {device}"
             if action == "guest":
                 title = "Подтвердить место и текущий Guest"
-                question = f"{name}\nМесто сверено, контрольное чтение запрещено, проект доступен, Wazuh готов?"
+                question = f"{place}\nМесто сверено, контрольное чтение запрещено, проект доступен, Wazuh готов?"
                 fields["checks"] = ["file", "project", "wazuh"]
             else:
                 title = "Отметить сверку сдачи"
-                question = f"{name}\nВы проверили сдачу этого студента в PrairieLearn в текущем Guest?"
+                state = "Guest вышел." if exited else "Guest открыт."
+                question = f"{place}\n{state} Вы сверили сдачу этого студента в PrairieLearn?"
+        else:
+            return
         self.push_screen(
             ConfirmDialog(title, self.scoped_message(question)),
             lambda accepted: self.change(scope, action, **fields) if accepted else None,
@@ -768,13 +906,13 @@ class ExamTUI(App):
             self.push_screen(MessageDialog("Действие не подтверждено", str(error)))
         else:
             if action in ("exam", "normal"):
-                group = GroupDialog(action, result, scope.exam_id)
+                group = GroupDialog(action, result, scope.exam_id, owner=self.owner, manual=self.manual_placement)
                 self.active_group = group
                 await self.push_screen(group, self.close_group)
                 group.update_reports({})
             notes = {
                 "bind": "Студент назначен", "move": "Студент пересажен", "guest": "Текущий Guest подтверждён",
-                "submit": "Отметка о сверке записана. Дождитесь выхода Guest.",
+                "submit": "Отметка о сверке в PrairieLearn записана.",
                 "dismiss": "Снятие запрошено. Ожидается подтверждение ПК.",
             }
             self.notice(notes.get(action, "Результаты назначения обновляются по отчётам ПК"), CYAN)
@@ -807,6 +945,7 @@ def main():
     parser.add_argument("--socket", required=True)
     parser.add_argument("--exam", required=True)
     parser.add_argument("--file-trace-exam", help="Дополнительный экзамен с записью файлов для владельца")
+    parser.add_argument("--manual-pilot", action="store_true", help="Ручная рассадка для сопровождаемой пробы владельца")
     parser.add_argument("--version", required=True)
     args = parser.parse_args()
     if args.exam.startswith(FILE_TRACE_PREFIX):

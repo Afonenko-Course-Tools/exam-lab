@@ -175,7 +175,7 @@ class CampaignTest(TestCase):
         self.assertEqual("Выход Guest не подтверждён", self.action("normal", devices=["pc-01"])[0]["reason"])
         self.advance(1)
         self.send(report, guest="absent")
-        result = self.action("normal", devices="*")
+        result = self.action("normal", devices="*", targets={"pc-01": target})
         self.assertEqual(["pending", "blocked"], [row["status"] for row in result])
         self.assertEqual("normal", self.send(report)["mode"])
 
@@ -196,10 +196,11 @@ class CampaignTest(TestCase):
             self.assertEqual(["pc-01", "pc-02"], [row["deviceId"] for row in self.action(action, devices="*")])
         self.assertEqual("pending", self.action("exam", devices=["old-free"])[0]["status"])
 
-    def run_tui(self, scenario, owner_uid=None, *, file_trace_exam=None, observe=None):
+    def run_tui(self, scenario, owner_uid=None, *, file_trace_exam=None, manual_pilot=False, observe=None):
         socket_path = self.path.parent / "tui.sock"
         args = type("Arguments", (), {
-            "socket": socket_path, "exam": self.exam, "version": self.version, "file_trace_exam": file_trace_exam,
+            "socket": socket_path, "exam": self.exam, "version": self.version,
+            "file_trace_exam": file_trace_exam, "manual_pilot": manual_pilot,
         })
         if owner_uid is None:
             owner_uid = self.owner
@@ -223,12 +224,22 @@ class CampaignTest(TestCase):
             async with app.run_test(size=(80, 24)) as pilot:
                 await app.workers.wait_for_complete()
                 self.assertEqual("pc-01", app.cursor_device())
+                self.assertEqual("textual-light", app.theme)
                 self.assertFalse(app.query("#scope-controls"))
-                self.assertEqual("Учебный Студент — pc-01", app.table.get_cell("pc-01", "1").plain)
+                self.assertEqual("pc-01 · —", app.table.get_cell("pc-01", "place").plain)
+                self.assertTrue(await pilot.click("#places", offset=(1, 2)))
+                self.assertEqual("pc-02", app.cursor_device())
+                self.assertTrue(await pilot.click("#places", offset=(1, 2)))
+                await app.workers.wait_for_complete()
+                self.assertIsInstance(app.screen, PlaceDialog)
+                self.assertFalse(app.screen.query("#bind"))
+                await pilot.press("escape", "up")
+                self.assertEqual("pc-01", app.cursor_device())
                 self.assertTrue(await pilot.click("#mark-exam"))
                 self.assertEqual({"pc-01", "pc-02"}, app.marked)
                 self.assertTrue(await pilot.click("#exam"))
                 self.assertIsInstance(app.screen, ConfirmDialog)
+                self.assertIn("Мест выбрано 2", app.screen.message)
                 self.assertTrue(await pilot.click("#confirm"))
                 await app.workers.wait_for_complete()
                 self.assertIsInstance(app.screen, GroupDialog)
@@ -236,11 +247,14 @@ class CampaignTest(TestCase):
                 self.assertIn("Нет свежей связи", app.screen.query_one("#message", Static).content.plain)
 
                 report = self.applied(self.current()["device"]["assignment"])
-                self.send(report, install=self.installation)
+                self.send(report, guest="absent", install=self.installation)
                 await pilot.pause(0.7)
                 self.assertIn("Можно входить в Guest", app.screen.query_one("#message", Static).content.plain)
                 await pilot.press("escape")
-                self.assertTrue(app.table.get_cell("pc-01", "2").plain.startswith("✓ "))
+                self.assertTrue(app.table.get_cell("pc-01", "version").plain.startswith("✓ "))
+                self.assertEqual("Подгот.", app.table.get_cell("pc-01", "mode").plain)
+                self.assertEqual("Есть", app.table.get_cell("pc-01", "connection").plain)
+                self.assertEqual("Можно входить", app.table.get_cell("pc-01", "action").plain)
 
                 app.table.focus()
                 await pilot.press(*(["down"] * 22))
@@ -307,11 +321,15 @@ class CampaignTest(TestCase):
                 selected = app.query_one("#selected", Static)
                 self.assertIn("Связь с ПК · есть", selected.content.plain)
                 self.assertIn("Отчёт ПК · политики ПК применены", selected.content.plain)
+                self.assertIn("Готовность ПК · есть", selected.content.plain)
                 self.assertIn("Сверка сдачи · отметки преподавателя пока нет", selected.content.plain)
+                self.assertIn("ФИО вручную", selected.content.plain)
+                self.assertEqual("Требуется LTI", app.table.get_cell("pc-01", "action").plain)
                 await pilot.press("down")
                 self.assertIn("Связь с ПК · первого опроса ещё не было", selected.content.plain)
                 await pilot.press("up", "enter")
                 await app.workers.wait_for_complete()
+                self.assertTrue(app.screen.query_one("#guest", Button).disabled)
                 self.assertTrue(await pilot.click("#submit"))
                 self.assertIsInstance(app.screen, ConfirmDialog)
                 self.assertIn("PrairieLearn", app.screen.message)
@@ -326,6 +344,59 @@ class CampaignTest(TestCase):
                 self.assertIn("Сверка сдачи · преподаватель сверил в PrairieLearn", selected.content.plain)
 
         self.run_tui(exercise)
+
+    def test_tui_review_after_exit_and_return_target_exact_guest(self):
+        self.action("bind", deviceId="pc-01", student="Учебный Студент")
+        active = self.assign()
+        report = self.applied(active)
+        target = {"revision": active["revision"], "bootUtc": self.boot, "guestSessionId": self.session}
+        self.send(report, guest="present", session=self.session)
+        self.action("guest", deviceId="pc-01", target=target, checks=["file", "project", "wazuh"])
+        self.advance(1)
+        self.send(report, guest="absent")
+        commands = []
+
+        def observe(request):
+            if request["action"] in ("submit", "normal"):
+                commands.append(request)
+
+        async def exercise(app):
+            app.POLL_SECONDS = 60
+            async with app.run_test(size=(57, 18)) as pilot:
+                await app.workers.wait_for_complete()
+                selected = app.query_one("#selected", Static)
+                self.assertIn("Учебный Студент", selected.content.plain)
+                self.assertIn("Guest · вышел", selected.content.plain)
+                self.assertEqual("Сверить сдачу", app.table.get_cell("pc-01", "action").plain)
+
+                await pilot.press("enter")
+                await app.workers.wait_for_complete()
+                self.assertTrue(await pilot.click("#submit"))
+                self.assertIn("Guest вышел", app.screen.message)
+                self.assertIn("PrairieLearn", app.screen.message)
+                self.assertTrue(await pilot.click("#confirm"))
+                await app.workers.wait_for_complete()
+                self.assertEqual(target, commands[-1]["target"])
+                self.assertIn("Сверка сдачи · преподаватель сверил в PrairieLearn", selected.content.plain)
+                self.assertEqual("Вернуть режим", app.table.get_cell("pc-01", "action").plain)
+
+                await pilot.press("n")
+                self.assertIsInstance(app.screen, ConfirmDialog)
+                self.assertIn("ПК pc-01", app.screen.message)
+                self.assertTrue(await pilot.click("#confirm"))
+                await app.workers.wait_for_complete()
+                self.assertEqual({"pc-01": target}, commands[-1]["targets"])
+                self.assertIsInstance(app.screen, GroupDialog)
+                self.assertEqual("pending", app.screen.results[0]["status"])
+                self.assertEqual("normal", self.current()["assignedMode"])
+                self.assertNotIn("Guest · вышел", selected.content.plain)
+                self.assertIn("Прошлый выход · ФИО вручную · Учебный Студент", selected.content.plain)
+                await pilot.press("escape", "enter")
+                await app.workers.wait_for_complete()
+                place_info = app.screen.query_one(".dialog-content Static", Static).content.plain
+                self.assertIn("Последний подтверждённый выход Guest · ФИО вручную · Учебный Студент", place_info)
+
+        self.run_tui(exercise, observe=observe)
 
     def test_tui_file_trace_switch_is_owner_only_and_scopes_requests(self):
         file_trace_exam = "file-trace-20261124"
@@ -421,6 +492,34 @@ class CampaignTest(TestCase):
                 )
                 self.assertEqual(2, result.returncode)
                 self.assertIn("обычный идентификатор в --exam", result.stderr)
+
+    def test_tui_manual_pilot_is_owner_only_on_regular_exam(self):
+        async def teacher(app):
+            async with app.run_test(size=(80, 24)) as pilot:
+                await app.workers.wait_for_complete()
+                self.assertNotIn("Ручная проба", app.query_one("#banner", Static).content.plain)
+                await pilot.press("enter")
+                await app.workers.wait_for_complete()
+                self.assertIsInstance(app.screen, PlaceDialog)
+                self.assertFalse(app.screen.query("#bind"))
+
+        async def owner(app):
+            async with app.run_test(size=(80, 24)) as pilot:
+                await app.workers.wait_for_complete()
+                self.assertIn("Ручная проба", app.query_one("#banner", Static).content.plain)
+                self.assertFalse(app.query("#scope-controls"))
+                await pilot.press("enter")
+                await app.workers.wait_for_complete()
+                self.assertTrue(await pilot.click("#bind"))
+                app.screen.query_one(Input).value = "Учебный Студент"
+                self.assertTrue(await pilot.click("#confirm"))
+                await app.workers.wait_for_complete()
+                self.assertEqual("Учебный Студент", self.current()["student"])
+                self.assertIn("ФИО вручную", app.query_one("#selected", Static).content.plain)
+                self.assertEqual(self.exam, app.scope.exam_id)
+
+        self.run_tui(teacher, self.teacher, manual_pilot=True)
+        self.run_tui(owner, manual_pilot=True)
 
     def test_changed_guest_invalidates_submission_and_local_normal_can_start_explicit_new_exam(self):
         report, _, target = self.present_alert()
