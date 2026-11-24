@@ -115,6 +115,7 @@
         $content = "@echo off`r`nsetlocal DisableDelayedExpansion`r`n" +
             ('start "" "{0}" --user-data-dir="%LOCALAPPDATA%\ExamLab\Edge" --proxy-server="{1}" "{2}"' -f $edge, $proxy, $activity) + "`r`n"
         if (Test-Path -LiteralPath $browserRoot) {
+            Assert-ExamLabProtectedPath $browserRoot -Readable
             if ((Get-Item -LiteralPath $browserRoot -Force).Attributes -band [IO.FileAttributes]::ReparsePoint -or
                 -not (Test-Path -LiteralPath $launcher -PathType Leaf) -or
                 (Get-Item -LiteralPath $launcher -Force).Attributes -band [IO.FileAttributes]::ReparsePoint -or
@@ -124,21 +125,30 @@
         } else {
             $browserStage = Join-Path $stage 'browser'
             New-SetupDirectory $browserStage -ReadOnlyForUsers
-            [IO.File]::WriteAllText((Join-Path $browserStage $filename), $content, [Text.Encoding]::ASCII)
-            [IO.Directory]::Move($browserStage, $browserRoot)
+            $stagedLauncher = Join-Path $browserStage $filename
+            [IO.File]::WriteAllText($stagedLauncher, $content, [Text.Encoding]::ASCII)
+            Add-ExamLabInstallChange ([ordered]@{ Kind='Directory'; Target=$browserRoot })
+            New-SetupDirectory $browserRoot -ReadOnlyForUsers
+            Set-ExamLabInstallFile $stagedLauncher $launcher -Readable
         }
 
         $desktop = [Environment]::GetFolderPath('CommonDesktopDirectory')
         $linkPath = Join-Path $desktop 'ExamLab - Moodle.lnk'
         $shell = New-Object -ComObject WScript.Shell
-        $link = $shell.CreateShortcut($linkPath)
         if (Test-Path -LiteralPath $linkPath) {
+            Assert-ExamLabProtectedPath $linkPath -Readable
+            $link = $shell.CreateShortcut($linkPath)
             if ($link.TargetPath -ine $launcher -or $link.Arguments) { throw 'A different ExamLab - Moodle shortcut already exists.' }
         } else {
+            $shortcutStage = Join-Path $stage 'browser-shortcut'
+            New-SetupDirectory $shortcutStage -ReadOnlyForUsers
+            $stagedLink = Join-Path $shortcutStage 'ExamLab - Moodle.lnk'
+            $link = $shell.CreateShortcut($stagedLink)
             $link.TargetPath = $launcher
             $link.IconLocation = "$edge,0"
             $link.WindowStyle = 7
             $link.Save()
+            Set-ExamLabInstallFile $stagedLink $linkPath -Readable
         }
         Write-Host 'Desktop shortcut created: ExamLab - Moodle'
     }
@@ -254,7 +264,6 @@
     $stage = Join-Path $diagnosticDirectory 'setup-stage'
     $maintenance = $null
     $systemChanges = $false
-    $residuals = [Collections.Generic.List[string]]::new()
     try {
         if ($Action -eq 'Apply') {
             $maintenance = Open-ExamLabMaintenanceLock
@@ -363,13 +372,13 @@
         $machine = Read-ExamLabProtectedJson $machineReport
         $verifiedCode = @($machine.Files | Where-Object Path -Like "$examLabCodePath\*").Path
         Add-InstallPhase 'register-alert-event-source'
-        $residuals.Add('ExamLab alert event source and configuration were reached. Verify their current state before removing them.')
+        Add-ExamLabInstallResidual 'ExamLab alert' 'Verify the event source and alert configuration after interruption.'
         Set-UpAlert
-        $residuals.Add('Wazuh agent installation was reached. Validate its MSI and service state.')
+        Add-ExamLabInstallResidual 'Wazuh agent' 'Verify the MSI installation and service state after interruption.'
         Invoke-Setup 'Install-ExamLabWazuh.ps1' @('-Action', 'Install', '-MsiPath', $msi, '-ManagerIPv4', $enrollment.ManagerIPv4,
             '-AgentKeyPath', $enrollment.WazuhKeyPath, '-UsePublishedInstallers')
         Add-InstallPhase 'system-prepare'
-        $residuals.Add('Shared PC preparation was reached. Its policy state requires review after a failed attempt.')
+        Add-ExamLabInstallResidual 'Shared PC' 'Verify the effective Shared PC policy after interruption.'
         $before = [IO.File]::GetLastWriteTimeUtc((Join-Path $examLabStatePath 'prepare.log'))
         try { $prepared = Invoke-ExamLabSystemTask 'prepare' 610 }
         finally { Copy-CurrentTaskReport 'prepare' $before }
@@ -400,12 +409,16 @@
         Write-Host 'ExamLab installation and Shared PC preparation completed.'
     } catch {
         $failure = $_
+        try {
+            $failure | Format-List * -Force | Out-String -Width 360 |
+                Set-Content -LiteralPath (Join-Path $diagnosticReport 'primary-installation-error.log') -Encoding utf8
+        } catch { Write-Warning "Could not save the primary installation failure: $_" }
         if ($systemChanges) {
             Add-InstallPhase 'rollback'
             $changes = [Collections.Generic.List[object]]::new()
             try { Undo-ExamLabInstallChanges | ForEach-Object { $changes.Add($_) } }
             catch { $changes.Add([pscustomobject]@{ Status='Conflict'; Error=$_.Exception.ToString() }) }
-            try { Save-InstallReport 'rollback.json' ([ordered]@{ Changes=$changes.ToArray(); Residuals=$residuals.ToArray() }) }
+            try { Save-InstallReport 'rollback.json' ($changes.ToArray()) }
             catch { Write-Warning "Could not write the rollback report: $_" }
         }
         throw $failure

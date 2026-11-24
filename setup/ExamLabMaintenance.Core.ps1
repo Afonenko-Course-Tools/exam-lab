@@ -122,7 +122,7 @@ function Assert-ExamLabInactive {
 }
 
 function Open-ExamLabMaintenanceLock {
-    Assert-ExamLabInactive
+    if (-not (Test-Path -LiteralPath $examLabInstallChangesPath)) { Assert-ExamLabInactive }
     if (-not (Test-Path -LiteralPath $examLabReportsPath)) { New-ExamLabPrivateDirectory $examLabReportsPath }
     Assert-ExamLabProtectedPath $examLabReportsPath
     $path = Join-Path $examLabReportsPath 'maintenance.lock'
@@ -474,6 +474,10 @@ function Add-ExamLabInstallChange($Change) {
     Write-ExamLabMaintenanceJson $examLabInstallChangesPath $journal
 }
 
+function Add-ExamLabInstallResidual([string]$Target, [string]$Reason) {
+    Add-ExamLabInstallChange ([ordered]@{ Kind = 'Residual'; Target = $Target; Reason = $Reason })
+}
+
 function Save-ExamLabInstallTemporaryFile([string]$Path, [bool]$Readable) {
     if (Test-Path -LiteralPath $Path) { throw "A temporary installation file already exists at $Path." }
     Add-ExamLabInstallChange ([ordered]@{ Kind = 'TemporaryFile'; Target = $Path; Readable = $Readable })
@@ -620,6 +624,7 @@ function Undo-ExamLabInstallChanges {
             $path = Join-Path $examLabStatePath 'operation.lock'
             if (Test-Path -LiteralPath $path) { Assert-ExamLabProtectedPath $path }
             $operation = [IO.File]::Open($path, 'OpenOrCreate', 'ReadWrite', 'None')
+            Assert-ExamLabInactive
         }
         while ($journal.Changes.Count) {
             $count = $journal.Changes.Count
@@ -628,6 +633,10 @@ function Undo-ExamLabInstallChanges {
                 if ($journal.Committed) {
                     if ($change.Kind -ceq 'File') { Remove-ExamLabInstallFileStaging $change }
                     elseif ($change.Kind -ceq 'TemporaryFile') { Remove-ExamLabInstallTemporaryFile $change }
+                } elseif ($change.Kind -ceq 'Residual') {
+                    $results.Add([pscustomobject]@{
+                        Kind = $change.Kind; Target = $change.Target; Status = 'ReviewRequired'; Reason = $change.Reason
+                    })
                 } else {
                     Undo-ExamLabInstallChange $change
                     $results.Add([pscustomobject]@{ Kind = $change.Kind; Target = $change.Target; Status = 'RolledBack' })
@@ -657,6 +666,7 @@ function Invoke-ExamLabInstallRecovery {
     if (@($results | Where-Object Status -eq 'Conflict').Count) {
         throw "The previous ExamLab installation has unresolved changes. See $examLabInstallChangesPath."
     }
+    Assert-ExamLabInactive
 }
 
 function Complete-ExamLabInstallChanges {

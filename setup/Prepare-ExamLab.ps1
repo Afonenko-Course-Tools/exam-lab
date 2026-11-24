@@ -92,10 +92,10 @@ function Get-UninstallEntries {
         'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
         'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*')) {
         Get-ItemProperty $key -ErrorAction SilentlyContinue |
-            Select-Object DisplayName,DisplayVersion,InstallLocation,DisplayIcon,UninstallString,PSPath | ForEach-Object {
+            Select-Object DisplayName,DisplayVersion,InstallLocation,DisplayIcon,Publisher,UninstallString,PSPath | ForEach-Object {
             [pscustomobject]@{ Name=[string]$_.DisplayName; Version=[string]$_.DisplayVersion;
                 Location=[string]$_.InstallLocation; DisplayIcon=[string]$_.DisplayIcon;
-                UninstallString=[string]$_.UninstallString; RegistryPath=[string]$_.PSPath;
+                Publisher=[string]$_.Publisher; UninstallString=[string]$_.UninstallString; RegistryPath=[string]$_.PSPath;
                 Machine=$key.StartsWith('HKLM:', [StringComparison]::OrdinalIgnoreCase) }
         }
     }
@@ -326,7 +326,7 @@ function Get-Tool([string]$Kind, [string]$ExplicitPath, [object[]]$Entries, [swi
                     $metadata = (Get-Item -LiteralPath $gitBinary).VersionInfo
                     $probe = "PE: ProductVersion=$($metadata.ProductVersion); FileVersion=$($metadata.FileVersion)"
                     $match = [regex]::Match("$($metadata.ProductVersion) $($metadata.FileVersion)", '\d+\.\d+\.\d+')
-                    $version = $match.Groups[1].Value
+                    $version = $match.Value
                     if (-not $match.Success) {
                         $entry = $registered | Where-Object { $_.Machine -and $_.Location -and
                             (ConvertTo-ToolRoot $_.Location Git) -ieq $path } | Select-Object -First 1
@@ -384,22 +384,22 @@ function Get-Inventory([switch]$VerifyVersions) {
 }
 
 function Get-IdeaReplacement($Inventory) {
+    if ($ReplaceIdeaPath -notmatch '^[A-Za-z]:[\\/]') { throw 'Conflict: -ReplaceIdeaPath требует полный локальный путь.' }
     $target = ConvertTo-ToolRoot $ReplaceIdeaPath IDEA
-    $pinned = @($Inventory.IDEA.Candidates | Where-Object { $_.Compatible -and $_.Version -eq $pins.IDEA.Version })
     $candidate = @($Inventory.IDEA.Candidates | Where-Object Path -ieq $target)
     if ($candidate.Count -and $candidate[0].Compatible -and $candidate[0].Version -eq $pins.IDEA.Version) { return }
     $launcher = Join-Path $target 'bin\idea64.exe'
     $uninstaller = Join-Path $target 'bin\uninstall.exe'
-    if ($pinned.Count -and -not (Test-Path -LiteralPath $launcher) -and -not (Test-Path -LiteralPath $uninstaller)) { return }
+    $matches = @(Get-UninstallEntries | Where-Object {
+        $_.Name -match '^IntelliJ IDEA' -and (Get-IdeaRegisteredExecutable $_) -ieq $uninstaller
+    })
+    if (-not $matches.Count -and -not (Test-Path -LiteralPath $launcher) -and -not (Test-Path -LiteralPath $uninstaller)) { return }
     if ($candidate.Count -ne 1 -or -not $candidate[0].Version -or
         -not (Test-Path -LiteralPath $launcher -PathType Leaf) -or -not (Test-TrustedExecutable $launcher) -or
         -not (Test-TrustedExecutable (Join-Path $target 'product-info.json'))) {
         throw "Conflict: не подтверждён установленный экземпляр IntelliJ IDEA в $target."
     }
-    $matches = @(Get-UninstallEntries | Where-Object {
-        $_.Name -match '^IntelliJ IDEA' -and (Get-IdeaRegisteredExecutable $_) -ieq $uninstaller
-    })
-    if ($matches.Count -ne 1 -or -not $matches[0].Machine -or
+    if ($matches.Count -ne 1 -or -not $matches[0].Machine -or $matches[0].Publisher -notmatch 'JetBrains' -or
         ($matches[0].Location -and (ConvertTo-ToolRoot $matches[0].Location IDEA) -ine $target) -or
         -not (Test-Path -LiteralPath $uninstaller -PathType Leaf) -or -not (Test-TrustedExecutable $uninstaller)) {
         throw "Conflict: для $target нужна единственная машинная запись со штатным защищённым bin\uninstall.exe."
@@ -412,7 +412,13 @@ function Get-IdeaReplacement($Inventory) {
             throw "Conflict: $target используется в PATH. Замену с сохранением прежнего PATH должен выполнить администратор."
         }
     }
+    foreach ($process in @(Get-Process -Name idea64,idea -ErrorAction SilentlyContinue)) {
+        if (-not $process.Path -or $process.Path.StartsWith("$target\", [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Conflict: закройте экземпляр IDEA в $target перед заменой."
+        }
+    }
     [pscustomobject]@{ Path=$target; Version=$candidate[0].Version; RegistryPath=$matches[0].RegistryPath;
+        Build=$candidate[0].Probe; RegisteredVersion=$matches[0].Version;
         Uninstaller=$uninstaller; SHA256=(Get-FileHash -LiteralPath $uninstaller -Algorithm SHA256).Hash }
 }
 
@@ -433,10 +439,11 @@ function Get-SoftwarePlan($Inventory) {
         $tool = $Inventory.$name
         $selected = $tool.Selected
         $remove = $null
-        if ($name -eq 'IDEA' -and $replacement) {
+        $explicitIdeaReplacement = $name -eq 'IDEA' -and $ReplaceIdeaPath -and -not $blockers.Count
+        if ($explicitIdeaReplacement) {
             $remove = $replacement
             $selected = $tool.Candidates | Where-Object { $_.Compatible -and $_.Version -eq $pins.IDEA.Version -and
-                $_.Path -ine $remove.Path } | Select-Object -First 1
+                (-not $remove -or $_.Path -ine $remove.Path) } | Select-Object -First 1
         }
         $operation = 'Keep'
         if ($remove) { $operation = 'Replace' }
@@ -450,7 +457,7 @@ function Get-SoftwarePlan($Inventory) {
             $reason = $null
             if ($existingTemurin25) {
                 $reason = 'Непригодный Temurin 25 уже зарегистрирован. Второй MSI этой версии может изменить прежний JDK.'
-            } elseif ($tool.State -eq 'Conflict' -and -not ($alongside -or $remove)) {
+            } elseif ($tool.State -eq 'Conflict' -and -not ($alongside -or $explicitIdeaReplacement)) {
                 $reason = "Выберите подходящий каталог через -${name}Path. IDEA и Gradle можно установить рядом с -InstallAlongside."
             } elseif (Test-Path -LiteralPath $destination) {
                 $reason = "Занят каталог назначения $destination."
@@ -476,11 +483,6 @@ function Remove-ReplacedIdea($Approved) {
     $current = Get-IdeaReplacement $inventory
     if (-not $current -or ($current | ConvertTo-Json -Compress) -cne ($Approved | ConvertTo-Json -Compress)) {
         throw 'Conflict: экземпляр IDEA или штатный деинсталлятор изменился после проверки.'
-    }
-    foreach ($process in @(Get-Process -Name idea64,idea -ErrorAction SilentlyContinue)) {
-        if (-not $process.Path -or $process.Path.StartsWith("$($Approved.Path)\", [StringComparison]::OrdinalIgnoreCase)) {
-            throw "Conflict: закройте экземпляр IDEA в $($Approved.Path) перед заменой."
-        }
     }
     Write-Host "Удаление IDEA $($Approved.Version) по согласованному пути $($Approved.Path)."
     $process = Start-Process -FilePath $Approved.Uninstaller -ArgumentList '/S' -WorkingDirectory (Split-Path $Approved.Uninstaller -Parent) -Wait -PassThru
@@ -812,6 +814,12 @@ try {
         foreach ($package in $pending) { $installers[$package.Name] = Get-Installer $package.Name }
         foreach ($actionItem in $report.Plan.Actions) {
             $name = $actionItem.Name
+            if ($actionItem.Replacement) {
+                if ($script:RebootRequired) { continue }
+                # Части выпуска IDEA могут использовать одну запись удаления Windows.
+                # Сначала проверен весь кэш, затем выполняется явная замена.
+                Remove-ReplacedIdea $actionItem.Replacement
+            }
             if ($installers.ContainsKey($name)) {
                 Install-Tool $name $installers[$name] $actionItem.Destination
             } else {
@@ -855,10 +863,6 @@ try {
                     $script:Changes.Add([pscustomobject]@{ Tool='IDEA'; Operation=$operation; Source=$path; Backup=$destination })
                 }
             }
-        }
-        $ideaAction = $report.Plan.Actions | Where-Object Name -eq 'IDEA'
-        if ($ideaAction.Replacement -and -not $script:RebootRequired) {
-            Remove-ReplacedIdea $ideaAction.Replacement
         }
     }
     $report.After = if ($inspectOnly) { $inventory } else { Get-Inventory -VerifyVersions }

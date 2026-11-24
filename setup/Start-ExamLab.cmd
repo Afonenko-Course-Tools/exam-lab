@@ -251,6 +251,57 @@ function Save-Artifact($Artifact) {
     else { [IO.File]::Move($partial, $target) }
 }
 
+function Complete-DiagnosticArchive([string]$Directory) {
+    $archive = Join-Path $Directory 'diagnostics.zip'
+    if ([IO.File]::Exists($archive)) { return }
+    $temporary = "$archive.partial"
+    if ($admin -and (Test-Path -LiteralPath $temporary)) { Assert-ExamLabProtectedPath $temporary }
+    [IO.File]::Delete($temporary)
+    try {
+        [IO.Compression.ZipFile]::CreateFromDirectory((Join-Path $Directory 'report'), $temporary)
+        [IO.File]::Move($temporary, $archive)
+    } finally { [IO.File]::Delete($temporary) }
+}
+
+function Complete-InterruptedDiagnostics([string]$Directory) {
+    if ([IO.File]::Exists((Join-Path $Directory 'diagnostics.zip'))) { return }
+    $startFile = Join-Path $Directory 'attempt-start.json'
+    $receiverFile = Join-Path $Directory 'delivery-target.txt'
+    $attemptLockPath = Join-Path $Directory 'attempt.lock'
+    if (-not ([IO.File]::Exists($startFile) -and [IO.File]::Exists($receiverFile) -and
+        [IO.File]::Exists($attemptLockPath))) { return }
+    if ($admin) {
+        foreach ($candidate in $startFile, $receiverFile, $attemptLockPath) { Assert-ExamLabProtectedPath $candidate }
+    }
+    if ([IO.File]::ReadAllText($receiverFile) -cne $receiver) { return }
+    $previousLock = $null
+    $childLock = $null
+    try {
+        try {
+            $previousLock = [IO.File]::Open($attemptLockPath, 'Open', 'ReadWrite', 'None')
+            $childLockPath = Join-Path $Directory 'child.lock'
+            if ([IO.File]::Exists($childLockPath)) {
+                if ($admin) { Assert-ExamLabProtectedPath $childLockPath }
+                $childLock = [IO.File]::Open($childLockPath, 'Open', 'ReadWrite', 'None')
+            }
+        } catch [IO.IOException] { return }
+        $previousReport = Join-Path $Directory 'report'
+        if ($admin) { Assert-ExamLabProtectedPath $previousReport }
+        $summary = Join-Path $previousReport 'attempt.json'
+        if (-not [IO.File]::Exists($summary)) {
+            $start = [IO.File]::ReadAllText($startFile) | ConvertFrom-Json
+            [ordered]@{
+                Attempt=$start.Attempt; Release=$start.Release; Action=$start.Action; StartedUtc=$start.StartedUtc
+                Interrupted=$true; RecoveredUtc=[DateTime]::UtcNow
+            } | ConvertTo-Json | Set-Content -LiteralPath $summary -Encoding UTF8
+        }
+        Complete-DiagnosticArchive $Directory
+    } finally {
+        if ($childLock) { $childLock.Dispose() }
+        if ($previousLock) { $previousLock.Dispose() }
+    }
+}
+
 function Send-Diagnostics([string]$Directory) {
     $archive = Join-Path $Directory 'diagnostics.zip'
     $receipt = Join-Path $Directory 'upload-result.json'
@@ -260,6 +311,11 @@ function Send-Diagnostics([string]$Directory) {
     if ($admin) {
         Assert-ExamLabProtectedPath $archive
         Assert-ExamLabProtectedPath $receiverFile
+    }
+    if (-not $admin) {
+        foreach ($candidate in $archive, $receiverFile) {
+            if ((Get-Item -LiteralPath $candidate -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { return }
+        }
     }
     if ([IO.File]::ReadAllText($receiverFile) -cne $receiver) { return }
     if (Test-Path -LiteralPath $receipt -PathType Leaf) {
@@ -348,7 +404,7 @@ function Get-ReleasePlan($Check, [bool]$RuntimeReady) {
     $missing = @($rows | Where-Object CacheStatus -eq 'Missing')
     $plan = [ordered]@{
         Release=$release; Attempt=$attempt; Action=$action; Elevated=$admin; Offline=$offline
-        PowerShell7Ready=$RuntimeReady; Artifacts=@($rows)
+        PowerShell7Ready=$RuntimeReady; Artifacts=@($rows); Transport='HTTPS; byte ranges tested during delivery'
         DownloadBytes=$(if (-not $unknown.Count) { [long](($missing | Measure-Object Bytes -Sum).Sum) })
         DownloadUpperBoundBytes=[long](($rows | Where-Object CacheStatus -ne 'Cached' | Measure-Object Bytes -Sum).Sum)
         CacheDriveFreeBytes=([IO.DriveInfo]::new([IO.Path]::GetPathRoot($programFiles))).AvailableFreeSpace
@@ -384,13 +440,31 @@ function Invoke-Bootstrap {
         }
         if ($platform.PartOfDomain -eq $true) { $bootCheck.Add('The pilot requires a standalone Windows computer.') }
     }
-    if ($check.Preflight) { $check.Preflight.Services | Format-Table Name, Status, StartValue -AutoSize | Out-Host }
+    if ($check.Preflight) {
+        $check.Preflight.Services | Format-Table Name, Status, StartValue -AutoSize | Out-Host
+        foreach ($service in @($check.Preflight.Services | Where-Object StartValue -eq 4)) {
+            $bootCheck.Add("The required Windows service $($service.Name) is disabled.")
+        }
+        if ($admin -and $check.Preflight.LocalMLGPO.Status -eq 'AbsentBindings') {
+            $bootCheck.Add('Windows Local Group Policy components are absent.')
+        }
+    }
+    $taskObservation = 'NotCheckedWithoutElevation'
+    if ($admin) {
+        try {
+            $tasks = @(Get-ScheduledTask -TaskPath '\' -ErrorAction Stop |
+                Where-Object TaskName -in 'ExamLab-Local-prepare', 'ExamLab-Local-check', 'ExamLab-Local-exam',
+                    'ExamLab-Local-normal', 'ExamLab-Controller-Poll' | Select-Object TaskName, State)
+            $taskObservation = $tasks
+            $tasks | Format-Table -AutoSize | Out-Host
+        } catch { $taskObservation = "Unknown: $_" }
+    }
     if ($check.Plan) {
         $check.Plan.Actions | Format-Table Name, Operation, ExistingVersion, ExistingPath, Destination -AutoSize | Out-Host
     }
     $check.Errors | ForEach-Object { Write-Host "Check: $_" }
     $bootCheck | ForEach-Object { Write-Host "Check: $_" }
-    [ordered]@{ Blockers=$bootCheck.ToArray(); NativeCheckExit=$checkExit } | ConvertTo-Json |
+    [ordered]@{ Blockers=$bootCheck.ToArray(); NativeCheckExit=$checkExit; InstalledTasks=$taskObservation } | ConvertTo-Json |
         Set-Content -LiteralPath (Join-Path $report 'pilot-preflight.json') -Encoding UTF8
     if ($action -ne 'Verify' -and ($checkExit -ne 0 -or $bootCheck.Count)) {
         Write-Host "Check report: $report"
@@ -451,6 +525,8 @@ try {
     [void][IO.Directory]::CreateDirectory($report)
     [IO.File]::WriteAllText((Join-Path $work 'delivery-target.txt'), $receiver)
     $attemptLock = [IO.File]::Open((Join-Path $work 'attempt.lock'), 'CreateNew', 'ReadWrite', 'None')
+    [ordered]@{ Attempt=$attempt; Release=$release; Action=$action; StartedUtc=[DateTime]::UtcNow } | ConvertTo-Json |
+        Set-Content -LiteralPath (Join-Path $work 'attempt-start.json') -Encoding UTF8
     Start-Transcript -LiteralPath (Join-Path $report 'bootstrap.log') | Out-Null
     $transcribing = $true
     Write-Host "ExamLab $release, $action, attempt $attempt"
@@ -480,10 +556,12 @@ try {
         try {
             if (-not (Test-Path -LiteralPath (Join-Path $report 'powershell-transcript.log'))) {
                 $eventLog = Join-Path ([Environment]::GetFolderPath('System')) 'wevtutil.exe'
-                & $eventLog qe Application '/q:*[System[Provider[@Name="MsiInstaller"] and TimeCreated[timediff(@SystemTime) <= 900000]]]' `
-                    /rd:true /c:30 /f:xml 2>&1 | Out-File -LiteralPath (Join-Path $report 'bootstrap-msi-events.xml') -Encoding UTF8
-                & $eventLog qe System '/q:*[System[Provider[@Name="Schannel"] and TimeCreated[timediff(@SystemTime) <= 900000]]]' `
-                    /rd:true /c:30 /f:xml 2>&1 | Out-File -LiteralPath (Join-Path $report 'bootstrap-schannel-events.xml') -Encoding UTF8
+                $ErrorActionPreference = 'Continue'
+                & $eventLog qe Application "/q:*[System[Provider[@Name='MsiInstaller'] and TimeCreated[timediff(@SystemTime) <= 900000]]]" `
+                    /rd:true /c:30 /f:xml /e:Events 2>&1 | Out-File -LiteralPath (Join-Path $report 'bootstrap-msi-events.xml') -Encoding UTF8
+                & $eventLog qe System "/q:*[System[Provider[@Name='Schannel'] and TimeCreated[timediff(@SystemTime) <= 900000]]]" `
+                    /rd:true /c:30 /f:xml /e:Events 2>&1 | Out-File -LiteralPath (Join-Path $report 'bootstrap-schannel-events.xml') -Encoding UTF8
+                $ErrorActionPreference = 'Stop'
             }
         } catch { Write-Warning "Native Windows events unavailable: $_" }
         Write-Host "Attempt $attempt finished with exit $result."
@@ -492,12 +570,7 @@ try {
             [ordered]@{ Attempt=$attempt; Release=$release; Action=$action; ExitCode=$result; EndedUtc=[DateTime]::UtcNow } |
                 ConvertTo-Json | Set-Content -LiteralPath (Join-Path $report 'attempt.json') -Encoding UTF8
             Add-Type -AssemblyName System.IO.Compression.FileSystem
-            $archive = Join-Path $work 'diagnostics.zip'
-            $temporary = "$archive.partial"
-            try {
-                [IO.Compression.ZipFile]::CreateFromDirectory($report, $temporary)
-                [IO.File]::Move($temporary, $archive)
-            } finally { [IO.File]::Delete($temporary) }
+            Complete-DiagnosticArchive $work
             $retryPrevious = -not $offline
             try { Send-Diagnostics $work }
             catch {
@@ -508,10 +581,16 @@ try {
             }
             if ($retryPrevious) {
                 $previous = Get-ChildItem -LiteralPath $attemptParent -Directory -Filter 'ExamLabBootstrap-*' |
-                    Where-Object { $_.FullName -ne $work -and -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) }
+                    Where-Object {
+                        $_.Name -cmatch '^ExamLabBootstrap-[0-9a-f]{32}$' -and $_.FullName -ne $work -and
+                            -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint)
+                    }
                 foreach ($directory in $previous) {
                     try {
-                        if ($admin) { Assert-ExamLabProtectedPath $directory.FullName }
+                        if ($admin) {
+                            Assert-ExamLabProtectedPath $directory.FullName
+                            Complete-InterruptedDiagnostics $directory.FullName
+                        }
                         Send-Diagnostics $directory.FullName
                     } catch { Write-Warning "Diagnostic delivery is pending for $($directory.Name): $_" }
                 }

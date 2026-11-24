@@ -17,6 +17,7 @@ $diagnosticReport = Join-Path $diagnosticDirectory 'report'
 
 $examLabStartCertificates = [Collections.Generic.List[Security.Cryptography.X509Certificates.X509Certificate2]]::new()
 $transcribing = $false
+$childLock = [IO.File]::Open((Join-Path $diagnosticDirectory 'child.lock'), 'CreateNew', 'ReadWrite', 'None')
 try {
     Start-Transcript -LiteralPath (Join-Path $diagnosticReport 'powershell-transcript.log') | Out-Null
     $transcribing = $true
@@ -38,4 +39,5 @@ try {
     if ($transcribing) { try { Stop-Transcript | Out-Null } catch { Write-Warning $_ } }
     try { Collect-ExamLabDiagnostics -DiagnosticDirectory $diagnosticDirectory }
     catch { [Console]::Error.WriteLine("Additional diagnostics unavailable: $($_.Exception.Message)") }
+    finally { $childLock.Dispose() }
 }
