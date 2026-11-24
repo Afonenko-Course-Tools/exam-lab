@@ -180,7 +180,7 @@ function Get-ExamLabSetupAccountIssue([object[]]$LocalAccounts) {
 }
 
 function Read-Context {
-    param([switch]$AllowRosterDriftOnlyForNormal, [string]$ObservedGuestSid)
+    param([switch]$AllowRosterDriftOnlyForNormal, [string]$ObservedGuestSid, $PollTiming)
     Assert-Host
     if ($PSScriptRoot -ne $script:CodeRoot -or
         (Get-FileHash -LiteralPath (Join-Path $script:CodeRoot 'ExamLab.psm1') -Algorithm SHA256).Hash -cne $script:LoadedSourceHash) {
@@ -213,7 +213,9 @@ function Read-Context {
     $roster=Test-LiveRoster $config $localAccounts -AllowDrift:$AllowRosterDriftOnlyForNormal -ObservedGuestSid $ObservedGuestSid
     $lgpo=Join-Path $script:CodeRoot 'LGPO.exe'
     if ((Get-FileHash -LiteralPath $lgpo -Algorithm SHA256).Hash -ne '0C97F29543418B30340C4FF5D930D31E6196DD59C2CC74B6B890FA7B90C910C7') { throw 'Неизвестный LGPO.exe.' }
+    Add-ExamLabPollBoundary $PollTiming 'lgpoSignature'
     $signature=Get-AuthenticodeSignature -LiteralPath $lgpo
+    Add-ExamLabPollBoundary $PollTiming 'lgpoSignatureEnd'
     if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') { throw 'Подпись Microsoft LGPO не подтверждена.' }
     [pscustomobject]@{
         Config=$config; Revision=$revision; Metadata=$metadata; LGPO=$lgpo
@@ -231,11 +233,14 @@ function Get-SharedPCState {
 }
 
 function Get-ComponentStatus {
-    param($Context)
+    param($Context, $PollTiming)
     $network=$null
     if ($Context.Config.PSObject.Properties.Name -contains 'Network') { $network=$Context.Config.Network }
+    Add-ExamLabPollBoundary $PollTiming 'usb'
+    $usbStatus=Get-ExamLabUsbStatus -ConfigRevision $Context.Revision
+    Add-ExamLabPollBoundary $PollTiming 'network'
     [pscustomobject]@{
-        Usb=(Get-ExamLabUsbStatus -ConfigRevision $Context.Revision)
+        Usb=$usbStatus
         Network=(Get-ExamNetworkStatus -Config $network -ConfigRevision $Context.Revision)
     }
 }
@@ -259,7 +264,8 @@ function Test-SharedPCUnset {
 }
 
 function Get-Status {
-    param($Context)
+    param($Context, $PollTiming)
+    Add-ExamLabPollBoundary $PollTiming 'sharedPc'
     $shared=Get-SharedPCState
     $settings=$null
     if ($shared.State -eq 'Observed' -and $shared.Count -eq 1) {
@@ -271,7 +277,8 @@ function Get-Status {
         }
         $settings=[pscustomobject]$settings
     }
-    $components=Get-ComponentStatus $Context
+    $components=Get-ComponentStatus $Context $PollTiming
+    Add-ExamLabPollBoundary $PollTiming 'statusReadback'
     # Единственный USB scanner принадлежит компоненту: он различает own и foreign.
     $conflicts=@($components.Usb.Conflicts)+@($components.Network.Blockers)
     $sourceNormal=($components.Usb.State -in @('NotConfigured','Normal') -and $components.Network.SourceNormal -and
@@ -748,10 +755,11 @@ function Get-ExamLabActiveGuest([DateTime]$Boot) {
     return [pscustomobject]@{Logon=$logon; Status='GuestCandidate'}
 }
 
-function Get-ExamLabControllerPolicyReadback($Guest) {
+function Get-ExamLabControllerPolicyReadback($Guest, $PollTiming) {
     $guestSid = if ($Guest) { $Guest.Sid }
-    $context = Read-Context -ObservedGuestSid $guestSid
-    $status = Get-Status $context
+    Add-ExamLabPollBoundary $PollTiming 'context'
+    $context = Read-Context -ObservedGuestSid $guestSid -PollTiming $PollTiming
+    $status = Get-Status $context $PollTiming
     $usb = $status.Components.Usb
     if ($status.Prepared -and $usb.State -ceq 'Applied' -and $usb.OwnSourceEntries -eq 1 -and
         $usb.MetadataRevisionMatches -and -not $status.Conflicts.Count -and $status.Components.Network.EffectiveApplied) {
@@ -792,7 +800,7 @@ function Get-ExamLabControllerGuestBinding {
     }
 }
 
-function Get-ExamLabControllerObservation($Configuration, $Snapshot, [DateTime]$Boot, [string]$BootUtc) {
+function Get-ExamLabControllerObservation($Configuration, $Snapshot, [DateTime]$Boot, [string]$BootUtc, $PollTiming) {
     $observation = [pscustomobject]@{Result=$Snapshot.Result; Readiness=$null; GuestObservation=$null}
     if (-not $Snapshot.Result) { return $observation }
     $readiness = [pscustomobject]@{
@@ -805,6 +813,7 @@ function Get-ExamLabControllerObservation($Configuration, $Snapshot, [DateTime]$
 
     $lock = $null
     try {
+        Add-ExamLabPollBoundary $PollTiming 'observationBinding'
         $lockPath = Join-Path $script:DataRoot 'operation.lock'
         Assert-SafePath $lockPath
         $lock = [IO.File]::Open($lockPath, 'Open', 'Read', 'None')
@@ -817,17 +826,19 @@ function Get-ExamLabControllerObservation($Configuration, $Snapshot, [DateTime]$
 
         if (-not (Test-ExamLabControllerPolicyProbeEnabled)) { return $observation }
         $guest = $null
+        Add-ExamLabPollBoundary $PollTiming 'console'
         try {
             $guestCandidate = Get-ExamLabActiveGuest $Boot
             $guest = $guestCandidate.Logon
             $observation.GuestObservation = $guestCandidate.Status
         } catch { $observation.GuestObservation = 'GuestObservationUnavailable' }
-        $context = Get-ExamLabControllerPolicyReadback $guest
+        $context = Get-ExamLabControllerPolicyReadback $guest $PollTiming
         if (-not $context) { return $observation }
         if (-not $context.Config.Network.PSObject.Properties['WazuhEndpoint']) {
             $observation.GuestObservation = 'WazuhNotConfigured'
             return $observation
         }
+        Add-ExamLabPollBoundary $PollTiming 'wazuh'
         try {
             if (-not (Test-ExamLabWazuhRunning)) {
                 $observation.GuestObservation = 'WazuhNotRunning'
@@ -839,6 +850,7 @@ function Get-ExamLabControllerObservation($Configuration, $Snapshot, [DateTime]$
         }
 
         $guestSessionId = $null
+        Add-ExamLabPollBoundary $PollTiming 'confirmConsole'
         if ($guest) {
             if ($guest.Sid -cin @($context.Config.OrdinaryAccounts.Sid)) {
                 $observation.GuestObservation = 'GuestListedAsOrdinary'
@@ -866,7 +878,7 @@ function Get-ExamLabControllerObservation($Configuration, $Snapshot, [DateTime]$
     return $observation
 }
 
-function Get-ExamLabControllerClientReport($Observation) {
+function Get-ExamLabControllerClientReport($Observation, $PollTiming) {
     $installation = $null
     try {
         $reportsRoot = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'ExamLabSetupReports'
@@ -886,6 +898,7 @@ function Get-ExamLabControllerClientReport($Observation) {
         $report.guestState = if ($readiness.guestSessionId) { 'present' }
             elseif (Test-ControllerNoGuestSession) { 'absent' } else { 'unknown' }
     }
+    Add-ExamLabPollBoundary $PollTiming 'alertRead'
     try {
         $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\ExamLabAlertPilot')
         $hasState = $false
@@ -930,6 +943,20 @@ function Get-ControllerPollDelayMilliseconds([long]$ElapsedMilliseconds, [string
     return [int][Math]::Max(1000L, 15000L - $ElapsedMilliseconds)
 }
 
+function Add-ExamLabPollBoundary($Timing, [string]$Name) {
+    if ($Timing) { $Timing.Marks[$Name] = $Timing.Clock.ElapsedMilliseconds }
+}
+
+function Wait-ExamLabPollCycle($Cycle, $Record, [string]$Status) {
+    $delay = Get-ControllerPollDelayMilliseconds $Cycle.ElapsedMilliseconds $Status
+    $Record.Status = $Status
+    $Record.SleepPlannedMilliseconds = $delay
+    $sleepStarted = $Cycle.ElapsedMilliseconds
+    $Record.OffsetsMs.SleepStart = $sleepStarted
+    Start-Sleep -Milliseconds $delay
+    $Record.SleepActualMilliseconds = $Cycle.ElapsedMilliseconds - $sleepStarted
+}
+
 function Invoke-ExamLabControllerLoop {
     Assert-Host
     if ($PSScriptRoot -ne $script:CodeRoot) { throw 'Запустите установленную задачу опроса.' }
@@ -944,7 +971,7 @@ function Invoke-ExamLabControllerLoop {
     $health = [pscustomobject]@{
         BootUtc=$bootUtc; FirstAttemptUtc=$null; LastAttemptUtc=$null
         FirstValidContactUtc=$null; LastValidContactUtc=$null; Status='Starting'; Reason=$null; ActionDetail=$null
-        Readiness=$null; GuestObservation=$null
+        Readiness=$null; GuestObservation=$null; PollTiming=$null
     }
     if (Test-ExistingFile $script:ControllerHealthFile) {
         Assert-SafePath $script:ControllerHealthFile
@@ -956,32 +983,66 @@ function Invoke-ExamLabControllerLoop {
         }
     }
     $client = New-ExamLabHttpClient
+    $recent = [Collections.Generic.Queue[object]]::new()
+    $record = $null
     try {
         while ($true) {
             $cycle = [Diagnostics.Stopwatch]::StartNew()
             $health.LastAttemptUtc = Get-ControllerUtc
+            if ($record) {
+                $recent.Enqueue($record)
+                if ($recent.Count -gt 8) { $null = $recent.Dequeue() }
+            }
+            # Временная диагностика RC14. Содержит только времена, фазы и безопасные статусы.
+            $record = [ordered]@{
+                StartedUtc=$health.LastAttemptUtc; ValidContactUtc=$null; ReadinessObservedUtc=$null
+                MachineReady=$null; GuestPresent=$null; Status=$null; FailedStep=$null
+                OffsetsMs=[ordered]@{}; DetailOffsetsMs=[ordered]@{}
+                SleepPlannedMilliseconds=$null; SleepActualMilliseconds=$null
+            }
+            $timing = [pscustomobject]@{Clock=$cycle; Marks=$record.DetailOffsetsMs}
+            $health.PollTiming = [ordered]@{Recent=$recent.ToArray(); Current=$record}
             $health.ActionDetail = $null
             $health.Readiness = $null
             $health.GuestObservation = $null
             if (-not $health.FirstAttemptUtc) { $health.FirstAttemptUtc = $health.LastAttemptUtc }
             Write-ControllerJson $script:ControllerHealthFile $health
+            $step = 'state'
+            $record.OffsetsMs[$step] = $cycle.ElapsedMilliseconds
             try {
                 $snapshot = Read-ControllerState $script:ControllerStateFile $configuration.deviceId
             } catch {
                 $health.Status='LocalError'
                 $health.Reason='controller-state-unreadable'
+                $record.FailedStep=$step
+                $record.OffsetsMs.Failure=$cycle.ElapsedMilliseconds
                 Write-ControllerJson $script:ControllerHealthFile $health
-                Start-Sleep -Milliseconds (Get-ControllerPollDelayMilliseconds $cycle.ElapsedMilliseconds $health.Status)
+                Wait-ExamLabPollCycle $cycle $record $health.Status
                 continue
             }
             try {
-                $observation = Get-ExamLabControllerObservation $configuration $snapshot $boot $bootUtc
-                $clientReport = Get-ExamLabControllerClientReport $observation
-                $response = Invoke-ControllerRequest $client $configuration $observation.Result $observation.Readiness `
-                    -ClientReport $clientReport -ResponseEnvelope
+                $step = 'observation'
+                $record.OffsetsMs[$step] = $cycle.ElapsedMilliseconds
+                $observation = Get-ExamLabControllerObservation $configuration $snapshot $boot $bootUtc $timing
+                $step = 'clientReport'
+                $record.OffsetsMs[$step] = $cycle.ElapsedMilliseconds
+                if ($observation.Readiness) {
+                    $record.ReadinessObservedUtc = $observation.Readiness.observedUtc
+                    $record.MachineReady = $observation.Readiness.machineReady
+                    $record.GuestPresent = [bool]$observation.Readiness.guestSessionId
+                }
+                $clientReport = Get-ExamLabControllerClientReport $observation $timing
+                $step = 'http'
+                $record.OffsetsMs[$step] = $cycle.ElapsedMilliseconds
+                try {
+                    $response = Invoke-ControllerRequest $client $configuration $observation.Result $observation.Readiness `
+                        -ClientReport $clientReport -ResponseEnvelope
+                } finally { $record.OffsetsMs.HttpEnd = $cycle.ElapsedMilliseconds }
+                $step = 'response'
                 $assignment = $response.Assignment
                 $null = Compare-ControllerAssignment $assignment $snapshot.Assignment
                 $health.LastValidContactUtc = Get-ControllerUtc
+                $record.ValidContactUtc = $health.LastValidContactUtc
                 if (-not $health.FirstValidContactUtc) { $health.FirstValidContactUtc = $health.LastValidContactUtc }
                 $health.Status='Connected'
                 $health.Reason=$null
@@ -991,27 +1052,38 @@ function Invoke-ExamLabControllerLoop {
                 }
                 Write-ControllerJson $script:ControllerHealthFile $health
                 try {
+                    $step = 'mode'
+                    $record.OffsetsMs[$step] = $cycle.ElapsedMilliseconds
                     $null = Set-ExamLabMode -Mode $assignment.mode -ControllerAssignment $assignment -LocalGeneration $snapshot.LocalGeneration
                     if ($assignment.mode -ceq 'exam' -and $assignment.examId -clike 'file-trace-*') {
+                        $step = 'trace'
+                        $record.OffsetsMs[$step] = $cycle.ElapsedMilliseconds
                         if (-not $script:FileTraceLoaded) { throw 'Установленный обработчик FileIO.light недоступен.' }
                         Invoke-ExamLabFileTraceAssignment -Assignment $assignment -Configuration $configuration `
                             -Snapshot $snapshot -Observation $observation
                     }
                     if ($response.AlertAcknowledgement) {
+                        $step = 'alert'
+                        $record.OffsetsMs[$step] = $cycle.ElapsedMilliseconds
                         Invoke-ExamLabControllerAlertAcknowledgement $response.AlertAcknowledgement $assignment $snapshot
                     }
+                    $record.OffsetsMs.ActionsEnd = $cycle.ElapsedMilliseconds
                 } catch {
                     $health.Status='LocalError'
                     $health.Reason='controller-action-delayed-or-failed'
                     $health.ActionDetail=$_.Exception.Message
+                    $record.FailedStep=$step
+                    $record.OffsetsMs.Failure=$cycle.ElapsedMilliseconds
                     Write-ControllerJson $script:ControllerHealthFile $health
                 }
             } catch {
                 $health.Status = if ($_.Exception.Message -ceq 'controller-unreachable') { 'Unavailable' } else { 'Rejected' }
                 $health.Reason = $_.Exception.Message
+                $record.FailedStep=$step
+                $record.OffsetsMs.Failure=$cycle.ElapsedMilliseconds
                 Write-ControllerJson $script:ControllerHealthFile $health
             }
-            Start-Sleep -Milliseconds (Get-ControllerPollDelayMilliseconds $cycle.ElapsedMilliseconds $health.Status)
+            Wait-ExamLabPollCycle $cycle $record $health.Status
         }
     } finally { $client.Dispose() }
 }
