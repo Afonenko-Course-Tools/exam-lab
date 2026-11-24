@@ -27,6 +27,10 @@ if (@CHECK_ONLY@) {
     }
 }
 $offline = $options -contains '--offline'
+if ($action -eq 'Check' -and [Console]::IsOutputRedirected) {
+    try { [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false) }
+    catch [IO.IOException] { }
+}
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $admin = [Security.Principal.WindowsPrincipal]::new($identity).IsInRole(
     [Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -352,25 +356,33 @@ function Send-Diagnostics([string]$Directory) {
         }
     }
     if ([IO.File]::ReadAllText($receiverFile) -cne $receiver) { return }
-    $length = (Get-Item -LiteralPath $archive -Force).Length
-    if ($length -gt 8MB) { throw 'Размер ZIP превышает лимит приёмника 8 МиБ.' }
-    $expectedId = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.Substring(0, 32).ToLowerInvariant()
-    if (Test-Path -LiteralPath $receipt -PathType Leaf) {
-        if ($admin) { Assert-ExamLabProtectedPath $receipt }
-        try {
-            $saved = [IO.File]::ReadAllText($receipt) | ConvertFrom-Json
-            if ($saved.reportId -ceq $expectedId) { return $expectedId }
-        } catch { Write-Warning "Invalid diagnostics receipt in $Directory. Retrying the same ZIP." }
-    }
-    Start-BootstrapTransport
-    $request = $transport.Request("$baseUrl/diagnostics")
-    $request.Method = 'POST'
-    $request.ContentType = 'application/zip'
-    $request.AllowWriteStreamBuffering = $false
-    $request.ServicePoint.Expect100Continue = $false
-    $request.ContentLength = $length
     $archiveStream = [IO.File]::Open($archive, 'Open', 'Read', 'Read')
     try {
+        $length = $archiveStream.Length
+        if ($length -gt 8MB) { throw 'Размер ZIP превышает лимит приёмника 8 МиБ.' }
+        $archiveSha256 = (Get-FileHash -InputStream $archiveStream -Algorithm SHA256).Hash.ToLowerInvariant()
+        $archiveStream.Position = 0
+        if (Test-Path -LiteralPath $receipt -PathType Leaf) {
+            if ($admin) { Assert-ExamLabProtectedPath $receipt }
+            try {
+                $saved = [IO.File]::ReadAllText($receipt) | ConvertFrom-Json
+                if ($saved.reportId -is [string] -and $saved.reportId -cmatch '\A[0-9a-f]{32}\z') {
+                    # Legacy receipts carry only the opaque server ID.
+                    if (-not $saved.PSObject.Properties['archiveSha256'] -or
+                        ($saved.archiveSha256 -is [string] -and $saved.archiveSha256 -ceq $archiveSha256)) {
+                        return $saved.reportId
+                    }
+                }
+            } catch { }
+            Write-Warning "Invalid diagnostics receipt in $Directory. Sending the local ZIP."
+        }
+        Start-BootstrapTransport
+        $request = $transport.Request("$baseUrl/diagnostics")
+        $request.Method = 'POST'
+        $request.ContentType = 'application/zip'
+        $request.AllowWriteStreamBuffering = $false
+        $request.ServicePoint.Expect100Continue = $false
+        $request.ContentLength = $length
         $output = $request.GetRequestStream()
         try { $archiveStream.CopyTo($output) } finally { $output.Dispose() }
         $response = $request.GetResponse()
@@ -380,12 +392,15 @@ function Send-Diagnostics([string]$Directory) {
             try {
                 $content = $reader.ReadToEnd()
                 $id = ($content | ConvertFrom-Json).reportId
-                if ($id -cne $expectedId) { throw 'Номер принятого архива не соответствует SHA-256 локального ZIP.' }
+                if ($id -isnot [string] -or $id -cnotmatch '\A[0-9a-f]{32}\z') {
+                    throw 'В ответе приёмника нет номера принятого архива.'
+                }
             } finally { $reader.Dispose() }
         } finally { $response.Dispose() }
         $temporary = "$receipt.$([Guid]::NewGuid().ToString('N')).tmp"
         try {
-            [IO.File]::WriteAllText($temporary, $content)
+            $localReceipt = [ordered]@{ reportId=$id; archiveSha256=$archiveSha256 } | ConvertTo-Json -Compress
+            [IO.File]::WriteAllText($temporary, $localReceipt)
             if ([IO.File]::Exists($receipt)) { [IO.File]::Replace($temporary, $receipt, [NullString]::Value) }
             else { [IO.File]::Move($temporary, $receipt) }
         } finally { [IO.File]::Delete($temporary) }
@@ -936,18 +951,24 @@ try {
             }
         } catch { Write-Warning "Diagnostic delivery is pending: $_" }
         if ($action -eq 'Check') {
+            $summary = @(
+                "Обследование ExamLab $($release.Substring(0, 12)) завершено."
+                switch ($result) {
+                    0 { 'Проверка предпосылок завершена. План подготовки сохранён.' }
+                    2 { 'Найдены препятствия для подготовки. Причины сохранены в отчёте.' }
+                    default { 'Часть проверок завершилась с ошибкой. Подробности сохранены в отчёте.' }
+                }
+                if ($currentReceipt) { "Номер принятого архива $currentReceipt" }
+                elseif ([IO.File]::Exists($archive)) { 'Архив не отправлен. Передайте его владельцу стенда закрытым способом.' }
+                if ([IO.File]::Exists($inventoryReport)) { "Сводка $inventoryReport" }
+                if ([IO.File]::Exists($archive)) { "Локальный ZIP $archive" }
+                else { "Локальные материалы $work" }
+            )
             Write-Host ''
-            Write-Host "Обследование ExamLab $($release.Substring(0, 12)) завершено."
-            switch ($result) {
-                0 { Write-Host 'Проверка предпосылок завершена. План подготовки сохранён.' }
-                2 { Write-Host 'Найдены препятствия для подготовки. Причины сохранены в отчёте.' }
-                default { Write-Host 'Часть проверок завершилась с ошибкой. Подробности сохранены в отчёте.' }
-            }
-            if ($currentReceipt) { Write-Host "Номер принятого архива $currentReceipt" }
-            elseif ([IO.File]::Exists($archive)) { Write-Host 'Архив не отправлен. Передайте его владельцу стенда закрытым способом.' }
-            if ([IO.File]::Exists($inventoryReport)) { Write-Host "Сводка $inventoryReport" }
-            if ([IO.File]::Exists($archive)) { Write-Host "Локальный ZIP $archive" }
-            else { Write-Host "Локальные материалы $work" }
+            $summary | ForEach-Object { Write-Host $_ }
+            try {
+                [IO.File]::WriteAllLines((Join-Path $work 'check-result.txt'), [string[]]$summary, [Text.UTF8Encoding]::new($true))
+            } catch { Write-Warning 'Отдельный файл итога сохранить не удалось.' }
         } else { Write-Host "Local diagnostics: $work" }
     }
     if ($transportStarted) { $transport.Dispose() }
