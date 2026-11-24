@@ -40,6 +40,10 @@ MAX_ENROLLMENT_RECEIPT = 16384
 FILE_TRACE_EXAM_PREFIX = "file-trace-"
 TEACHER_PATH = "/exam/teacher/readiness"
 TEACHER_PROXY_HEADER = "X-Exam-Teacher-Proxy"
+LTI_BINDING_PATH = "/exam/internal/lti-binding"
+LTI_CERT_ID = re.compile(r"[a-f0-9]{64}:(?:[0-9A-F]{2}){1,20}")
+LTI_UID = re.compile(r"gw-[a-f0-9]{64}@example\.invalid")
+LTI_BEARER = re.compile(r"Bearer ([a-f0-9]{64})", re.ASCII)
 MAX_BODY = 4096
 MAX_REVISION = 2_147_483_647
 READINESS_TIMEOUT = 45
@@ -86,6 +90,22 @@ CREATE TABLE IF NOT EXISTS device_alerts (
     cancelled INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (device_id, alert_id)
 );
+CREATE TABLE IF NOT EXISTS lti_guest_bindings (
+    cert_id TEXT PRIMARY KEY NOT NULL,
+    exam_id TEXT NOT NULL,
+    device_id TEXT NOT NULL REFERENCES devices(device_id),
+    revision INTEGER NOT NULL,
+    boot_utc TEXT NOT NULL,
+    guest_session_id TEXT NOT NULL,
+    expires_utc TEXT NOT NULL,
+    uid TEXT,
+    student TEXT,
+    state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending', 'verified', 'conflict', 'revoked')),
+    closed INTEGER NOT NULL DEFAULT 0,
+    submission TEXT,
+    UNIQUE (exam_id, device_id, revision, boot_utc, guest_session_id)
+);
+CREATE INDEX IF NOT EXISTS lti_guest_bindings_uid ON lti_guest_bindings (exam_id, uid);
 """
 READINESS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS device_readiness (
@@ -318,6 +338,10 @@ def register(db, device_id, rotate=False):
         if not exists:
             raise ValueError("Устройство не зарегистрировано")
         db.execute("UPDATE devices SET token_digest = ? WHERE device_id = ?", (token_digest(token), device_id))
+        db.execute(
+            """UPDATE lti_guest_bindings SET state = 'revoked', closed = 1, submission = NULL
+               WHERE device_id = ? AND closed = 0""", (device_id,),
+        )
     else:
         if exists:
             raise ValueError("Устройство уже зарегистрировано")
@@ -528,18 +552,25 @@ def record_campaign(db, device_id, client, result, readiness, active, now):
             )
             same_guest = same_boot and accepted["guestSessionId"] in (None, previous["lastGuestSessionId"])
             student = previous.get("confirmedStudent") if same_guest else None
+            previous_cert = previous.get("ltiCertId") if previous else None
+            cert_id = previous_cert if same_guest else None
             last_exit = previous.get("lastGuestExit") if previous and previous.get("examId") == active["examId"] else None
             observation = {
                 **{key: accepted[key] for key in (*SESSION_FIELDS, "observedUtc", "receivedUtc")},
                 "examId": active["examId"], "state": state, "alertId": None, "lastGuestSessionId": last_session,
-                "confirmedStudent": student, "lastGuestExit": last_exit,
+                "confirmedStudent": student, "lastGuestExit": last_exit, "ltiCertId": cert_id,
             }
-            if student and last_session and state == "absent" and not ended_guest_matches(observation, last_exit):
-                observation["lastGuestExit"] = {
-                    "revision": observation["revision"], "bootUtc": observation["bootUtc"],
-                    "guestSessionId": last_session, "exitedUtc": observation["observedUtc"], "student": student,
-                    "source": "manual",
-                }
+            if previous_cert and (not same_guest or state == "absent"):
+                db.execute("UPDATE lti_guest_bindings SET closed = 1 WHERE cert_id = ? AND closed = 0", (previous_cert,))
+            if last_session and state == "absent" and not ended_guest_matches(observation, last_exit):
+                binding = get_lti_binding(db, observation)
+                name = (binding["student"] if binding["state"] == "verified" else None) if binding else student
+                if name:
+                    observation["lastGuestExit"] = {
+                        "revision": observation["revision"], "bootUtc": observation["bootUtc"],
+                        "guestSessionId": last_session, "exitedUtc": observation["observedUtc"], "student": name,
+                        "source": "lti" if binding else "manual",
+                    }
             if observation["state"] in ("present", "absent"):
                 for row in db.execute(
                     "SELECT alert_id, report FROM device_alerts WHERE device_id = ? AND acknowledgement IS NOT NULL AND cancelled = 0",
@@ -777,10 +808,32 @@ def ended_guest_matches(observation, target):
     )
 
 
-def can_submit_after_exit(place, observation):
+def get_lti_binding(db, observation):
+    cert_id = observation.get("ltiCertId") if observation else None
+    if cert_id:
+        return db.execute("SELECT * FROM lti_guest_bindings WHERE cert_id = ?", (cert_id,)).fetchone()
+    return None
+
+
+def verified_lti(binding):
+    return binding is not None and binding["state"] == "verified"
+
+
+def submission_for_place(place, binding):
+    receipt = binding["submission"] if verified_lti(binding) else (
+        place["submission"] if place and binding is None else None
+    )
+    return json.loads(receipt) if receipt else None
+
+
+def can_submit_after_exit(place, observation, binding):
     last_exit = observation.get("lastGuestExit") if observation else None
+    if not ended_guest_matches(observation, last_exit):
+        return False
+    if binding is not None:
+        return verified_lti(binding) and binding["closed"] and last_exit["source"] == "lti"
     return bool(
-        place and ended_guest_matches(observation, last_exit)
+        place and last_exit["source"] == "manual"
         and observation.get("confirmedStudent") == last_exit["student"] == place["student"]
     )
 
@@ -834,6 +887,7 @@ def teacher_snapshot(db, device, exam_id, version, now, details=False):
     saved = read_campaign_guest(db, device_id)
     observation = campaign_observation(db, device_id, saved, active, now) if intended_exam else None
     last_exit = saved.get("lastGuestExit") if saved and saved.get("examId") == exam_id else None
+    binding = get_lti_binding(db, saved) if saved and saved.get("examId") == exam_id else None
     alert_rows = db.execute(
         "SELECT * FROM device_alerts WHERE device_id = ? ORDER BY rowid DESC LIMIT ?", (device_id, 10 if details else 1),
     ).fetchall()
@@ -846,11 +900,16 @@ def teacher_snapshot(db, device, exam_id, version, now, details=False):
             alert_rows = [row] + [historical for historical in alert_rows if historical["alert_id"] != row["alert_id"]]
     alerts = [display_alert(row, observation, now) for row in alert_rows]
     report = confirmed_report(db, device_id, active, snapshot["latestReport"], now)
-    submission = json.loads(place["submission"]) if place and place["submission"] else None
-    eligible_exit = can_submit_after_exit(place, observation)
-    session_student = (
-        observation.get("confirmedStudent") if observation and (observation["state"] == "present" or eligible_exit) else None
-    )
+    submission = submission_for_place(place, binding)
+    eligible_exit = can_submit_after_exit(place, observation, binding)
+    session_student = None
+    if observation and (observation["state"] == "present" or eligible_exit):
+        if binding is None:
+            session_student = observation.get("confirmedStudent")
+        elif verified_lti(binding) and (
+            eligible_exit or (not binding["closed"] and snapshot["readiness"]["machineReady"])
+        ):
+            session_student = binding["student"]
     normal_target = (
         {key: submission[key] for key in SESSION_FIELDS}
         if not is_local_cleanup(report) and ended_guest_matches(observation, submission) else None
@@ -861,12 +920,14 @@ def teacher_snapshot(db, device, exam_id, version, now, details=False):
     elif report:
         report_status = report["outcome"]
     guest_ready = bool(
-        intended_exam and place and observation and observation["state"] == "present"
+        intended_exam and (place if binding is None else verified_lti(binding) and not binding["closed"])
+        and observation and observation["state"] == "present"
         and snapshot["readiness"]["guestReady"]
     )
     summary = {
         "deviceId": device_id, "student": place["student"] if place else None, "sessionStudent": session_student,
-        "sessionStudentSource": "manual" if session_student else None,
+        "sessionStudentSource": ("lti" if binding else "manual") if session_student else None,
+        "sessionIdentityStatus": binding["state"] if binding and observation and observation["state"] == "present" else None,
         "installation": installation_status(db, device_id, version, now), "connection": snapshot["connection"],
         "connectionAgeSeconds": snapshot["connectionAgeSeconds"],
         "examId": active["examId"], "assignedMode": active["mode"], "reportStatus": report_status,
@@ -901,6 +962,130 @@ def selected_guest(db, device, exam_id, target, now):
     return observation
 
 
+def selected_lti_guest(db, device_id, exam_id, target, now):
+    device = device_row(db, device_id)
+    if device is None:
+        raise ValueError("ПК не зарегистрирован")
+    observation = selected_guest(db, device, exam_id, target, now)
+    if not device_status(db, device, now, READINESS_TIMEOUT)["readiness"]["machineReady"]:
+        raise ValueError("Машинная готовность для текущего Guest не подтверждена")
+    return observation
+
+
+def lti_binding_target(binding):
+    return {
+        "revision": binding["revision"], "bootUtc": binding["boot_utc"],
+        "guestSessionId": binding["guest_session_id"],
+    }
+
+
+def bind_lti_certificate(db, cert_id, exam_id, device_id, target, now=None, minutes=15):
+    if (
+        not valid_code(LTI_CERT_ID, cert_id) or not valid_code(IDENTIFIER, device_id)
+        or not valid_code(IDENTIFIER, exam_id) or exam_id.startswith(FILE_TRACE_EXAM_PREFIX)
+        or not valid_session_target(target) or type(minutes) is not int or not 1 <= minutes <= 30
+    ):
+        raise ValueError("Недопустимый сертификат или привязка текущего сеанса")
+    db.execute("BEGIN IMMEDIATE")
+    now = now or utc_now()
+    observation = selected_lti_guest(db, device_id, exam_id, target, now)
+    registered = db.execute("SELECT * FROM lti_guest_bindings WHERE cert_id = ?", (cert_id,)).fetchone()
+    if registered is not None:
+        if (
+            registered["exam_id"] == exam_id and registered["device_id"] == device_id
+            and lti_binding_target(registered) == target and not registered["closed"]
+            and registered["state"] in ("pending", "verified") and registered["expires_utc"] > iso_utc(now)
+        ):
+            return
+        raise ValueError("Сертификат уже использован для привязки Guest")
+    try:
+        db.execute(
+            """INSERT INTO lti_guest_bindings (cert_id, exam_id, device_id, revision, boot_utc, guest_session_id, expires_utc)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (cert_id, exam_id, device_id, *(target[key] for key in SESSION_FIELDS),
+             iso_utc(now + timedelta(minutes=minutes))),
+        )
+    except sqlite3.IntegrityError:
+        raise ValueError("У этого сеанса Guest уже есть привязка сертификата") from None
+    observation["ltiCertId"] = cert_id
+    db.execute("UPDATE device_campaign SET guest_observation = ? WHERE device_id = ?",
+               (json.dumps(observation), device_id))
+
+
+def revoke_lti_certificate(db, cert_id):
+    if not valid_code(LTI_CERT_ID, cert_id):
+        raise ValueError("Недопустимый идентификатор сертификата")
+    db.execute("BEGIN IMMEDIATE")
+    result = db.execute("UPDATE lti_guest_bindings SET state = 'revoked', submission = NULL WHERE cert_id = ?", (cert_id,))
+    if result.rowcount != 1:
+        raise ValueError("Сертификат не зарегистрирован")
+
+
+def valid_lti_payload(payload):
+    return (
+        isinstance(payload, dict) and payload.keys() == {"examId", "certId", "uid", "student"}
+        and valid_code(IDENTIFIER, payload["examId"]) and valid_code(LTI_CERT_ID, payload["certId"])
+        and valid_code(LTI_UID, payload["uid"]) and valid_text(payload["student"], 256)
+    )
+
+
+def record_lti_binding(db, payload, now=None):
+    if not valid_lti_payload(payload):
+        raise RequestError("invalid-lti-binding")
+    cert_id, exam_id, uid = payload["certId"], payload["examId"], payload["uid"]
+    db.execute("BEGIN IMMEDIATE")
+    now = now or utc_now()
+    binding = db.execute("SELECT * FROM lti_guest_bindings WHERE cert_id = ?", (cert_id,)).fetchone()
+    if (
+        binding is None or binding["exam_id"] != exam_id or binding["closed"]
+        or binding["state"] not in ("pending", "verified") or binding["expires_utc"] <= iso_utc(now)
+    ):
+        return HTTPStatus.CONFLICT
+    device_id = binding["device_id"]
+    try:
+        observation = selected_lti_guest(db, device_id, exam_id, lti_binding_target(binding), now)
+    except ValueError:
+        return HTTPStatus.CONFLICT
+    if observation.get("ltiCertId") != cert_id:
+        return HTTPStatus.CONFLICT
+    if binding["uid"] == uid:
+        return HTTPStatus.NO_CONTENT
+    other_bindings = db.execute(
+        """SELECT * FROM lti_guest_bindings
+           WHERE exam_id = ? AND uid = ? AND cert_id != ? AND closed = 0 AND state IN ('verified', 'conflict')""",
+        (exam_id, uid, cert_id),
+    ).fetchall()
+    conflicts = []
+    unresolved = False
+    for other in other_bindings:
+        other_device_id = other["device_id"]
+        if current_assignment(db, other_device_id)["revision"] != other["revision"]:
+            continue
+        other_device = device_row(db, other_device_id)
+        latest = json.loads(other_device["latest_report"]) if other_device["latest_report"] else None
+        if latest and latest["revision"] == other["revision"] and latest["outcome"] == "overridden":
+            continue
+        try:
+            selected = selected_lti_guest(db, other_device_id, exam_id, lti_binding_target(other), now)
+        except ValueError:
+            unresolved = True
+        else:
+            if selected.get("ltiCertId") == other["cert_id"]:
+                conflicts.append(other["cert_id"])
+    if binding["uid"] is not None or conflicts:
+        db.execute("UPDATE lti_guest_bindings SET uid = COALESCE(uid, ?) WHERE cert_id = ?", (uid, cert_id))
+        db.executemany("UPDATE lti_guest_bindings SET state = 'conflict', submission = NULL WHERE cert_id = ?",
+                       ((affected,) for affected in (cert_id, *conflicts)))
+        return HTTPStatus.CONFLICT
+    if unresolved:
+        return HTTPStatus.CONFLICT
+    db.execute("UPDATE lti_guest_bindings SET uid = ?, student = ?, state = 'verified' WHERE cert_id = ?",
+               (uid, payload["student"], cert_id))
+    # Сверка готовности, сделанная до привязки LTI, относилась к ручной записи.
+    db.execute("UPDATE device_readiness SET guest_confirmed = 0 WHERE device_id = ?", (device_id,))
+    return HTTPStatus.NO_CONTENT
+
+
 def request_acknowledgement(db, device, exam_id, target, uid, now):
     device_id = device["device_id"]
     observation = selected_guest(db, device, exam_id, target, now)
@@ -928,8 +1113,9 @@ def request_acknowledgement(db, device, exam_id, target, uid, now):
 
 def reset_place_confirmation(db, device_id, exam_id):
     if current_assignment(db, device_id)["examId"] == exam_id:
-        db.execute("UPDATE device_readiness SET guest_confirmed = 0 WHERE device_id = ?", (device_id,))
         observation = read_campaign_guest(db, device_id)
+        if not verified_lti(get_lti_binding(db, observation)):
+            db.execute("UPDATE device_readiness SET guest_confirmed = 0 WHERE device_id = ?", (device_id,))
         if observation and observation.pop("confirmedStudent", None) is not None:
             db.execute("UPDATE device_campaign SET guest_observation = ? WHERE device_id = ?",
                        (json.dumps(observation), device_id))
@@ -959,10 +1145,12 @@ def group_assign(db, exam_id, mode, selection, targets, now):
                 raise ValueError("ПК уже локально вышел из экзамена. Обновите список")
             if mode == "normal" and active["mode"] == "exam" and not local_cleanup:
                 place = get_place(db, device_id, exam_id)
-                submission = json.loads(place["submission"]) if place and place["submission"] else None
+                saved = read_campaign_guest(db, device_id)
+                binding = get_lti_binding(db, saved)
+                submission = submission_for_place(place, binding)
                 if submission is None:
                     raise ValueError("Сдача не подтверждена")
-                observation = campaign_observation(db, device_id, read_campaign_guest(db, device_id), active, now)
+                observation = campaign_observation(db, device_id, saved, active, now)
                 if not ended_guest_matches(observation, submission):
                     raise ValueError("Выход Guest не подтверждён")
                 if target is None:
@@ -1065,34 +1253,44 @@ def teacher_command(db, uid, owner_uid, exam_id, version, action, request, now):
         raise ValueError("Недопустимая привязка текущего сеанса")
     if action == "dismiss":
         return request_acknowledgement(db, device, exam_id, target, uid, now)
-    if not place:
+    active = current_assignment(db, device_id)
+    saved = read_campaign_guest(db, device_id)
+    observation = campaign_observation(db, device_id, saved, active, now)
+    binding = get_lti_binding(db, observation) if active["examId"] == exam_id else None
+    if binding is not None and not verified_lti(binding):
+        raise ValueError("Личность LTI для текущего Guest не подтверждена")
+    if binding is None and not place:
         raise ValueError("Сначала укажите студента на этом месте")
     if action == "guest":
         observation = selected_guest(db, device, exam_id, target, now)
+        if binding is not None and binding["closed"]:
+            raise ValueError("Сеанс Guest уже завершён")
         if request["checks"] != ["file", "project", "wazuh"]:
             raise ValueError("Подтвердите файловый запрет, проект и Wazuh")
         confirmation = confirm_guest_locked(db, device_id, target["revision"], target["bootUtc"], target["guestSessionId"])
-        observation["confirmedStudent"] = place["student"]
-        db.execute("UPDATE device_campaign SET guest_observation = ? WHERE device_id = ?",
-                   (json.dumps(observation), device_id))
+        if binding is None:
+            observation["confirmedStudent"] = place["student"]
+            db.execute("UPDATE device_campaign SET guest_observation = ? WHERE device_id = ?",
+                       (json.dumps(observation), device_id))
         return confirmation
-    active = current_assignment(db, device_id)
-    observation = campaign_observation(db, device_id, read_campaign_guest(db, device_id), active, now)
     after_exit = (
-        active["examId"] == exam_id and can_submit_after_exit(place, observation) and ended_guest_matches(observation, target)
+        active["examId"] == exam_id and can_submit_after_exit(place, observation, binding)
+        and ended_guest_matches(observation, target)
     )
     if not after_exit:
         selected_guest(db, device, exam_id, target, now)
         snapshot = device_status(db, device, now, READINESS_TIMEOUT)
-        if not snapshot["readiness"]["guestReady"]:
+        if (binding is not None and binding["closed"]) or not snapshot["readiness"]["guestReady"]:
             raise ValueError("Сначала подтвердите место и текущий сеанс Guest")
-    if place["submission"]:
-        previous = json.loads(place["submission"])
-        if same_fields(previous, target, SESSION_FIELDS):
-            return previous
+    previous = submission_for_place(place, binding)
+    if previous and same_fields(previous, target, SESSION_FIELDS):
+        return previous
     receipt = {**target, "confirmedUtc": iso_utc(now), "confirmedByUid": uid}
-    db.execute("UPDATE exam_places SET submission = ? WHERE device_id = ? AND exam_id = ?",
-               (json.dumps(receipt), device_id, exam_id))
+    if binding is None:
+        db.execute("UPDATE exam_places SET submission = ? WHERE device_id = ? AND exam_id = ?",
+                   (json.dumps(receipt), device_id, exam_id))
+    else:
+        db.execute("UPDATE lti_guest_bindings SET submission = ? WHERE cert_id = ?", (json.dumps(receipt), binding["cert_id"]))
     return receipt
 
 
@@ -1643,6 +1841,9 @@ class PollHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self):
+        if self.path == LTI_BINDING_PATH:
+            self.receive_lti_binding()
+            return
         if self.path == ENROLLMENT_PATH:
             self.receive_enrollment()
             return
@@ -1686,6 +1887,51 @@ class PollHandler(BaseHTTPRequestHandler):
             self.reply(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "database-unavailable"})
         else:
             self.reply(HTTPStatus.OK, response)
+
+    def receive_lti_binding(self):
+        token = getattr(self.server, "lti_binding_token", None)
+        if token is None:
+            self.reply(HTTPStatus.NOT_FOUND, {"error": "not-found"})
+            return
+        auth = self.headers.get_all("Authorization", [])
+        bearer = LTI_BEARER.fullmatch(auth[0]) if len(auth) == 1 else None
+        if bearer is None or not secrets.compare_digest(token, bearer[1]):
+            self.reply(HTTPStatus.UNAUTHORIZED, {"error": "invalid-credentials"})
+            return
+        lengths = self.headers.get_all("Content-Length", [])
+        if len(lengths) != 1 or not re.fullmatch(r"[0-9]{1,12}", lengths[0]) or "Transfer-Encoding" in self.headers:
+            self.reply(HTTPStatus.BAD_REQUEST, {"error": "invalid-content-length"})
+            return
+        length = int(lengths[0])
+        if length > MAX_BODY:
+            self.reply(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": "body-too-large"})
+            return
+        if len(self.headers.get_all("Content-Type", [])) != 1 or self.headers.get_content_type() != "application/json":
+            self.reply(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, {"error": "invalid-content-type"})
+            return
+        try:
+            body = self.rfile.read(length)
+            if len(body) != length:
+                raise RequestError("incomplete-body")
+            try:
+                payload = json.loads(body.decode("utf-8"), object_pairs_hook=unique_keys)
+            except (ValueError, RecursionError):
+                raise RequestError("invalid-json") from None
+            with closing(connect(self.server.db_path)) as db, db:
+                result = record_lti_binding(db, payload)
+        except RequestError as error:
+            self.reply(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+        except TimeoutError:
+            self.reply(HTTPStatus.REQUEST_TIMEOUT, {"error": "lti-binding-timeout"})
+        except sqlite3.Error:
+            self.reply(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "database-unavailable"})
+        else:
+            if result == HTTPStatus.NO_CONTENT:
+                self.send_response(result)
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+            else:
+                self.reply(result, {"error": "lti-binding-unavailable"})
 
     def receive_enrollment(self):
         if not self.trusted_proxy():
@@ -1822,7 +2068,7 @@ def private_db_path(path):
     return path
 
 
-def read_teacher_proxy_token(path):
+def read_private_hex_token(path, service):
     flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW
     with os.fdopen(os.open(path, flags), "rb") as token_file:
         metadata = os.fstat(token_file.fileno())
@@ -1831,10 +2077,14 @@ def read_teacher_proxy_token(path):
         try:
             token = token_file.read(66).decode("ascii").removesuffix("\n")
         except UnicodeDecodeError:
-            raise ValueError("Недопустимый формат секрета Nginx") from None
+            raise ValueError(f"Недопустимый формат секрета {service}") from None
     if not valid_code(TEACHER_PROXY_TOKEN, token):
-        raise ValueError("Недопустимый формат секрета Nginx")
+        raise ValueError(f"Недопустимый формат секрета {service}")
     return token
+
+
+def read_teacher_proxy_token(path):
+    return read_private_hex_token(path, "Nginx")
 
 
 def main():
@@ -1845,6 +2095,7 @@ def main():
     serve_cmd = commands.add_parser("serve", help="Запустить HTTP за локальным Nginx")
     serve_cmd.add_argument("--port", default=21651, type=int, metavar="PORT")
     serve_cmd.add_argument("--teacher-proxy-token-file", type=Path, metavar="PATH")
+    serve_cmd.add_argument("--lti-binding-token-file", type=Path, metavar="PATH")
     serve_cmd.add_argument("--diagnostic-enrollment-config", type=Path, metavar="PATH")
     serve_cmd.add_argument("--teacher-socket", type=Path, metavar="PATH")
     serve_cmd.add_argument("--teacher-version", metavar="VERSION")
@@ -1860,6 +2111,16 @@ def main():
     revoke.add_argument("device_id")
     revoke.add_argument("--diagnostic-enrollment-config", required=True, type=Path, metavar="PATH")
     commands.add_parser("readiness", help="Показать готовность зарегистрированных ПК")
+    lti_certificate = commands.add_parser("bind-lti-certificate", help="Закрепить сертификат за текущим пилотным Guest")
+    lti_certificate.add_argument("device_id")
+    lti_certificate.add_argument("--exam-id", required=True)
+    lti_certificate.add_argument("--cert-id", required=True)
+    lti_certificate.add_argument("--revision", required=True, type=int)
+    lti_certificate.add_argument("--boot-utc", required=True)
+    lti_certificate.add_argument("--guest-session-id", required=True)
+    lti_certificate.add_argument("--minutes", type=int, default=15, choices=range(1, 31), metavar="MINUTES")
+    lti_revoke = commands.add_parser("revoke-lti-certificate", help="Отозвать привязку сертификата LTI")
+    lti_revoke.add_argument("--cert-id", required=True)
     commands.choices["assign"].add_argument("mode", choices=("normal", "exam"))
     commands.choices["assign"].add_argument("--exam-id")
     commands.choices["status"].add_argument("--stale-after", default=READINESS_TIMEOUT, type=int, metavar="SECONDS")
@@ -1913,6 +2174,13 @@ def main():
                 result = assign(db, args.device_id, args.exam_id)
             elif command == "confirm-guest":
                 result = confirm_guest(db, args.device_id, args.revision, args.boot_utc, args.guest_session_id)
+            elif command == "bind-lti-certificate":
+                target = {"revision": args.revision, "bootUtc": args.boot_utc, "guestSessionId": args.guest_session_id}
+                bind_lti_certificate(db, args.cert_id, args.exam_id, args.device_id, target, minutes=args.minutes)
+                result = "Сертификат закреплён за текущим Guest"
+            elif command == "revoke-lti-certificate":
+                revoke_lti_certificate(db, args.cert_id)
+                result = "Привязка сертификата LTI отозвана"
             elif command == "readiness":
                 result = readiness_table(db)
             elif command == "revoke-diagnostic-enrollment":
@@ -1937,6 +2205,11 @@ def main():
                 except (OSError, ValueError):
                     # Ошибка настройки панели оставляет доступным опрос Windows.
                     pass
+            lti_binding_token = None
+            if args.lti_binding_token_file:
+                lti_binding_token = read_private_hex_token(args.lti_binding_token_file, "LTI")
+                if lti_binding_token == teacher_proxy_token:
+                    raise ValueError("Для LTI требуется отдельный секрет")
             teacher = nullcontext()
             if args.teacher_socket:
                 try:
@@ -1951,6 +2224,7 @@ def main():
                 )
             with ControllerHTTPServer(("127.0.0.1", args.port), PollHandler) as server, teacher:
                 server.db_path = path
+                server.lti_binding_token = lti_binding_token
                 server.diagnostic_enrollment = pilot
                 server.diagnostics_store = DiagnosticStore(path.parent / "diagnostics")
                 server.file_trace_store = FileTraceStore(path.parent / "file-traces")

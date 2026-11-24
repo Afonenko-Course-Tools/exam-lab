@@ -17,10 +17,11 @@ from zipfile import ZipFile
 
 from server import (
     DIAGNOSTIC_ENROLLMENT_SCHEMA, DIAGNOSTICS_PATH, ENROLLMENT_PATH, MAX_BODY, MAX_DIAGNOSTICS_BODY,
-    POLL_PATH, READINESS_TIMEOUT, SCHEMA, TEACHER_PATH, TEACHER_PROXY_HEADER,
+    LTI_BINDING_PATH, POLL_PATH, READINESS_TIMEOUT, SCHEMA, TEACHER_PATH, TEACHER_PROXY_HEADER,
     DiagnosticEnrollment, DiagnosticStore, EnrollmentSlot, PollHandler, WazuhEnrollment, WazuhEnrollmentError,
-    assign, confirm_guest, connect, enrollment_receipt,
-    iso_utc, parse_utc, read_teacher_proxy_token, readiness_table, register, status, teacher_dispatch, utc_now,
+    assign, bind_lti_certificate, confirm_guest, connect, enrollment_receipt,
+    iso_utc, parse_utc, read_teacher_proxy_token, readiness_table, register, revoke_lti_certificate,
+    status, teacher_dispatch, utc_now,
 )
 from teacher_access import MAX_TEACHER_REQUEST, serve_teacher
 
@@ -56,7 +57,8 @@ class ControllerTest(unittest.TestCase):
             client.request("POST", path, payload, headers)
             response = client.getresponse()
             self.assertEqual("no-store", response.getheader("Cache-Control"))
-            return response.status, json.loads(response.read())
+            body = response.read()
+            return response.status, json.loads(body) if body else None
 
     def poll(self, result=None, *, device_id="pc-01", token=None, readiness=None, client=None):
         payload = {"deviceId": device_id, "result": result}
@@ -104,6 +106,155 @@ class ControllerTest(unittest.TestCase):
             "machineReady": True, "observedUtc": iso_utc(clock.return_value),
         }, client={"guestState": guest_state, "installation": None, "alert": None})
         self.assertEqual(200, response[0])
+
+    def lti_seats(self, clock):
+        with closing(connect(self.path)) as db, db:
+            second_token = register(db, "pc-02")
+        self.teacher("exam", devices=["pc-01", "pc-02"])
+        report = {
+            "revision": 2, "examId": "exam-a", "mode": "exam", "outcome": "source-applied",
+            "reason": "machine-policies-only", "fullReady": False, "observedUtc": iso_utc(clock.return_value),
+        }
+        first = {"revision": 2, "bootUtc": "2026-11-24T17:00:00.000Z", "guestSessionId": "guest-a"}
+        second = {**first, "guestSessionId": "guest-b"}
+        self.observe_guest(clock, report, first, "present")
+        self.observe_guest(clock, report, second, "present", device_id="pc-02", token=second_token)
+        return report, first, second, second_token
+
+    def lti_certificate(self, target, cert_serial, *, device_id="pc-01", minutes=15):
+        cert_id = "a" * 64 + ":" + cert_serial
+        with closing(connect(self.path)) as db, db:
+            bind_lti_certificate(db, cert_id, "exam-a", device_id, target, minutes=minutes)
+        return cert_id
+
+    def lti_payload(self, cert_id, uid_character, student):
+        return {"certId": cert_id, "uid": "gw-" + uid_character * 64 + "@example.invalid",
+                "examId": "exam-a", "student": student}
+
+    def post_lti(self, payload, token="d" * 64):
+        return self.send(json.dumps(payload), token, path=LTI_BINDING_PATH)[0]
+
+    def test_lti_binding_opt_in_exact_exit_submission_and_normal_without_roster(self):
+        clock = self.clock("2026-11-24T17:00:15.000Z")
+        report, first, second, _ = self.lti_seats(clock)
+        a = self.lti_payload(self.lti_certificate(first, "01"), "a", "Первый студент LTI")
+        b = self.lti_payload(self.lti_certificate(second, "02", device_id="pc-02"), "b", "Второй студент LTI")
+        self.assertEqual(404, self.post_lti(a))
+        self.server.lti_binding_token = "d" * 64
+        self.assertEqual(401, self.post_lti(a, self.token))
+        self.assertEqual(400, self.post_lti({**a, "deviceId": "pc-02"}))
+        self.assertEqual(409, self.post_lti({**a, "examId": "exam-b"}))
+        self.assertEqual(409, self.post_lti({**a, "certId": "b" * 64 + ":01"}))
+        self.assertEqual(204, self.post_lti(a))
+        self.assertEqual(204, self.post_lti({**a, "student": "Повтор не меняет имя"}))
+        self.assertEqual(204, self.post_lti(b))
+        one = self.teacher("details", deviceId="pc-01")
+        self.assertEqual(a["student"], one["sessionStudent"])
+        self.assertEqual("lti", one["sessionStudentSource"])
+        self.assertIsNone(one["student"])
+        self.assertFalse(one["guestReady"])
+        self.assertNotIn(a["uid"], json.dumps(one))
+        self.teacher("guest", deviceId="pc-01", target=first, checks=["file", "project", "wazuh"])
+        self.teacher("guest", deviceId="pc-02", target=second, checks=["file", "project", "wazuh"])
+        clock.return_value += timedelta(seconds=1)
+        self.observe_guest(clock, report, first, "absent")
+        self.assertEqual(409, self.post_lti(a))
+        one, two = self.teacher("list")["places"]
+        ended = {**first, "student": a["student"], "exitedUtc": iso_utc(clock.return_value), "source": "lti"}
+        self.assertEqual(ended, one["lastGuestExit"])
+        self.assertTrue(one["canSubmitAfterExit"])
+        self.assertTrue(two["guestReady"])
+        self.assertEqual(b["student"], two["sessionStudent"])
+        self.teacher("submit", deviceId="pc-01", target=first)
+        result = self.teacher("normal", devices="*", targets={"pc-01": first})
+        self.assertEqual(["pending", "blocked"], [row["status"] for row in result])
+        one, two = self.teacher("list")["places"]
+        self.assertEqual(("normal", ended, True), (one["assignedMode"], one["lastGuestExit"], one["submitted"]))
+        self.assertEqual(("exam", b["student"], True), (two["assignedMode"], two["sessionStudent"], two["guestReady"]))
+
+    def test_lti_conflict_does_not_replace_uid_and_new_guest_cannot_reuse_certificate(self):
+        clock = self.clock("2026-11-24T17:00:15.000Z")
+        report, first, second, _ = self.lti_seats(clock)
+        self.server.lti_binding_token = "d" * 64
+        a = self.lti_payload(self.lti_certificate(first, "01"), "a", "Первый студент LTI")
+        b = self.lti_payload(self.lti_certificate(second, "02", device_id="pc-02"), "a", "Первый студент LTI")
+        self.assertEqual(204, self.post_lti(a))
+        self.assertEqual(409, self.post_lti(b))
+        one, two = self.teacher("list")["places"]
+        for seat in (one, two):
+            self.assertEqual("conflict", seat["sessionIdentityStatus"])
+            self.assertIsNone(seat["sessionStudent"])
+            self.assertFalse(seat["guestReady"])
+        self.assertEqual(409, self.post_lti(a))
+        clock.return_value += timedelta(seconds=1)
+        replacement = {**first, "guestSessionId": "guest-c"}
+        self.observe_guest(clock, report, replacement, "present")
+        self.assertEqual(409, self.post_lti(a))
+        with self.assertRaisesRegex(ValueError, "Сертификат уже использован"):
+            self.lti_certificate(replacement, "01")
+        c = self.lti_payload(self.lti_certificate(replacement, "03"), "c", "Третий студент LTI")
+        self.assertEqual(204, self.post_lti(c))
+        self.assertEqual(409, self.post_lti({**c, "uid": "gw-" + "d" * 64 + "@example.invalid"}))
+        changed = self.teacher("details", deviceId="pc-01")
+        self.assertEqual("conflict", changed["sessionIdentityStatus"])
+        self.assertIsNone(changed["sessionStudent"])
+        self.assertEqual(409, self.post_lti(c))
+
+    def test_lti_stale_expired_revoked_and_local_override_fail_closed(self):
+        clock = self.clock("2026-11-24T17:00:15.000Z")
+        report, first, second, second_token = self.lti_seats(clock)
+        self.server.lti_binding_token = "d" * 64
+        self.teacher("bind", deviceId="pc-01", student="Ручная запись")
+        self.teacher("guest", deviceId="pc-01", target=first, checks=["file", "project", "wazuh"])
+        self.teacher("submit", deviceId="pc-01", target=first)
+        a = self.lti_payload(self.lti_certificate(first, "01"), "a", "Другой студент LTI")
+        b = self.lti_payload(self.lti_certificate(second, "02", device_id="pc-02", minutes=1), "b", "Студент LTI")
+        clock.return_value += timedelta(seconds=READINESS_TIMEOUT)
+        self.assertEqual(409, self.post_lti(a))
+        with self.assertRaisesRegex(ValueError, "Сеанс Guest изменился"):
+            self.lti_certificate(first, "03")
+        self.observe_guest(clock, report, first, "present")
+        self.assertEqual(204, self.post_lti(a))
+        replaced = self.teacher("details", deviceId="pc-01")
+        self.assertEqual(("Другой студент LTI", "Ручная запись"), (replaced["sessionStudent"], replaced["student"]))
+        self.assertFalse(replaced["guestReady"])
+        self.assertFalse(replaced["submitted"])
+        clock.return_value += timedelta(seconds=20)
+        self.observe_guest(clock, report, second, "present", device_id="pc-02", token=second_token)
+        self.assertEqual(409, self.post_lti(b))
+        clock.return_value += timedelta(seconds=1)
+        stopped = {**report, "outcome": "overridden", "reason": "local-normal-source-confirmed",
+                   "observedUtc": iso_utc(clock.return_value)}
+        self.assertEqual(200, self.poll(stopped)[0])
+        self.assertEqual(409, self.post_lti(a))
+        self.assertIsNone(self.teacher("details", deviceId="pc-01")["sessionStudent"])
+        with closing(connect(self.path)) as db, db:
+            revoke_lti_certificate(db, b["certId"])
+        self.assertEqual("revoked", self.teacher("details", deviceId="pc-02")["sessionIdentityStatus"])
+        self.assertEqual(409, self.post_lti(b))
+
+    def test_lti_waits_for_explicit_exit_of_unreachable_seat_and_honors_device_token_rotation(self):
+        clock = self.clock("2026-11-24T17:00:15.000Z")
+        report, first, second, second_token = self.lti_seats(clock)
+        self.server.lti_binding_token = "d" * 64
+        a = self.lti_payload(self.lti_certificate(first, "01"), "a", "Студент LTI")
+        b = self.lti_payload(self.lti_certificate(second, "02", device_id="pc-02"), "a", "Студент LTI")
+        self.assertEqual(204, self.post_lti(a))
+        clock.return_value += timedelta(seconds=READINESS_TIMEOUT)
+        self.observe_guest(clock, report, second, "present", device_id="pc-02", token=second_token)
+        self.assertEqual(409, self.post_lti(b))
+        waiting = self.teacher("details", deviceId="pc-02")
+        self.assertEqual("pending", waiting["sessionIdentityStatus"])
+        self.assertIsNone(waiting["sessionStudent"])
+        self.observe_guest(clock, report, first, "absent")
+        self.assertEqual(204, self.post_lti(b))
+        self.assertEqual("lti", self.teacher("details", deviceId="pc-02")["sessionStudentSource"])
+        with closing(connect(self.path)) as db, db:
+            register(db, "pc-02", rotate=True)
+        self.assertEqual(409, self.post_lti(b))
+        rotated = self.teacher("details", deviceId="pc-02")
+        self.assertEqual("revoked", rotated["sessionIdentityStatus"])
+        self.assertIsNone(rotated["sessionStudent"])
 
     def test_submit_after_observed_exit_and_targeted_normal_are_isolated_by_device(self):
         clock = self.clock("2026-11-24T17:00:15.000Z")

@@ -51,6 +51,10 @@ REPORT_REASON = {
     "collection-stop-failed": ("Ошибка записи", "Не удалось остановить запись"),
 }
 MANUAL_STUDENT = "ФИО вручную"
+IDENTITY_REFUSAL = {
+    "conflict": ("Конфликт LTI", "Связь LTI для этого Guest противоречива. Проверьте вход студента."),
+    "revoked": ("Связь отозвана", "Связь LTI для этого Guest отозвана."),
+}
 INSTALLATION = {
     "installed": ("✓", GREEN, "Установлен ожидаемый выпуск"),
     "other-release": ("≠", YELLOW, "Установлен другой выпуск"),
@@ -106,6 +110,8 @@ def exam_places(places, exam_id):
 
 
 def place_student(row, *, manual=False):
+    if row.get("sessionIdentityStatus") in IDENTITY_REFUSAL:
+        return None
     student = row.get("sessionStudent")
     if student is None and manual:
         return row["student"]
@@ -185,6 +191,8 @@ def place_guidance(row, exam_id, *, brief=False, owner=False, manual=False):
             return ("Снять тревогу" if owner else "Позвать владельца") + ("" if brief else "."), RED
         if alert["status"] == "expired":
             return label("Снятие истекло", "Истёк срок команды снятия тревоги.", RED)
+    if identity_refusal := IDENTITY_REFUSAL.get(row.get("sessionIdentityStatus")):
+        return label(*identity_refusal, RED)
     if row["submitted"]:
         if row.get("canReturnToNormal"):
             return label("Вернуть режим", "Guest вышел. Доступен обычный режим.", GREEN)
@@ -345,6 +353,7 @@ class PlaceDialog(Dialog):
         name = place_title(row, manual=self.manual)
         can_dismiss = any(alert["current"] and alert["status"] in ("received", "shown") for alert in row["alerts"])
         guest_confirmable = row["guestState"] == "present" and bool(student_for_guest(row, manual=self.manual))
+        can_submit = (row["guestReady"] and place_student(row, manual=self.manual)) or row.get("canSubmitAfterExit")
         with Vertical(classes="dialog"):
             yield Static(name, classes="dialog-title", markup=False)
             with VerticalScroll(classes="dialog-content"):
@@ -355,9 +364,7 @@ class PlaceDialog(Dialog):
                     yield Button("Пересадить", id="move", disabled=not row["student"])
             with Horizontal(classes="button-row"):
                 yield Button("Подтвердить Guest", id="guest", disabled=not (guest_confirmable and row["machineReady"]))
-                yield Button("Сверить сдачу", id="submit", variant="success", disabled=not (
-                    (row["guestReady"] or row.get("canSubmitAfterExit")) and not row["submitted"]
-                ))
+                yield Button("Сверить сдачу", id="submit", variant="success", disabled=not can_submit or row["submitted"])
                 if self.owner:
                     yield Button("Снять тревогу", id="dismiss-alert", variant="error", disabled=not can_dismiss)
             with Horizontal(classes="button-row"):

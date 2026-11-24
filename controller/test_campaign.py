@@ -1,6 +1,7 @@
 import asyncio
 from contextlib import closing
 from datetime import timedelta
+from http import HTTPStatus
 import json
 import os
 from pathlib import Path
@@ -342,6 +343,63 @@ class CampaignTest(TestCase):
                 self.assertIn("Связь с ПК · нет свежего опроса", selected.content.plain)
                 self.assertIn("Отчёт ПК · нет свежего результата", selected.content.plain)
                 self.assertIn("Сверка сдачи · преподаватель сверил в PrairieLearn", selected.content.plain)
+
+        self.run_tui(exercise)
+
+    def test_tui_lti_student_enables_guest_confirmation_without_manual_pilot(self):
+        from server import bind_lti_certificate, record_lti_binding
+
+        active = self.assign()
+        target = {"revision": active["revision"], "bootUtc": self.boot, "guestSessionId": self.session}
+        report = self.applied(active)
+        self.send(report, guest="present", session=self.session)
+        student = "Студент LTI"
+        cert_id = "a" * 64 + ":01"
+        with closing(connect(self.path)) as db, db:
+            bind_lti_certificate(db, cert_id, self.exam, "pc-01", target, self.clock.return_value)
+
+        def claim(uid, name):
+            with closing(connect(self.path)) as db, db:
+                return record_lti_binding(db, {
+                    "examId": self.exam, "certId": cert_id, "uid": uid, "student": name,
+                }, self.clock.return_value)
+
+        async def exercise(app):
+            app.POLL_SECONDS = 60
+            async with app.run_test(size=(80, 24)) as pilot:
+                await app.workers.wait_for_complete()
+                self.assertEqual("Открыть задание", app.table.get_cell("pc-01", "action").plain)
+                await pilot.press("enter")
+                await app.workers.wait_for_complete()
+                self.assertTrue(app.screen.query_one("#guest", Button).disabled)
+                await pilot.press("escape")
+
+                self.assertEqual(HTTPStatus.NO_CONTENT, claim("gw-" + "b" * 64 + "@example.invalid", student))
+                app.action_reload()
+                await app.workers.wait_for_complete()
+                self.assertEqual(f"pc-01 · {student}", app.table.get_cell("pc-01", "place").plain)
+                self.assertEqual("Сверить Guest", app.table.get_cell("pc-01", "action").plain)
+                self.assertNotIn("ФИО вручную", app.query_one("#selected", Static).content.plain)
+
+                await pilot.press("enter")
+                await app.workers.wait_for_complete()
+                self.assertFalse(app.screen.query("#bind"))
+                self.assertTrue(await pilot.click("#guest"))
+                self.assertIsInstance(app.screen, ConfirmDialog)
+                self.assertIn(f"{student} — pc-01", app.screen.message)
+                self.assertTrue(await pilot.click("#confirm"))
+                await app.workers.wait_for_complete()
+                self.assertEqual("Можно начинать", app.table.get_cell("pc-01", "action").plain)
+
+                self.assertEqual(HTTPStatus.CONFLICT, claim("gw-" + "c" * 64 + "@example.invalid", "Другая учётка"))
+                app.action_reload()
+                await app.workers.wait_for_complete()
+                self.assertEqual("pc-01 · —", app.table.get_cell("pc-01", "place").plain)
+                self.assertEqual("Конфликт LTI", app.table.get_cell("pc-01", "action").plain)
+                await pilot.press("enter")
+                await app.workers.wait_for_complete()
+                self.assertTrue(app.screen.query_one("#guest", Button).disabled)
+                self.assertTrue(app.screen.query_one("#submit", Button).disabled)
 
         self.run_tui(exercise)
 
