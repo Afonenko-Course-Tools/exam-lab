@@ -40,19 +40,28 @@ $script:Changes = [Collections.Generic.List[object]]::new()
 $script:Failures = [Collections.Generic.List[string]]::new()
 $script:InstallerLocks = [Collections.Generic.List[object]]::new()
 $script:WorkingDirectory = $null
+# PayloadBytes are the pinned files. InstalledBytes and ScratchBytes are rounded disk-planning estimates.
 $pins = @{
     IDEA = @{ File='ideaIC-2025.2.6.4.exe'; Version='2025.2.6.4'; Publisher='JetBrains';
         Uri='https://download.jetbrains.com/idea/ideaIC-2025.2.6.4.exe';
-        Hash='57301793b57b9f2b87a5c79fd06b619e6bbd881501d793ecd78482b20525ea34' }
+        Hash='57301793b57b9f2b87a5c79fd06b619e6bbd881501d793ecd78482b20525ea34';
+        PayloadBytes=993423664; InstalledBytes=4GB; ScratchBytes=1GB }
     JDK = @{ File='OpenJDK25U-jdk_x64_windows_hotspot_25.0.5_8.msi'; Version='25.0.5'; Publisher='Eclipse';
         Uri='https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.5%2B8/OpenJDK25U-jdk_x64_windows_hotspot_25.0.5_8.msi';
-        Hash='e1d3c94032579dc16af9abb311f4552ba271466b74c8767e8ce39585a4c64d40' }
+        Hash='e1d3c94032579dc16af9abb311f4552ba271466b74c8767e8ce39585a4c64d40';
+        PayloadBytes=116088832; InstalledBytes=512MB; ScratchBytes=384MB }
     Git = @{ File='Git-2.56.1-64-bit.exe'; Version='2.56.1'; Publisher='O=Johannes Schindelin';
         Uri='https://github.com/git-for-windows/git/releases/download/v2.56.1.windows.1/Git-2.56.1-64-bit.exe';
-        Hash='c330c72e10b408cc39994bfefdb63542b0d93d21699325c3e0bd874af8a5a559' }
+        Hash='c330c72e10b408cc39994bfefdb63542b0d93d21699325c3e0bd874af8a5a559';
+        PayloadBytes=66870448; InstalledBytes=512MB; ScratchBytes=128MB }
     Gradle = @{ File='gradle-9.8.2-bin.zip'; Version='9.8.2';
         Uri='https://services.gradle.org/distributions/gradle-9.8.2-bin.zip';
-        Hash='21bd5da2de49b642904077f38c0efdc7778e92b3ed0889392dca61b97e389607' }
+        Hash='21bd5da2de49b642904077f38c0efdc7778e92b3ed0889392dca61b97e389607';
+        PayloadBytes=151620138; InstalledBytes=192MB; ScratchBytes=0 }
+    WinDirStat = @{ File='WinDirStat-2.9.3-x64.msi'; Version='2.9.3'; Publisher='CN=Open Source Developer Bryan Berns';
+        Uri='https://github.com/windirstat/windirstat/releases/download/release/v2.9.3/WinDirStat-x64.msi';
+        Hash='96c4c4beb63c7c5ad6b1a206f96560d7a9a2b6063f3cd175a82f392977a9af5d';
+        PayloadBytes=2486272; InstalledBytes=16MB; ScratchBytes=8MB }
 }
 
 function Invoke-Native([string]$Executable, [string[]]$Arguments, [string]$WorkingDirectory) {
@@ -267,6 +276,11 @@ function Get-Tool([string]$Kind, [string]$ExplicitPath, [object[]]$Entries, [swi
                     $paths.Add((Split-Path (Split-Path $cmd.Source -Parent) -Parent))
                 }
             }
+            WinDirStat {
+                $registered = @($Entries | Where-Object { $_.Machine -and $_.Name -match '^WinDirStat(?:\s|$)' })
+                foreach ($entry in $registered) { if ($entry.Location) { $paths.Add($entry.Location) } }
+                $paths.Add("$env:ProgramFiles\WinDirStat")
+            }
         }
     }
     $candidates = [Collections.Generic.List[object]]::new()
@@ -356,6 +370,15 @@ function Get-Tool([string]$Kind, [string]$ExplicitPath, [object[]]$Entries, [swi
                         (Test-Path -LiteralPath (Join-Path $lib 'plugins') -PathType Container)
                     $probe = "Структура и ACL дистрибутива Gradle $version"
                 }
+                WinDirStat {
+                    $exe = Join-Path $path 'WinDirStat.exe'
+                    if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { continue }
+                    if (-not (Test-TrustedExecutable $exe)) { throw 'Путь WinDirStat не защищён от записи обычным пользователем.' }
+                    $metadata = (Get-Item -LiteralPath $exe).VersionInfo
+                    $version = [regex]::Match("$($metadata.ProductVersion) $($metadata.FileVersion)", '\d+\.\d+\.\d+').Value
+                    $compatible = $version -and [version]$version -ge [version]$pins.WinDirStat.Version
+                    $probe = "PE: ProductVersion=$($metadata.ProductVersion); FileVersion=$($metadata.FileVersion)"
+                }
             }
         } catch { $errorText = $_.Exception.Message }
         $candidates.Add([pscustomobject]@{ Path=$path; Version=$version; Compatible=[bool]$compatible; Probe=$probe; Error=$errorText })
@@ -380,7 +403,8 @@ function Get-Tool([string]$Kind, [string]$ExplicitPath, [object[]]$Entries, [swi
 function Get-Inventory([switch]$VerifyVersions) {
     $entries = @(Get-UninstallEntries)
     [pscustomobject]@{ IDEA=(Get-Tool IDEA $IdeaPath $entries); JDK=(Get-Tool JDK $JdkPath $entries -VerifyVersion:$VerifyVersions);
-        Git=(Get-Tool Git $GitPath $entries -VerifyVersion:$VerifyVersions); Gradle=(Get-Tool Gradle $GradlePath $entries) }
+        Git=(Get-Tool Git $GitPath $entries -VerifyVersion:$VerifyVersions); Gradle=(Get-Tool Gradle $GradlePath $entries);
+        WinDirStat=(Get-Tool WinDirStat '' $entries) }
 }
 
 function Get-IdeaReplacement($Inventory) {
@@ -424,9 +448,10 @@ function Get-IdeaReplacement($Inventory) {
 
 function Get-SoftwarePlan($Inventory) {
     $destinations = @{ IDEA="$env:ProgramFiles\JetBrains\IntelliJ IDEA Community Edition 2025.2.6.4";
-        JDK=(Get-JdkDestination); Git="$env:ProgramFiles\Git"; Gradle=(Get-GradleDestination) }
+        JDK=(Get-JdkDestination); Git="$env:ProgramFiles\Git"; Gradle=(Get-GradleDestination); WinDirStat="$env:ProgramFiles\WinDirStat" }
     $actions = [Collections.Generic.List[object]]::new()
     $packages = [Collections.Generic.List[object]]::new()
+    $componentSizes = [Collections.Generic.List[object]]::new()
     $blockers = [Collections.Generic.List[string]]::new()
     $replacement = $null
     if ($ReplaceIdeaPath) {
@@ -436,6 +461,7 @@ function Get-SoftwarePlan($Inventory) {
         } catch { $blockers.Add($_.Exception.Message) }
     }
     foreach ($name in $installOrder) {
+        $pin = $pins[$name]
         $tool = $Inventory.$name
         $selected = $tool.Selected
         $remove = $null
@@ -448,6 +474,9 @@ function Get-SoftwarePlan($Inventory) {
         $operation = 'Keep'
         if ($remove) { $operation = 'Replace' }
         $destination = $null
+        $payloadBytes = 0L
+        $additionalInstalledBytes = 0L
+        $stagingBytes = 0L
         if (-not $selected) {
             $alongside = -not $tool.ExplicitPath -and ($name -eq 'JDK' -or ($InstallAlongside -and $name -in @('IDEA','Gradle')))
             $existingTemurin25 = $name -eq 'JDK' -and @($tool.Registered | Where-Object {
@@ -457,6 +486,8 @@ function Get-SoftwarePlan($Inventory) {
             $reason = $null
             if ($existingTemurin25) {
                 $reason = 'Непригодный Temurin 25 уже зарегистрирован. Второй MSI этой версии может изменить прежний JDK.'
+            } elseif ($name -eq 'WinDirStat' -and $tool.State -eq 'Conflict') {
+                $reason = 'Обнаружена машинная установка WinDirStat, пригодность которой не подтверждена. Проверьте её перед установкой.'
             } elseif ($tool.State -eq 'Conflict' -and -not ($alongside -or $explicitIdeaReplacement)) {
                 $reason = "Выберите подходящий каталог через -${name}Path. IDEA и Gradle можно установить рядом с -InstallAlongside."
             } elseif (Test-Path -LiteralPath $destination) {
@@ -467,8 +498,11 @@ function Get-SoftwarePlan($Inventory) {
                 $blockers.Add("${name}: $reason")
             } else {
                 if (-not $remove) { $operation = 'Install' }
-                $pin = $pins[$name]
-                $packages.Add([pscustomobject]@{ Name=$name; File=$pin.File; SHA256=$pin.Hash; Uri=$pin.Uri; Destination=$destination })
+                $payloadBytes = [long]$pin.PayloadBytes
+                $additionalInstalledBytes = [long]$pin.InstalledBytes
+                $stagingBytes = $payloadBytes + [long]$pin.ScratchBytes
+                $packages.Add([pscustomobject]@{ Name=$name; File=$pin.File; SHA256=$pin.Hash; Uri=$pin.Uri;
+                    Destination=$destination; PayloadBytes=$payloadBytes })
             }
         }
         # Windows PowerShell 5.1 can serialize an empty pipeline as {} instead of null.
@@ -481,8 +515,51 @@ function Get-SoftwarePlan($Inventory) {
         $actions.Add([pscustomobject]@{ Name=$name; Operation=$operation;
             ExistingPath=$existingPath; ExistingVersion=$existingVersion;
             Destination=$destination; Replacement=$remove })
+        $footprint = [long]$pin.InstalledBytes
+        $basis = 'PinnedReleaseEstimate'
+        if ($operation -eq 'Block') {
+            $footprint = $null
+            $basis = 'Unavailable'
+        } elseif ($selected -and $existingVersion -ne $pin.Version) {
+            $basis = 'CompatibleVersionEstimate'
+        }
+        $componentSizes.Add([pscustomobject]@{ Name=$name; Operation=$operation;
+            Destination=$(if ($destination) { $destination } else { $existingPath });
+            PayloadBytes=$payloadBytes; AdditionalInstalledBytes=$additionalInstalledBytes;
+            EstimatedInstalledFootprintBytes=$footprint; InstalledSizeBasis=$basis;
+            StagingBytes=$stagingBytes; StagingDestination=$env:ProgramFiles })
     }
-    [pscustomobject]@{ Actions=$actions.ToArray(); Packages=$packages.ToArray(); Blockers=$blockers.ToArray() }
+    $size = [pscustomobject]@{
+        KnownPayloadBytes=[long](($componentSizes | Measure-Object -Property PayloadBytes -Sum).Sum);
+        EstimatedAdditionalInstalledBytes=[long](($componentSizes | Measure-Object -Property AdditionalInstalledBytes -Sum).Sum);
+        EstimatedInstalledFootprintBytes=[long](($componentSizes | Measure-Object -Property EstimatedInstalledFootprintBytes -Sum).Sum);
+        EstimatedStagingBytes=[long](($componentSizes | Measure-Object -Property StagingBytes -Sum).Sum);
+        Complete=($blockers.Count -eq 0); Components=$componentSizes.ToArray()
+    }
+    [pscustomobject]@{ Actions=$actions.ToArray(); Packages=$packages.ToArray(); Blockers=$blockers.ToArray(); Size=$size }
+}
+
+function Get-SoftwareDiskSpace($Size) {
+    $volume = [IO.Path]::GetPathRoot([Environment]::GetFolderPath('ProgramFiles'))
+    $estimatedPeak = $Size.EstimatedAdditionalInstalledBytes + $Size.EstimatedStagingBytes
+    $observation = [ordered]@{ Volume=$volume; AvailableBytes=$null; RequiredPackageStagingBytes=$Size.KnownPayloadBytes;
+        EstimatedPeakAdditionalBytes=$estimatedPeak; Status='Unknown'; Detail=$null }
+    try { $observation.AvailableBytes = [IO.DriveInfo]::new($volume).AvailableFreeSpace }
+    catch { $observation.Detail = $_.Exception.Message; return [pscustomobject]$observation }
+    $observation.Status = if ($observation.AvailableBytes -lt $Size.KnownPayloadBytes) { 'InsufficientForStagedPackages' }
+        elseif ($observation.AvailableBytes -lt $estimatedPeak) { 'BelowEstimatedPeak' }
+        else { 'SufficientForEstimate' }
+    [pscustomobject]$observation
+}
+
+function Confirm-SoftwareDiskSpace($Space, [switch]$Apply) {
+    if ($Space.Status -eq 'InsufficientForStagedPackages') {
+        $message = "На $($Space.Volume) свободно $($Space.AvailableBytes) байт, для временных копий пакетов нужно $($Space.RequiredPackageStagingBytes) байт."
+        if ($Apply) { throw "Conflict: $message" }
+        Write-Warning $message
+    } elseif ($Space.Status -eq 'BelowEstimatedPeak') {
+        Write-Warning "На $($Space.Volume) свободно $($Space.AvailableBytes) байт при расчётном пике установки $($Space.EstimatedPeakAdditionalBytes) байт."
+    }
 }
 
 function Remove-ReplacedIdea($Approved) {
@@ -634,6 +711,7 @@ function Get-Installer([string]$Kind) {
     if (Test-Path -LiteralPath $file) {
         $lock = [IO.File]::Open($file,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
         $script:InstallerLocks.Add($lock)
+        if ($lock.Length -ne $pin.PayloadBytes) { throw "Размер $Kind не совпадает с закреплённым пакетом." }
         $output = [IO.File]::Open($staged,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
         try { $lock.CopyTo($output) } finally { $output.Dispose() }
     } else {
@@ -692,6 +770,12 @@ function Install-Tool([string]$Kind, [string]$Installer, [string]$Destination) {
             $exe = "$env:SystemRoot\System32\msiexec.exe"
             $arguments = @('/i', "`"$Installer`"", '/qn','/norestart','ADDLOCAL=FeatureMain',
                 "INSTALLDIR=`"$Destination`"", '/L*v', "`"$logDirectory\jdk-install.log`"")
+        }
+        WinDirStat {
+            $exe = "$env:SystemRoot\System32\msiexec.exe"
+            $arguments = @('/i', "`"$Installer`"", '/qn','/norestart', 'ENABLE_SHORTCUT=0',
+                'DISABLE_CONTEXTMENU=1', 'ENABLE_ADD_TO_PATH=0', "INSTALLFOLDER=`"$Destination`"",
+                '/L*v', "`"$logDirectory\windirstat-install.log`"")
         }
         Git { $arguments = @('/VERYSILENT','/NORESTART','/ALLUSERS','/SP-','/o:PathOption=BashOnly', '/COMPONENTS=',"/DIR=`"$Destination`"", "/LOG=`"$logDirectory\git-install.log`"") }
         IDEA {
@@ -764,14 +848,13 @@ $script:IsAdministratorAccount = $script:IsAdmin -or 'S-1-5-32-544' -in @($ident
 $inspectOnly = $Action -eq 'Check'
 $apply = $Action -in @('Prepare','Apply')
 $report = [ordered]@{ Timestamp=[DateTime]::UtcNow.ToString('o'); ScriptSHA256=(Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash;
-    Action=$Action; Platform=$null; Preflight=$null; Plan=$null; Before=$null; After=$null;
+    Action=$Action; Platform=$null; Preflight=$null; Plan=$null; DiskSpace=$null; Before=$null; After=$null;
     EnvironmentBefore=$null; EnvironmentAfter=$null; EnvironmentPreserved=$null; CLIProbe=$null; WorkingDirectory=$null;
     Changes=@(); Errors=@(); RebootRequired=$false; SoftwareReady=$false; ExamReady=$false;
     ManualChecks=@('Настоящий Shared PC Guest','IDEA: SDK/run/debug, completion/inspection/refactoring, отсутствие генеративных помощников',
         'Gradle с JDK 25: запуск и сборка исходного проекта в IDEA из Guest',
         'Moodle и PrairieLearn','Физические флешки','Локальное завершение и сохранность обычных занятий') }
-$toolNames = @('IDEA','JDK','Git','Gradle')
-$installOrder = @('JDK','Git','IDEA','Gradle')
+$installOrder = @('JDK','Git','IDEA','Gradle','WinDirStat')
 $exitCode = 0
 try {
     if (-not [Environment]::Is64BitProcess) { throw 'Conflict: запустите 64-битный PowerShell.' }
@@ -792,7 +875,9 @@ try {
     $inventory = Get-Inventory
     $report.Before = $inventory
     $report.Plan = Get-SoftwarePlan $inventory
+    $report.DiskSpace = Get-SoftwareDiskSpace $report.Plan.Size
     if ($report.Plan.Blockers.Count) { throw ('Conflict: ' + ($report.Plan.Blockers -join ' ')) }
+    if ($apply -or $inspectOnly) { Confirm-SoftwareDiskSpace $report.DiskSpace -Apply:$apply }
     if ($apply) {
         if ($ExpectedPlanPath) {
             $expected = Get-Content -LiteralPath $ExpectedPlanPath -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -883,7 +968,7 @@ try {
     if (-not $inspectOnly) {
         if ($UsePublishedInstallers) { Write-Host 'Testing Java compilation and local Git commands...' }
         $report.CLIProbe = Test-CLI $report.After
-        $report.SoftwareReady = $report.Platform.SoftwareEligible -and $toolNames.Where({ $report.After.$_.State -ne 'Compatible' }).Count -eq 0 -and $report.CLIProbe.Passed
+        $report.SoftwareReady = $report.Platform.SoftwareEligible -and $installOrder.Where({ $report.After.$_.State -ne 'Compatible' }).Count -eq 0 -and $report.CLIProbe.Passed
         if (-not $report.SoftwareReady) { $exitCode = 2 }
     }
     $report.PluginReview = Get-IDEPlugins $report.After.IDEA
@@ -904,7 +989,7 @@ try {
     foreach ($lock in $script:InstallerLocks) { $lock.Dispose() }
     if ($script:WorkingDirectory) {
         # The private working directory keeps logs; signed or pinned installer inputs are reusable upstream.
-        foreach ($kind in $toolNames) {
+        foreach ($kind in $installOrder) {
             $stagedInstaller = Join-Path $script:WorkingDirectory $pins[$kind].File
             if (Test-Path -LiteralPath $stagedInstaller -PathType Leaf) {
                 try { [IO.File]::Delete($stagedInstaller) }

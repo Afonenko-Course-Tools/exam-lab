@@ -50,7 +50,8 @@ $controllerCa = [Convert]::FromBase64String('@CONTROLLER_CA_BASE64@')
 $receiver = "$baseUrl/diagnostics @CONTROLLER_CA_SHA256@"
 $runtime = @{ Name='@PWSH_FILE@'; SHA256='@PWSH_SHA256@'; Bytes=@PWSH_BYTES@; Tool=$true }
 $installer = @{ Name='@INSTALLER_FILE@'; SHA256='@INSTALLER_SHA256@'; Bytes=@INSTALLER_BYTES@; Tool=$false }
-$bundle = @{ Name='@BUNDLE_FILE@'; SHA256='@BUNDLE_SHA256@'; Bytes=@BUNDLE_BYTES@; Tool=$false }
+$bundle = @{ Name='@BUNDLE_FILE@'; SHA256='@BUNDLE_SHA256@'; Bytes=@BUNDLE_BYTES@;
+    ExpandedBytes=@BUNDLE_EXPANDED_BYTES@; Tool=$false }
 $tools = @BOOTSTRAP_TOOLS@
 foreach ($tool in $tools) { $tool.Tool = $true }
 $programFiles = [Environment]::GetFolderPath('ProgramFiles')
@@ -70,18 +71,48 @@ $attemptLock = $null
 $result = 1
 $sharedCacheRead = $false
 $transportStarted = $false
+$bootstrapTypesLoaded = $false
 
-function Start-BootstrapTransport {
-    if ($script:transportStarted) { return }
+function Initialize-BootstrapTypes {
+    if ($script:bootstrapTypesLoaded) { return }
     $previousTemp = $env:TEMP
     $previousTmp = $env:TMP
     try {
         $env:TEMP = $env:TMP = $work
         Add-Type -TypeDefinition @'
 using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
 using System.Net;
 using System.Net.Security;
 using System.Security.Cryptography.X509Certificates;
+
+public sealed class ExamLabBootstrapVolume {
+    public string Id { get; private set; }
+    public string MountPath { get; private set; }
+    public long FreeBytes { get; private set; }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool GetVolumePathName(string path, StringBuilder mountPath, uint size);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool GetVolumeNameForVolumeMountPoint(string mountPath, StringBuilder name, uint size);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool GetDiskFreeSpaceEx(string path, out ulong callerFree, out ulong total, out ulong totalFree);
+
+    public static ExamLabBootstrapVolume Read(string directory) {
+        var mountPath = new StringBuilder(32768);
+        var identity = new StringBuilder(64);
+        ulong available, total, free;
+        if (!GetVolumePathName(directory, mountPath, (uint)mountPath.Capacity) ||
+            !GetVolumeNameForVolumeMountPoint(mountPath.ToString(), identity, (uint)identity.Capacity) ||
+            !GetDiskFreeSpaceEx(directory, out available, out total, out free))
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        return new ExamLabBootstrapVolume {
+            Id = identity.ToString(), MountPath = mountPath.ToString(), FreeBytes = checked((long)available)
+        };
+    }
+}
 
 public sealed class ExamLabBootstrapTransport : IDisposable {
     private readonly X509Certificate2 root;
@@ -128,6 +159,12 @@ public sealed class ExamLabBootstrapTransport : IDisposable {
         $env:TEMP = $previousTemp
         $env:TMP = $previousTmp
     }
+    $script:bootstrapTypesLoaded = $true
+}
+
+function Start-BootstrapTransport {
+    if ($script:transportStarted) { return }
+    Initialize-BootstrapTypes
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     $script:transport = [ExamLabBootstrapTransport]::new($controllerCa)
     $script:transportStarted = $true
@@ -380,6 +417,207 @@ function Invoke-EarlyCheck {
     Get-Content -LiteralPath $checkReport -Raw | ConvertFrom-Json
 }
 
+function Get-ReleaseVolume([string]$Path) {
+    $directory = $Path
+    while ($directory -and -not [IO.Directory]::Exists($directory)) {
+        $directory = [IO.Path]::GetDirectoryName($directory)
+    }
+    try {
+        if (-not $directory) { throw 'No existing destination directory is accessible.' }
+        Initialize-BootstrapTypes
+        $volume = [ExamLabBootstrapVolume]::Read($directory)
+        [pscustomobject]@{ Id=$volume.Id; MountPath=$volume.MountPath; FreeBytes=$volume.FreeBytes; Error=$null }
+    } catch {
+        $root = [IO.Path]::GetPathRoot($Path)
+        [pscustomobject]@{ Id="Unknown:$root"; MountPath=$root; FreeBytes=$null; Error=$_.Exception.Message }
+    }
+}
+
+function New-SpaceNeed([string]$Path, [string]$Kind, [long]$Bytes) {
+    [pscustomobject]@{ Path=$Path; Kind=$Kind; Bytes=$Bytes }
+}
+
+function Get-InstallationSpaceNeeds($ReleasePlan, [bool]$RuntimeReady, $Warnings) {
+    $windows = [Environment]::GetFolderPath('Windows')
+    $programData = [Environment]::GetFolderPath('CommonApplicationData')
+    $stage = $programFiles
+    $software = $ReleasePlan.Software
+    $downloaded = $ReleasePlan.Artifacts
+    $names = 'LGPO.zip', 'PolicyFileEditor-3.0.1.zip', 'gradle-9.8.2-bin.zip', 'gradle-exam-cache.zip',
+        'wazuh-agent-4.14.10-1.msi'
+    $required = @{}
+    foreach ($name in $names) { $required[$name] = $downloaded | Where-Object Name -ceq $name }
+
+    New-SpaceNeed $stage 'SetupFiles' ($installer.Bytes + $bundle.ExpandedBytes)
+    foreach ($name in 'LGPO.zip', 'PolicyFileEditor-3.0.1.zip') {
+        $artifact = $required[$name]
+        if ($artifact.ContainsKey('ExpandedBytes') -and $null -ne $artifact.ExpandedBytes) {
+            New-SpaceNeed $stage 'SetupFiles' $artifact.ExpandedBytes
+        } else { $Warnings.Add("Expanded archive size is unknown for $name.") }
+    }
+
+    foreach ($package in $software.Packages) {
+        $artifact = $downloaded | Where-Object Name -ceq $package.File
+        New-SpaceNeed $stage 'InstallerCopies' $artifact.Bytes
+    }
+    if ($software.PSObject.Properties['Size'] -and $software.Size) {
+        foreach ($component in $software.Size.Components) {
+            if ($component.Operation -eq 'Keep') { continue }
+            $destination = $component.Destination
+            if ($null -eq $component.AdditionalInstalledBytes -or -not $destination) {
+                $Warnings.Add("Installed growth is unknown for $($component.Name).")
+                continue
+            }
+            $payload = $software.Packages | Where-Object Name -ceq $component.Name
+            $publishedPayload = if ($payload) { $downloaded | Where-Object Name -ceq $payload.File }
+            if ($component.Name -eq 'Gradle' -and $publishedPayload -and $publishedPayload.ContainsKey('ExpandedBytes') -and
+                $null -ne $publishedPayload.ExpandedBytes) {
+                New-SpaceNeed $destination 'InstalledAssets' $publishedPayload.ExpandedBytes
+                New-SpaceNeed $destination 'InstalledEstimates' ([Math]::Max(0L,
+                    [long]$component.AdditionalInstalledBytes - [long]$publishedPayload.ExpandedBytes))
+            } else { New-SpaceNeed $destination 'InstalledEstimates' $component.AdditionalInstalledBytes }
+            if ($null -eq $component.StagingBytes) { $Warnings.Add("Installer working space is unknown for $($component.Name).") }
+            else {
+                $scratch = [Math]::Max(0L, [long]$component.StagingBytes - [long]$component.PayloadBytes)
+                $scratchPath = $component.StagingDestination
+                if ($payload -and $payload.File -like '*.msi') {
+                    $scratchPath = $windows
+                    New-SpaceNeed $windows 'InstalledEstimates' $publishedPayload.Bytes
+                } elseif ($payload -and $payload.File -like '*.exe' -and $env:TEMP) { $scratchPath = $env:TEMP }
+                if ($scratchPath) { New-SpaceNeed $scratchPath 'WorkingEstimates' $scratch }
+                elseif ($scratch) { $Warnings.Add("Installer working volume is unknown for $($component.Name).") }
+            }
+        }
+    } else { $Warnings.Add('Application installation sizes are unavailable.') }
+
+    $sharedGradle = Join-Path $programFiles 'ExamLabGradleCache'
+    $gradleCache = $required['gradle-exam-cache.zip']
+    if (-not ((Test-Path -LiteralPath (Join-Path $sharedGradle '.exam-lab-cache') -PathType Leaf -ErrorAction SilentlyContinue) -and
+        (Test-Path -LiteralPath (Join-Path $sharedGradle 'modules-2') -PathType Container -ErrorAction SilentlyContinue))) {
+        if ($gradleCache.ContainsKey('ExpandedBytes') -and $null -ne $gradleCache.ExpandedBytes) {
+            New-SpaceNeed $sharedGradle 'InstalledAssets' $gradleCache.ExpandedBytes
+        } else { $Warnings.Add('Expanded Gradle dependency cache size is unknown.') }
+    }
+    $gradleLauncher = $required['gradle-9.8.2-bin.zip']
+    $ideaRoot = Join-Path $programFiles 'ExamLabIdea'
+    if (-not (Test-Artifact (Join-Path $ideaRoot $gradleLauncher.Name) $gradleLauncher)) {
+        New-SpaceNeed $ideaRoot 'InstalledAssets' $gradleLauncher.Bytes
+    }
+
+    if (-not $RuntimeReady) {
+        New-SpaceNeed (Split-Path -Parent $pwsh) 'InstalledEstimates' ([Math]::Max(256MB, 2L * $runtime.Bytes))
+        New-SpaceNeed $windows 'InstalledEstimates' $runtime.Bytes
+        New-SpaceNeed $windows 'WorkingEstimates' ([Math]::Max(128MB, $runtime.Bytes))
+    }
+    if (-not (Get-Service -Name 'WazuhSvc' -ErrorAction SilentlyContinue)) {
+        $wazuh = $required['wazuh-agent-4.14.10-1.msi']
+        New-SpaceNeed (Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) 'ossec-agent') 'InstalledEstimates' `
+            ([Math]::Max(100MB, 2L * $wazuh.Bytes))
+        New-SpaceNeed $windows 'InstalledEstimates' $wazuh.Bytes
+        New-SpaceNeed $windows 'WorkingEstimates' ([Math]::Max(64MB, $wazuh.Bytes))
+    }
+    # The bundle and policy archives provide a conservative bound for stamps, code and side-by-side file updates.
+    $examLabCodeBytes = [long]$bundle.ExpandedBytes
+    foreach ($name in 'LGPO.zip', 'PolicyFileEditor-3.0.1.zip') {
+        if ($required[$name].ContainsKey('ExpandedBytes')) { $examLabCodeBytes += [long]$required[$name].ExpandedBytes }
+    }
+    if (Test-Path -LiteralPath (Join-Path $programFiles 'ExamLab') -PathType Container -ErrorAction SilentlyContinue) {
+        New-SpaceNeed $programFiles 'WorkingEstimates' $examLabCodeBytes
+    } else { New-SpaceNeed $programFiles 'InstalledEstimates' $examLabCodeBytes }
+    New-SpaceNeed $programData 'WorkingEstimates' 16MB
+    New-SpaceNeed $programFiles 'WorkingEstimates' 32MB
+}
+
+function Test-ReleaseSpace($ReleasePlan, [bool]$RuntimeReady, [string]$Phase) {
+    $warnings = [Collections.Generic.List[string]]::new()
+    $cacheBytes = if ($Phase -eq 'Initial') { $ReleasePlan.Report.CacheGrowthUpperBoundBytes } else { 0L }
+    $trustedCacheBytes = if ($Phase -eq 'Initial') { $ReleasePlan.Report.KnownCacheGrowthBytes } else { 0L }
+    $needs = @(New-SpaceNeed $cache 'Cache' $cacheBytes)
+    $needs += @(Get-InstallationSpaceNeeds $ReleasePlan $RuntimeReady $warnings)
+    $volumes = @{}
+    $resolvedPaths = @{}
+    foreach ($need in $needs) {
+        if (-not $resolvedPaths.ContainsKey($need.Path)) { $resolvedPaths[$need.Path] = Get-ReleaseVolume $need.Path }
+        $volume = $resolvedPaths[$need.Path]
+        if (-not $volumes.ContainsKey($volume.Id)) {
+            $volumes[$volume.Id] = [ordered]@{
+                Id=$volume.Id; MountPath=$volume.MountPath; FreeBytes=$volume.FreeBytes; Error=$volume.Error
+                Cache=0L; SetupFiles=0L; InstallerCopies=0L; InstalledAssets=0L; InstalledEstimates=0L; WorkingEstimates=0L
+            }
+        }
+        $row = $volumes[$volume.Id]
+        if ($null -ne $volume.FreeBytes -and $volume.FreeBytes -lt $row.FreeBytes) { $row.FreeBytes = $volume.FreeBytes }
+        $row[$need.Kind] += $need.Bytes
+    }
+    $cacheVolumeId = $resolvedPaths[$cache].Id
+    $rows = foreach ($row in $volumes.Values | Sort-Object MountPath) {
+        # The setup files stay present while installers run. Installer copies and the later Gradle assets need not coexist.
+        $minimumCache = if ($row.Id -eq $cacheVolumeId) { $trustedCacheBytes } else { 0L }
+        $minimum = $minimumCache + $row.SetupFiles + [Math]::Max($row.InstallerCopies, $row.InstalledAssets)
+        $estimatedGrowth = $row.InstalledAssets + $row.InstalledEstimates
+        $estimatedPeak = $row.Cache + $row.SetupFiles + $row.InstallerCopies + $estimatedGrowth + $row.WorkingEstimates
+        $blockingThreshold = if ($action -eq 'Prefetch') { $minimumCache } else { $minimum }
+        $status = 'Available'
+        $reason = $null
+        if ($null -eq $row.FreeBytes) { $status = 'Unknown'; $reason = $row.Error }
+        elseif ($row.FreeBytes -lt $blockingThreshold) {
+            $status = 'InsufficientSpace'
+            $reason = "Free space is below the known requirement of $blockingThreshold bytes."
+        } elseif ($row.FreeBytes -lt $estimatedPeak) {
+            $status = 'EstimatedSpaceRisk'
+            $reason = 'Available space is below the estimated installation peak.'
+        }
+        [pscustomobject]@{
+            VolumeId=$row.Id; MountPath=$row.MountPath; AvailableBytes=$row.FreeBytes; Status=$status; Reason=$reason
+            CacheGrowthBytes=$row.Cache; SetupStagingBytes=$row.SetupFiles; InstallerCopiesBytes=$row.InstallerCopies
+            AdditionalInstalledBytes=$estimatedGrowth; OtherWorkingBytes=$row.WorkingEstimates
+            KnownInstallationPeakBytes=$minimum; RequiredBytesForAction=$blockingThreshold; EstimatedPeakBytes=$estimatedPeak
+        }
+    }
+    $installedGrowth = [long]0
+    foreach ($row in $rows) { $installedGrowth += $row.AdditionalInstalledBytes }
+    $measurement = [pscustomobject]@{
+        Phase=$Phase; TimeUtc=[DateTime]::UtcNow; EstimatedAdditionalInstalledBytes=$installedGrowth
+        Volumes=@($rows); Warnings=$warnings.ToArray()
+    }
+    $ReleasePlan.Report.SpaceChecks += $measurement
+    $ReleasePlan.Report | ConvertTo-Json -Depth 9 |
+        Set-Content -LiteralPath (Join-Path $report 'release-plan.json') -Encoding UTF8
+    Write-Host "Disk space ($Phase). Estimated additional installed bytes: $installedGrowth."
+    $rows | Format-Table @{Label='Volume';Expression={$_.MountPath}}, @{Label='Free bytes';Expression={$_.AvailableBytes}},
+        @{Label='Cache bytes';Expression={$_.CacheGrowthBytes}}, @{Label='Install bytes';Expression={$_.AdditionalInstalledBytes}},
+        @{Label='Peak estimate';Expression={$_.EstimatedPeakBytes}}, Status -AutoSize | Out-Host
+    foreach ($row in $rows) {
+        if ($row.Reason) { Write-Warning "$($row.MountPath) $($row.Reason)" }
+    }
+    foreach ($warning in $warnings) { Write-Warning $warning }
+    return (-not @($rows | Where-Object Status -eq 'InsufficientSpace').Count)
+}
+
+function Remove-CachedReleaseInstallers {
+    $records = foreach ($artifact in $tools | Where-Object { $_.Name -match '\.exe$' }) {
+        $path = Join-Path $cache $artifact.Name
+        $state = 'Absent'
+        $reason = $null
+        try {
+            if (Test-Path -LiteralPath $path) {
+                Assert-ExamLabProtectedPath $path
+                if (-not (Test-Artifact $path $artifact)) { throw 'The file does not match the pinned release installer.' }
+                [IO.File]::Delete($path)
+                $state = 'Removed'
+                Write-Host "Removed cached installer $($artifact.Name)."
+            }
+        } catch {
+            $state = 'Retained'
+            $reason = $_.Exception.Message
+            Write-Warning "Cached installer cleanup left $($artifact.Name): $reason"
+        }
+        [pscustomobject]@{ Name=$artifact.Name; Status=$state; Bytes=$artifact.Bytes; Reason=$reason }
+    }
+    ConvertTo-Json -InputObject @($records) |
+        Set-Content -LiteralPath (Join-Path $report 'installer-cleanup.json') -Encoding UTF8
+}
+
 function Get-ReleasePlan($Check, [bool]$RuntimeReady) {
     $plannedFiles = @($Check.Plan.Packages | ForEach-Object { $_.File })
     $requiredTools = @('LGPO.zip', 'PolicyFileEditor-3.0.1.zip', 'wazuh-agent-4.14.10-1.msi',
@@ -393,30 +631,73 @@ function Get-ReleasePlan($Check, [bool]$RuntimeReady) {
     }
     $rows = foreach ($artifact in $artifacts) {
         $target = Join-Path $cache $artifact.Name
-        $status = if (-not $sharedCacheRead) { 'UnknownWithoutElevation' }
-            elseif (Test-Artifact $target $artifact) { 'Cached' }
-            else { 'Missing' }
-        $supplied = Get-SuppliedArtifact $artifact
-        if ($status -ne 'Cached' -and $supplied) { $status = 'SuppliedUnverified' }
-        [pscustomobject]@{ Name=$artifact.Name; Bytes=$artifact.Bytes; CacheStatus=$status }
+        $status = 'UnknownWithoutElevation'
+        $partialBytes = 0L
+        $partialCredit = 0L
+        if ($sharedCacheRead) {
+            $status = 'Missing'
+            if (Test-Path -LiteralPath $target) { Assert-ExamLabProtectedPath $target }
+            if (Test-Artifact $target $artifact) { $status = 'Cached' }
+            else {
+                $partial = "$target.$($artifact.SHA256).partial"
+                if (Test-Path -LiteralPath $partial) {
+                    Assert-ExamLabProtectedPath $partial
+                    $item = Get-Item -LiteralPath $partial -Force
+                    if (Test-Artifact $partial $artifact) { $status = 'VerifiedPartial' }
+                    elseif (-not $item.PSIsContainer -and $item.Length -gt 0) {
+                        if ($item.Length -lt $artifact.Bytes) {
+                            $status = 'Partial'
+                            $partialBytes = $item.Length
+                        }
+                        if (-not ($item.Attributes -band ([IO.FileAttributes]::SparseFile -bor [IO.FileAttributes]::Compressed))) {
+                            $partialCredit = [Math]::Min([long]$item.Length, [long]$artifact.Bytes)
+                        }
+                    }
+                }
+            }
+        }
+        $ready = $status -in 'Cached', 'VerifiedPartial'
+        $supplied = (-not $ready) -and [bool](Get-SuppliedArtifact $artifact)
+        $cacheGrowth = if ($ready) { 0L } else { [long]$artifact.Bytes - $partialCredit }
+        $networkMaximum = if ($ready -or $supplied) { 0L } else { [long]$artifact.Bytes }
+        [pscustomobject]@{
+            Name=$artifact.Name; Bytes=$artifact.Bytes; CacheStatus=$status; Supplied=$supplied; PartialBytes=$partialBytes
+            CacheGrowthBytes=$cacheGrowth; DownloadBytesIfRanges=$networkMaximum - [Math]::Min($networkMaximum, $partialBytes)
+            DownloadUpperBoundBytes=$networkMaximum; RemoveAfterSuccessfulApply=$artifact.Name -match '\.exe$'
+        }
     }
-    $unverified = @($rows | Where-Object CacheStatus -ne 'Cached')
-    $unknown = @($unverified | Where-Object CacheStatus -eq 'UnknownWithoutElevation')
-    $missing = @($unverified | Where-Object CacheStatus -eq 'Missing')
-    $missingBytes = if ($missing.Count) { [long](($missing | Measure-Object Bytes -Sum).Sum) } else { 0L }
-    $upperBoundBytes = if ($unverified.Count) { [long](($unverified | Measure-Object Bytes -Sum).Sum) } else { 0L }
+    $knownCacheGrowth = 0L
+    $upperCacheGrowth = 0L
+    $retainedCacheGrowth = 0L
+    $downloadUpper = 0L
+    $downloadWithRanges = 0L
+    foreach ($row in $rows) {
+        if ($row.CacheStatus -ne 'UnknownWithoutElevation') { $knownCacheGrowth += $row.CacheGrowthBytes }
+        $upperCacheGrowth += $row.CacheGrowthBytes
+        if (-not $row.RemoveAfterSuccessfulApply) { $retainedCacheGrowth += $row.CacheGrowthBytes }
+        $downloadUpper += $row.DownloadUpperBoundBytes
+        $downloadWithRanges += $row.DownloadBytesIfRanges
+    }
+    $plannedDownload = $null
+    if (-not @($rows | Where-Object CacheStatus -eq 'UnknownWithoutElevation').Count) { $plannedDownload = $downloadWithRanges }
+    $footprint = $null
+    if ($Check.Plan.PSObject.Properties['Size'] -and $Check.Plan.Size -and
+        $Check.Plan.Size.PSObject.Properties['EstimatedInstalledFootprintBytes']) { $footprint = $Check.Plan.Size.EstimatedInstalledFootprintBytes }
     $plan = [ordered]@{
         Release=$release; Attempt=$attempt; Action=$action; Elevated=$admin; Offline=$offline
         PowerShell7Ready=$RuntimeReady; Artifacts=@($rows); Transport='HTTPS; byte ranges tested during delivery'
-        DownloadBytes=$(if (-not $unknown.Count) { $missingBytes })
-        DownloadUpperBoundBytes=$upperBoundBytes
-        CacheDriveFreeBytes=([IO.DriveInfo]::new([IO.Path]::GetPathRoot($programFiles))).AvailableFreeSpace
+        DownloadBytes=$plannedDownload; DownloadUpperBoundBytes=$downloadUpper
+        KnownCacheGrowthBytes=$knownCacheGrowth; CacheGrowthUpperBoundBytes=$upperCacheGrowth
+        RetainedCacheGrowthIfApplySucceedsBytes=$retainedCacheGrowth
+        EstimatedSelectedApplicationFootprintBytes=$footprint; SpaceChecks=@()
     }
-    $plan | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $report 'release-plan.json') -Encoding UTF8
-    Write-Host "PowerShell 7 ready: $RuntimeReady. Cache drive free bytes: $($plan.CacheDriveFreeBytes)."
-    $rows | Format-Table Name, Bytes, CacheStatus -AutoSize | Out-Host
-    Write-Host "Download upper bound: $($plan.DownloadUpperBoundBytes) bytes."
-    return $artifacts
+    Write-Host "PowerShell 7 ready: $RuntimeReady."
+    $rows | Format-Table Name, Bytes, CacheStatus, Supplied, PartialBytes -AutoSize | Out-Host
+    Write-Host "Online download upper bound: $downloadUpper bytes."
+    if ($offline) { Write-Host 'Offline mode uses supplied or cached files.' }
+    if ($null -ne $plannedDownload) { Write-Host "Expected network bytes when ranges are honored: $plannedDownload." }
+    if ($null -ne $footprint) { Write-Host "Estimated installed footprint of selected applications: $footprint bytes." }
+    return [pscustomobject]@{ Report=$plan; Artifacts=$artifacts; Software=$Check.Plan }
 }
 
 function Test-PowerShellRuntime {
@@ -489,15 +770,17 @@ function Invoke-Bootstrap {
         return 2
     }
     $runtimeReady = Test-PowerShellRuntime
-    if ($check.Plan) { $artifacts = @(Get-ReleasePlan $check $runtimeReady) }
-    if ($action -eq 'Check') {
-        Write-Host "Check report: $report"
-        return 0
-    }
-    if ($action -ne 'Verify' -and -not $check.Plan) { throw 'Check returned no installation plan.' }
     if ($action -ne 'Verify') {
-        foreach ($artifact in $artifacts) { Save-Artifact $artifact }
+        if (-not $check.Plan) { throw 'Check returned no installation plan.' }
+        $releasePlan = Get-ReleasePlan $check $runtimeReady
+        if (-not (Test-ReleaseSpace $releasePlan $runtimeReady 'Initial')) { return 2 }
+        if ($action -eq 'Check') {
+            Write-Host "Check report: $report"
+            return 0
+        }
+        foreach ($artifact in $releasePlan.Artifacts) { Save-Artifact $artifact }
         if ($action -eq 'Prefetch') { return 0 }
+        if (-not (Test-ReleaseSpace $releasePlan $runtimeReady 'AfterPrefetch')) { return 2 }
     }
     if (-not $runtimeReady) {
         if ($action -eq 'Verify') { throw 'PowerShell 7 x64 for this release is unavailable.' }
@@ -515,6 +798,7 @@ function Invoke-Bootstrap {
             -ArgumentList "/i `"$msi`" /quiet /norestart USE_MU=0 ENABLE_MU=0 /L*v `"$log`"" -Wait -PassThru
         if ($process.ExitCode -ne 0) { return $process.ExitCode }
         if (-not (Test-PowerShellRuntime)) { throw 'The PowerShell 7 MSI ran, but the specified runtime did not pass verification.' }
+        if (-not (Test-ReleaseSpace $releasePlan $true 'AfterRuntimeInstall')) { return 2 }
     }
     $entry = Join-Path $cache $installer.Name
     Assert-ExamLabProtectedPath $entry
@@ -528,7 +812,12 @@ function Invoke-Bootstrap {
     $ErrorActionPreference = 'Continue'
     & $pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $localEntry @arguments 2>&1 |
         ForEach-Object { [string]$_ } | Tee-Object -FilePath (Join-Path $report 'powershell-console.log') | Out-Host
-    return $LASTEXITCODE
+    $applyExit = $LASTEXITCODE
+    if ($action -eq 'Apply' -and $applyExit -eq 0) {
+        try { Remove-CachedReleaseInstallers }
+        catch { Write-Warning "Cached installer cleanup report unavailable: $_" }
+    }
+    return $applyExit
 }
 
 try {

@@ -20,6 +20,9 @@ PILOT_CONTROLLER_DNS = "controller.exam-server-20261119.test"
 PWSH_VERSION = "7.6.10"
 PWSH_MSI = f"PowerShell-{PWSH_VERSION}-win-x64.msi"
 PWSH_SHA256 = "7d8daea48b450d4d62fcd1ac4d6faa7ac2db5e11aba5061ee81b7496adca8c07"
+# https://github.com/windirstat/windirstat/releases/tag/release/v2.9.3
+WINDIRSTAT_MSI = "WinDirStat-2.9.3-x64.msi"
+WINDIRSTAT_SHA256 = "96c4c4beb63c7c5ad6b1a206f96560d7a9a2b6063f3cd175a82f392977a9af5d"
 SOURCES = (
     "setup/Prepare-ExamLab.ps1",
     "setup/Install-ExamLabIdea.ps1",
@@ -73,6 +76,8 @@ def published_tools(git, revision, tools_dir):
             hashes[name] = hashlib.file_digest(stream, "sha256").hexdigest()
     if hashes.get(PWSH_MSI) != PWSH_SHA256:
         raise ValueError(f"{PWSH_MSI} не соответствует SHA-256 опубликованного выпуска PowerShell")
+    if WINDIRSTAT_MSI in hashes and hashes[WINDIRSTAT_MSI] != WINDIRSTAT_SHA256:
+        raise ValueError(f"{WINDIRSTAT_MSI} не соответствует SHA-256 опубликованного выпуска WinDirStat")
     return hashes
 
 
@@ -186,11 +191,21 @@ def main():
     installer_name = f"exam-lab-{revision}.ps1"
     tools_url = f"{base}/exam-lab-{revision}/tools"
     tools_pins = ";\n        ".join(f"'{name}' = '{pin}'" for name, pin in tools_hashes.items())
-    bootstrap_tools = ", ".join(
-        f"@{{Name='{name}'; SHA256='{pin}'; Bytes={(args.tools_dir / name).stat().st_size}}}"
-        for name, pin in tools_hashes.items()
-        if name != PWSH_MSI
-    )
+    cmd = git("show", f"{revision}:setup/Start-ExamLab.cmd").decode("ascii")
+    include_expanded_sizes = "@BUNDLE_EXPANDED_BYTES@" in cmd
+    bootstrap_tools = []
+    for name, pin in tools_hashes.items():
+        if name == PWSH_MSI:
+            continue
+        path = args.tools_dir / name
+        sizes = f"Bytes={path.stat().st_size}"
+        if include_expanded_sizes:
+            expanded = "$null"
+            if path.suffix.lower() == ".zip":
+                with zipfile.ZipFile(path) as archive:
+                    expanded = sum(member.file_size for member in archive.infolist())
+            sizes += f"; ExpandedBytes={expanded}"
+        bootstrap_tools.append(f"@{{Name='{name}'; SHA256='{pin}'; {sizes}}}")
     template = git("show", f"{revision}:setup/Install-FromHttps.ps1.in").decode("utf-8-sig")
     installer = fill_template(template, {
         "BUNDLE_URL": f"{base}/{filename}",
@@ -230,7 +245,6 @@ def main():
         native_base = f"https://{native_host}{url.path}"
         curl_resolve = f' --resolve "{PILOT_CONTROLLER_DNS}:{url.port or 443}:{url.hostname}"'
 
-    cmd = git("show", f"{revision}:setup/Start-ExamLab.cmd").decode("ascii")
     cmd_substitutions = {
         "REVISION": revision,
         "CONTROLLER_CA_PEM": bootstrap_pem(certificate),
@@ -251,8 +265,9 @@ def main():
         "PREFETCH_BASE_URL": base,
         "BUNDLE_FILE": filename,
         "BUNDLE_BYTES": len(bundle),
+        "BUNDLE_EXPANDED_BYTES": sum(len(data) for data in files.values()),
         "BUNDLE_SHA256": digest,
-        "BOOTSTRAP_TOOLS": f"@({bootstrap_tools})",
+        "BOOTSTRAP_TOOLS": "@(" + ", ".join(bootstrap_tools) + ")",
         "EARLY_CHECK_PAYLOAD": bootstrap_check(files["setup/Prepare-ExamLab.ps1"]),
     }
     if "@BOOTSTRAP_PRIVATE_PATHS@" in cmd:

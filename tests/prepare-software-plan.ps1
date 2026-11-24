@@ -20,6 +20,7 @@ function Get-UninstallEntries { $registeredFixture }
 function Invoke-Native { throw 'План запустил программу вместо чтения метаданных.' }
 function Get-Item([string]$LiteralPath) {
     if ($LiteralPath -eq $gitBinaryFixture) { return [pscustomobject]@{ VersionInfo=$gitVersionFixture } }
+    if ($LiteralPath -eq $winDirStatBinaryFixture) { return [pscustomobject]@{ VersionInfo=$winDirStatVersionFixture } }
     Microsoft.PowerShell.Management\Get-Item -LiteralPath $LiteralPath
 }
 
@@ -34,11 +35,30 @@ function New-FixtureJdk([string]$Directory, [string]$Version) {
     New-FixtureFile (Join-Path $Directory 'release') ('JAVA_VERSION="{0}"' -f $Version)
 }
 
+$shortage = [pscustomobject]@{ Status='InsufficientForStagedPackages'; Volume='C:\'; AvailableBytes=100;
+    RequiredPackageStagingBytes=200; EstimatedPeakAdditionalBytes=300 }
+$warnings = @(Confirm-SoftwareDiskSpace $shortage 3>&1)
+if ($warnings.Count -ne 1 -or $warnings[0] -isnot [Management.Automation.WarningRecord]) {
+    throw 'Check должен сообщить о нехватке места и продолжить.'
+}
+$blocked = $false
+try { Confirm-SoftwareDiskSpace $shortage -Apply }
+catch { $blocked = $_.Exception.Message -like 'Conflict:*200*' }
+if (-not $blocked) { throw 'Apply должен остановиться при нехватке места для временных копий пакетов.' }
+$shortage.Status = 'BelowEstimatedPeak'
+$shortage.AvailableBytes = 250
+$warnings = @(Confirm-SoftwareDiskSpace $shortage -Apply 3>&1)
+if ($warnings.Count -ne 1 -or $warnings[0] -isnot [Management.Automation.WarningRecord]) {
+    throw 'Apply должен продолжиться с предупреждением, если временные копии помещаются.'
+}
+'PASS Место: Check предупреждает, Apply блокируется только ниже размера временных копий.'
+
 $UsePublishedInstallers = $InstallAlongside = $false
 $IdeaPath = $JdkPath = $GitPath = $GradlePath = $ReplaceIdeaPath = $null
-$installOrder = @('JDK', 'Git', 'IDEA', 'Gradle')
+$installOrder = @('JDK', 'Git', 'IDEA', 'Gradle', 'WinDirStat')
 $registeredFixture = @()
 $gitBinaryFixture = $gitVersionFixture = $null
+$winDirStatBinaryFixture = $winDirStatVersionFixture = $null
 $previous = @{}
 $temporary = Join-Path ([IO.Path]::GetTempPath()) ('exam-lab-software-plan-' + [Guid]::NewGuid().ToString('N'))
 foreach ($name in 'ProgramFiles', 'LOCALAPPDATA', 'JAVA_HOME', 'GRADLE_HOME') {
@@ -69,6 +89,17 @@ try {
     }
     'PASS План: версия и путь отсутствующего Gradle сериализованы как JSON null.'
 
+    $component = $plan.Size.Components | Where-Object Name -eq WinDirStat
+    $package = $plan.Packages | Where-Object Name -eq WinDirStat
+    $knownPayload = ($plan.Packages | Measure-Object -Property PayloadBytes -Sum).Sum
+    if ($component.Operation -ne 'Install' -or $package.File -ne $pins.WinDirStat.File -or
+        $component.PayloadBytes -ne 2486272 -or $component.StagingBytes -le $component.PayloadBytes -or
+        $component.AdditionalInstalledBytes -lt 2910384 -or $plan.Size.KnownPayloadBytes -ne $knownPayload -or
+        $plan.Size.EstimatedAdditionalInstalledBytes -ne $plan.Size.EstimatedInstalledFootprintBytes) {
+        throw 'Ожидался отдельный точный размер пакета WinDirStat и оценки места для новых программ.'
+    }
+    'PASS WinDirStat: новый MSI в плане, размер скачивания и оценки установки различаются.'
+
     $jdkHome = Get-JdkDestination
     New-FixtureJdk $jdkHome $pins.JDK.Version
     $JdkPath = Join-Path $jdkHome 'bin'
@@ -84,11 +115,16 @@ try {
     New-FixtureFile (Join-Path $gradle "lib/gradle-core-$($pins.Gradle.Version).jar")
     New-FixtureFile (Join-Path $gradle "lib/gradle-launcher-$($pins.Gradle.Version).jar")
     [void][IO.Directory]::CreateDirectory((Join-Path $gradle 'lib/plugins'))
+    $winDirStatBinaryFixture = Join-Path $env:ProgramFiles 'WinDirStat/WinDirStat.exe'
+    New-FixtureFile $winDirStatBinaryFixture
+    $winDirStatVersionFixture = [pscustomobject]@{ ProductVersion=$pins.WinDirStat.Version; FileVersion="$($pins.WinDirStat.Version).2253" }
     $plan = Get-SoftwarePlan (Get-Inventory)
     $jdk = $plan.Actions | Where-Object Name -eq JDK
     if ($plan.Packages.Count -or $plan.Blockers.Count -or $jdk.ExistingPath -ne $jdkHome -or
-        @($plan.Actions | Where-Object Operation -ne Keep).Count) {
-        throw 'Повтор должен сохранить подходящие IDEA, JDK, Git и Gradle, включая выбранный JDK по bin.'
+        @($plan.Actions | Where-Object Operation -ne Keep).Count -or $plan.Size.KnownPayloadBytes -or
+        $plan.Size.EstimatedAdditionalInstalledBytes -or $plan.Size.EstimatedStagingBytes -or
+        $plan.Size.EstimatedInstalledFootprintBytes -le 0) {
+        throw 'Повтор должен сохранить подходящие программы и оценку их места без нового скачивания или установки.'
     }
     'PASS Повтор: подходящие программы сохранены в плане, установщики не требуются.'
 
@@ -103,6 +139,14 @@ try {
         throw 'Ожидалась пригодная версия Git из метаданных PE с суффиксом .windows.1.'
     }
     'PASS Git: версия PE с суффиксом .windows.1 распознана, экземпляр сохранён.'
+
+    $winDirStatVersionFixture = [pscustomobject]@{ ProductVersion='2.9.2'; FileVersion='2.9.2.0' }
+    $plan = Get-SoftwarePlan (Get-Inventory)
+    $winDirStat = $plan.Actions | Where-Object Name -eq WinDirStat
+    if ($winDirStat.Operation -ne 'Block' -or $plan.Size.Complete -or $plan.Packages.Count) {
+        throw 'Несовместимая существующая версия WinDirStat должна блокировать автоматическую замену.'
+    }
+    'PASS WinDirStat: прежняя неподходящая версия сохраняется, требуется проверка администратора.'
 } finally {
     foreach ($name in $previous.Keys) { [Environment]::SetEnvironmentVariable($name, $previous[$name]) }
     if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Recurse -Force }
