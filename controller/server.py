@@ -626,6 +626,11 @@ def poll(db, device_id, token, result, readiness=None, client=None):
             latest_report = report
         if result["outcome"] == "applied" and newer_report(last_applied, result, now):
             last_applied = report
+        if result["revision"] == active["revision"] and result["outcome"] == "overridden":
+            db.execute(
+                "UPDATE lti_guest_bindings SET closed = 1 WHERE device_id = ? AND revision = ? AND closed = 0",
+                (device_id, result["revision"]),
+            )
     db.execute(
         "UPDATE devices SET last_seen = ?, latest_report = ?, last_applied = ? WHERE device_id = ?",
         (iso_utc(now), latest_report, last_applied, device_id),
@@ -1061,10 +1066,6 @@ def record_lti_binding(db, payload, now=None):
         other_device_id = other["device_id"]
         if current_assignment(db, other_device_id)["revision"] != other["revision"]:
             continue
-        other_device = device_row(db, other_device_id)
-        latest = json.loads(other_device["latest_report"]) if other_device["latest_report"] else None
-        if latest and latest["revision"] == other["revision"] and latest["outcome"] == "overridden":
-            continue
         try:
             selected = selected_lti_guest(db, other_device_id, exam_id, lti_binding_target(other), now)
         except ValueError:
@@ -1072,6 +1073,8 @@ def record_lti_binding(db, payload, now=None):
         else:
             if selected.get("ltiCertId") == other["cert_id"]:
                 conflicts.append(other["cert_id"])
+            else:
+                unresolved = True
     if binding["uid"] is not None or conflicts:
         db.execute("UPDATE lti_guest_bindings SET uid = COALESCE(uid, ?) WHERE cert_id = ?", (uid, cert_id))
         db.executemany("UPDATE lti_guest_bindings SET state = 'conflict', submission = NULL WHERE cert_id = ?",
@@ -1114,7 +1117,8 @@ def request_acknowledgement(db, device, exam_id, target, uid, now):
 def reset_place_confirmation(db, device_id, exam_id):
     if current_assignment(db, device_id)["examId"] == exam_id:
         observation = read_campaign_guest(db, device_id)
-        if not verified_lti(get_lti_binding(db, observation)):
+        binding = get_lti_binding(db, observation) if observation and observation.get("examId") == exam_id else None
+        if not verified_lti(binding):
             db.execute("UPDATE device_readiness SET guest_confirmed = 0 WHERE device_id = ?", (device_id,))
         if observation and observation.pop("confirmedStudent", None) is not None:
             db.execute("UPDATE device_campaign SET guest_observation = ? WHERE device_id = ?",
