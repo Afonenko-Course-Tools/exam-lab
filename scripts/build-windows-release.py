@@ -82,7 +82,7 @@ def published_tools(git, revision, tools_dir):
 
 
 def fill_template(template, substitutions):
-    return re.sub(r"@([A-Z][A-Z0-9_]*)@", lambda match: substitutions[match[1]], template)
+    return re.sub(r"@([A-Z][A-Z0-9_]*)@", lambda match: str(substitutions[match[1]]), template)
 
 
 def read_root(path):
@@ -114,7 +114,7 @@ def bootstrap_payload(name, script):
 
 
 def render_cmd(template, substitutions):
-    cmd = fill_template(template, {name: str(value) for name, value in substitutions.items()})
+    cmd = fill_template(template, substitutions)
     return cmd.replace("\r\n", "\n").replace("\n", "\r\n").encode("utf-8")
 
 
