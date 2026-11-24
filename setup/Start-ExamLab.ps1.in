@@ -1,0 +1,49 @@
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+# The launcher runs this verified entry from an administrators-only directory.
+$diagnosticDirectory = $env:EXAMLAB_DIAGNOSTICS_DIR
+if (-not $diagnosticDirectory -or [IO.Path]::GetDirectoryName($PSCommandPath) -ine $diagnosticDirectory) {
+    throw 'Start ExamLab through the verified Start-ExamLab.cmd.'
+}
+
+@DIAGNOSTICS_COLLECTOR@
+
+$examLabStartCertificates = [Collections.Generic.List[Security.Cryptography.X509Certificates.X509Certificate2]]::new()
+$transcribing = $false
+try {
+    Start-Transcript -LiteralPath (Join-Path $diagnosticDirectory 'install-transcript.log') | Out-Null
+    $transcribing = $true
+    @ROOT_TRUST@
+    @LOAD_ROOTS@
+    @INSTALLER@
+} catch {
+    $failure = $_
+    if ($transcribing) {
+        try { Stop-Transcript | Out-Null } catch { }
+        $transcribing = $false
+    }
+    try {
+        $failure | Format-List * -Force | Out-String -Width 360 |
+            Set-Content -LiteralPath (Join-Path $diagnosticDirectory 'install-error.log') -Encoding utf8
+    } catch { }
+    try {
+        $errorId = if ($failure.FullyQualifiedErrorId -cmatch '\A[A-Za-z][A-Za-z0-9._,]{0,127}\z') {
+            $failure.FullyQualifiedErrorId
+        } else { 'UnstructuredErrorId' }
+        [ordered]@{
+            fullyQualifiedErrorId = $errorId
+            category = $failure.CategoryInfo.Category.ToString()
+            exceptionType = $failure.Exception.GetType().FullName
+            hResult = $failure.Exception.HResult
+            sourceLine = [int]$failure.InvocationInfo.ScriptLineNumber
+        } | ConvertTo-Json -Compress |
+            Set-Content -LiteralPath (Join-Path $diagnosticDirectory 'report/powershell-error.json') -Encoding utf8
+    } catch { }
+    try { Collect-ExamLabDiagnostics -DiagnosticDirectory $diagnosticDirectory }
+    catch { [Console]::Error.WriteLine("Additional diagnostics unavailable: $($_.Exception.Message)") }
+    [Console]::Error.WriteLine($failure.ToString())
+    exit 1
+} finally {
+    foreach ($certificate in $examLabStartCertificates) { $certificate.Dispose() }
+    if ($transcribing) { Stop-Transcript | Out-Null }
+}

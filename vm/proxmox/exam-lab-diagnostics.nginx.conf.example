@@ -1,0 +1,14 @@
+location = /install/diagnostics {
+    allow REPLACE_WITH_EXACT_CLIENT_CIDR;
+    deny all;
+    limit_except POST { deny all; }
+
+    client_max_body_size 8m;
+    client_body_timeout 12s;
+    proxy_connect_timeout 3s;
+    proxy_send_timeout 12s;
+    proxy_read_timeout 12s;
+    proxy_set_header Authorization "";
+    proxy_set_header Cookie "";
+    proxy_pass http://127.0.0.1:21651/install/diagnostics;
+}

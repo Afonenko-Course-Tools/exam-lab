@@ -1,0 +1,427 @@
+& {
+    $ErrorActionPreference = 'Stop'
+    Set-StrictMode -Version 2
+    $ProgressPreference = 'SilentlyContinue'
+    $toolHashes = @TOOLS_SHA256@
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    if ($PSVersionTable.PSEdition -ne 'Core' -or $PSVersionTable.PSVersion -lt [version]'7.6' -or
+        -not [Environment]::Is64BitProcess -or -not ([Security.Principal.WindowsPrincipal]::new($identity)).IsInRole(
+            [Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        throw 'Open elevated 64-bit PowerShell 7.'
+    }
+    $startCertificates = Get-Variable -Name examLabStartCertificates -ErrorAction SilentlyContinue
+    if (-not $startCertificates -or $startCertificates.Value.Count -ne 2) {
+        throw 'Start ExamLab through the verified Start-ExamLab.cmd.'
+    }
+
+    Add-Type -AssemblyName System.Diagnostics.EventLog
+    @MAINTENANCE_CORE@
+    @ENROLLMENT_CORE@
+
+    function Add-InstallPhase([string]$Phase) {
+        if (-not $env:EXAMLAB_DIAGNOSTICS_DIR) { return }
+        try {
+            $reportDirectory = Join-Path $env:EXAMLAB_DIAGNOSTICS_DIR 'report'
+            [void][IO.Directory]::CreateDirectory($reportDirectory)
+            [IO.File]::AppendAllText((Join-Path $reportDirectory 'install-phase.txt'), "$Phase`r`n")
+        } catch { Write-Warning 'Installation phase log unavailable.' }
+    }
+
+    function Invoke-Setup([string]$Name, [string[]]$Arguments, [ref]$RestartRequired) {
+        Add-InstallPhase ([IO.Path]::GetFileNameWithoutExtension($Name))
+        $PSNativeCommandUseErrorActionPreference = $false
+        & $examLabPowerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $setup $Name) @Arguments
+        if ($LASTEXITCODE -eq 3010) {
+            if ($null -eq $RestartRequired) { throw 'Restart Windows and run the same installation command again.' }
+            $RestartRequired.Value = $true
+            return
+        }
+        if ($LASTEXITCODE -ne 0) { throw "$Name failed with exit code $LASTEXITCODE." }
+    }
+
+    function Get-Download([string]$Url, [string]$Target) {
+        Add-InstallPhase ('download-' + [IO.Path]::GetFileName($Target))
+        Write-Host ('Downloading ' + [IO.Path]::GetFileName($Target))
+        Invoke-WebRequest -Uri $Url -OutFile $Target -ConnectionTimeoutSeconds 60 -OperationTimeoutSeconds 600 -MaximumRedirection 0 -NoProxy -ErrorAction Stop
+    }
+
+    function Get-IdeaDownload([string]$Url, [string]$Target) {
+        $ProgressPreference = 'Continue'
+        $activity = 'Downloading IntelliJ IDEA'
+        Add-InstallPhase ('download-' + [IO.Path]::GetFileName($Target))
+        Write-Host ('Downloading ' + [IO.Path]::GetFileName($Target))
+        $request = [Net.WebRequest]::CreateHttp($Url)
+        $request.AllowAutoRedirect = $false
+        $request.Proxy = $null
+        $request.Timeout = 600000
+        $request.ReadWriteTimeout = 600000
+        $response = $source = $file = $null
+        try {
+            Write-Progress -Activity $activity -Status 'Connecting...'
+            $response = $request.GetResponse()
+            if ($response.StatusCode -ne [Net.HttpStatusCode]::OK) {
+                throw "Unexpected HTTP status $([int]$response.StatusCode) for the IDEA download."
+            }
+            $length = $response.ContentLength
+            $source = $response.GetResponseStream()
+            $file = [IO.File]::Open($Target, 'CreateNew', 'Write', 'None')
+            $buffer = [byte[]]::new(256KB)
+            $received = 0L
+            $timer = [Diagnostics.Stopwatch]::StartNew()
+            $deadline = [Diagnostics.Stopwatch]::StartNew()
+            while (($read = $source.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                if ($deadline.Elapsed.TotalMinutes -ge 20) { throw 'The IDEA download exceeded its time limit.' }
+                $file.Write($buffer, 0, $read)
+                $received += $read
+                if ($timer.ElapsedMilliseconds -ge 500) {
+                    $status = '{0:F1} MiB received' -f ($received / 1MB)
+                    $percent = -1
+                    if ($length -gt 0) {
+                        $status = '{0:F1} of {1:F1} MiB' -f ($received / 1MB), ($length / 1MB)
+                        $percent = [Math]::Min(100, [Math]::Floor(100.0 * $received / $length))
+                    }
+                    Write-Progress -Activity $activity -Status $status -PercentComplete $percent
+                    $timer.Restart()
+                }
+            }
+            if ($length -ge 0 -and $received -ne $length) { throw 'The IDEA download ended before Content-Length was received.' }
+        } finally {
+            try {
+                if ($file) { $file.Dispose() }
+                if ($source) { $source.Dispose() }
+                if ($response) { $response.Close() }
+            } finally {
+                Write-Progress -Activity $activity -Completed
+            }
+        }
+    }
+
+    function Get-PublishedTool([string]$Name, [string]$Url, [switch]$Idea) {
+        if (-not $toolHashes.ContainsKey($Name)) { throw "Missing SHA-256 for $Name." }
+        $target = Join-Path $published $Name
+        if (Test-Path -LiteralPath $target) {
+            Assert-ExamLabProtectedPath $target
+            if ((Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash -ieq $toolHashes[$Name]) { return $target }
+            [IO.File]::Delete($target)
+        }
+        $temporary = Join-Path $stage $Name
+        if ($Idea) { Get-IdeaDownload $Url $temporary }
+        else { Get-Download $Url $temporary }
+        Assert-Sha256 $temporary $toolHashes[$Name]
+        [IO.File]::Move($temporary, $target)
+        return $target
+    }
+
+    function New-SetupDirectory([string]$Path, [switch]$ReadOnlyForUsers) {
+        $acl = [Security.AccessControl.DirectorySecurity]::new()
+        $acl.SetAccessRuleProtection($true, $false)
+        foreach ($value in 'S-1-5-18', 'S-1-5-32-544') {
+            $sid = [Security.Principal.SecurityIdentifier]::new($value)
+            $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+                $sid, 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow'))
+        }
+        if ($ReadOnlyForUsers) {
+            foreach ($value in 'S-1-5-32-545', 'S-1-5-32-546') {
+                $sid = [Security.Principal.SecurityIdentifier]::new($value)
+                $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+                    $sid, 'ReadAndExecute', 'ContainerInherit, ObjectInherit', 'None', 'Allow'))
+            }
+        }
+        [void][IO.FileSystemAclExtensions]::CreateDirectory($acl, $Path)
+    }
+
+    function Install-PilotGradleCache {
+        $target = Join-Path $programFiles 'ExamLabGradleCache'
+        if (Test-Path -LiteralPath $target) {
+            Assert-ExamLabProtectedPath $target -Readable
+            $marker = Join-Path $target '.exam-lab-cache'
+            if ((Get-Item -LiteralPath $target -Force).Attributes -band [IO.FileAttributes]::ReparsePoint -or
+                -not (Test-Path -LiteralPath $marker -PathType Leaf) -or
+                -not (Test-Path -LiteralPath (Join-Path $target 'modules-2') -PathType Container)) {
+                throw 'An existing ExamLabGradleCache requires administrator review.'
+            }
+        } else {
+            $archive = Get-PublishedTool 'gradle-exam-cache.zip' '@GRADLE_CACHE_URL@'
+            $unpacked = Join-Path $stage 'gradle-cache'
+            New-SetupDirectory $unpacked -ReadOnlyForUsers
+            Expand-Archive -LiteralPath $archive -DestinationPath $unpacked
+            $entries = @(Get-ChildItem -LiteralPath $unpacked -Force)
+            if ($entries.Count -ne 1 -or $entries[0].Name -cne 'modules-2' -or -not $entries[0].PSIsContainer) {
+                throw 'The Gradle dependency cache must contain one modules-2 directory.'
+            }
+            New-Item -ItemType File -Path (Join-Path $unpacked '.exam-lab-cache') | Out-Null
+            [IO.Directory]::Move($unpacked, $target)
+        }
+        Write-Host "Gradle shared dependency cache: $target"
+    }
+
+    function Install-PilotMoodleShortcut {
+        $activity = '@MOODLE_ACTIVITY_URL@'
+        if (-not $activity) { return }
+        $edge = Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) 'Microsoft\Edge\Application\msedge.exe'
+        if (-not (Test-Path -LiteralPath $edge -PathType Leaf)) { throw 'Microsoft Edge is missing.' }
+        $proxy = 'http://{0}:{1}' -f $pc.Network.ProxyEndpointIP, $pc.Network.ProxyEndpointPort
+        $browserRoot = Join-Path $programFiles 'ExamLabBrowser'
+        $filename = 'Open-ExamLabMoodle.cmd'
+        $launcher = Join-Path $browserRoot $filename
+        $content = "@echo off`r`nsetlocal DisableDelayedExpansion`r`n" +
+            ('start "" "{0}" --user-data-dir="%LOCALAPPDATA%\ExamLab\Edge" --proxy-server="{1}" "{2}"' -f $edge, $proxy, $activity) + "`r`n"
+        if (Test-Path -LiteralPath $browserRoot) {
+            if ((Get-Item -LiteralPath $browserRoot -Force).Attributes -band [IO.FileAttributes]::ReparsePoint -or
+                -not (Test-Path -LiteralPath $launcher -PathType Leaf) -or
+                (Get-Item -LiteralPath $launcher -Force).Attributes -band [IO.FileAttributes]::ReparsePoint -or
+                [IO.File]::ReadAllText($launcher) -cne $content) {
+                throw 'An existing ExamLabBrowser installation requires administrator review.'
+            }
+        } else {
+            $browserStage = Join-Path $stage 'browser'
+            New-SetupDirectory $browserStage -ReadOnlyForUsers
+            [IO.File]::WriteAllText((Join-Path $browserStage $filename), $content, [Text.Encoding]::ASCII)
+            [IO.Directory]::Move($browserStage, $browserRoot)
+        }
+
+        $desktop = [Environment]::GetFolderPath('CommonDesktopDirectory')
+        $linkPath = Join-Path $desktop 'ExamLab - Moodle.lnk'
+        $shell = New-Object -ComObject WScript.Shell
+        $link = $shell.CreateShortcut($linkPath)
+        if (Test-Path -LiteralPath $linkPath) {
+            if ($link.TargetPath -ine $launcher -or $link.Arguments) { throw 'A different ExamLab - Moodle shortcut already exists.' }
+        } else {
+            $link.TargetPath = $launcher
+            $link.IconLocation = "$edge,0"
+            $link.WindowStyle = 7
+            $link.Save()
+        }
+        Write-Host 'Desktop shortcut created: ExamLab - Moodle'
+    }
+
+    function Assert-Sha256([string]$Path, [string]$Expected) {
+        if ($Expected -notmatch '^[a-fA-F0-9]{64}$' -or
+            (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash -ne $Expected) {
+            throw "SHA-256 does not match: $([IO.Path]::GetFileName($Path))."
+        }
+    }
+
+    function Set-UpAlert {
+        $alertRoot = Join-Path $programFiles 'ExamLabAlert'
+        $alertKey = 'HKLM:\SOFTWARE\ExamLabAlertPilot'
+        $alertSource = Join-Path $package 'windows\alert'
+        $files = @('ExamLabAlert.ps1', 'Show-ExamLabAlert.ps1', 'Test-ExamLabFileReadAudit.ps1', 'Wait-ExamLabFileRead.ps1')
+        $legacyHashes = @{
+            'ExamLabAlert.ps1' = '311EDA1DA36F26BC7A981174C89E3408A249FF803411399422BBC63E9A17C110'
+            'Show-ExamLabAlert.ps1' = '09F809888C03D3A7BDF286118257537C77B4CE51025D7DEE12BA482523A08098'
+        }
+        $defined = (Test-Path -LiteralPath $alertKey) -and
+            (Test-Path -LiteralPath (Join-Path $alertRoot 'Private') -PathType Container) -and
+            [Diagnostics.EventLog]::SourceExists('ExamLab-Alert')
+        if (-not (Test-Path -LiteralPath $alertRoot)) {
+            if ((Test-Path -LiteralPath $alertKey) -or [Diagnostics.EventLog]::SourceExists('ExamLab-Alert')) {
+                throw 'An existing ExamLabAlert registry key or event source requires administrator review.'
+            }
+            New-SetupDirectory $alertRoot -ReadOnlyForUsers
+        } elseif (-not $defined -and -not (Test-ExamLabOwnedResource $ownership $alertRoot)) {
+            throw 'An incomplete ExamLabAlert installation requires administrator review.'
+        }
+        Assert-ExamLabProtectedPath $alertRoot -Readable
+        foreach ($name in $files) {
+            $source = Join-Path $alertSource $name
+            $target = Join-Path $alertRoot $name
+            if (Test-Path -LiteralPath $target) {
+                Assert-ExamLabProtectedPath $target -Readable
+                $installedHash = (Get-FileHash -LiteralPath $target).Hash
+                if ($installedHash -ceq (Get-FileHash -LiteralPath $source).Hash) { continue }
+                $legacy = $defined -and $legacyHashes[$name] -ceq $installedHash
+                if (-not $legacy -and -not (Test-ExamLabOwnedResource $ownership $alertRoot)) {
+                    throw "The prior ExamLabAlert file differs: $name."
+                }
+            }
+            Copy-ExamLabFileAtomically $source $target
+        }
+        if (-not $defined) {
+            $arguments = @('-Action', 'Initialize')
+            if (Test-ExamLabOwnedResource $ownership $alertRoot) { $arguments += '-ResumeInitialize' }
+            $PSNativeCommandUseErrorActionPreference = $false
+            & $examLabPowerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $alertRoot 'ExamLabAlert.ps1') @arguments
+            if ($LASTEXITCODE -ne 0) { throw "ExamLabAlert initialization failed with exit code $LASTEXITCODE." }
+        }
+    }
+
+    Add-InstallPhase 'preflight'
+    Write-Host 'ExamLab @REVISION@'
+    $machine = Get-CimInstance Win32_ComputerSystem
+    $os = Get-CimInstance Win32_OperatingSystem
+    if ($machine.PartOfDomain -or [int]$os.ProductType -ne 1 -or [int]$os.BuildNumber -lt 19041) {
+        throw 'The test installation requires a standalone Windows client, build 19041 or newer.'
+    }
+    $ordinaryRoster = @(Get-ExamLabEnrollmentRoster)
+
+    $programFiles = $examLabProgramFiles
+    $maintenance = $null
+    $stage = $null
+    $pollWasEnabled = $false
+    $componentsChanged = $false
+    try {
+        $maintenance = Open-ExamLabMaintenanceLock
+        $ownership = Read-ExamLabOwnership
+        if ($ownership.Removing) { throw 'Finish the previous local uninstall before installing ExamLab again.' }
+        if ($ownership.Disabled) { throw 'Enable the locally disabled ExamLab installation before updating it.' }
+        Assert-ExamLabArp $ownership
+        $boot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o')
+        if ($ownership.RebootBootUtc -ceq $boot) { exit 3010 }
+        Add-InstallPhase 'verify-certificate-trust'
+        $pollWasEnabled = Suspend-ExamLabPolling
+        $bootstrapAddedFirstRoot = $env:EXAMLAB_BOOTSTRAP_CA_ADDED -ceq '1'
+        Set-ExamLabRootTrust $ownership $examLabStartCertificates -BootstrapAddedFirstRoot:$bootstrapAddedFirstRoot
+        if ($bootstrapAddedFirstRoot) {
+            $marker = Join-Path $env:EXAMLAB_DIAGNOSTICS_DIR 'bootstrap-ca-managed'
+            $stream = [IO.File]::Open($marker, 'CreateNew', 'Write', 'None')
+            try {
+                $stream.WriteByte(49)
+                $stream.Flush($true)
+            } finally { $stream.Dispose() }
+            $caSha256 = (Get-CertificateSha256 $examLabStartCertificates[0].RawData).ToLowerInvariant()
+            $pending = Join-Path $examLabProgramFiles ('.exam-lab-controller-' + $caSha256 + '.pending')
+            if (Test-Path -LiteralPath $pending) {
+                Assert-ExamLabProtectedPath $pending -Readable
+                if ([IO.File]::ReadAllText($pending).Trim() -cne $caSha256) {
+                    throw 'The controller CA pending record does not match the verified certificate.'
+                }
+                [IO.File]::Delete($pending)
+            }
+        }
+        if ($pollWasEnabled) {
+            Start-ExamLabPolling
+            $pollWasEnabled = $false
+        }
+
+        $stage = Join-Path $programFiles ('ExamLabSetup-' + [Guid]::NewGuid().ToString('N'))
+        New-SetupDirectory $stage
+        $zip = Join-Path $stage 'exam-lab.zip'
+        Get-Download '@BUNDLE_URL@' $zip
+        Assert-Sha256 $zip '@BUNDLE_SHA256@'
+        $package = Join-Path $stage 'package'
+        Expand-Archive -LiteralPath $zip -DestinationPath $package
+        $setup = Join-Path $package 'setup'
+        Add-InstallPhase 'enroll-pc'
+        Import-Module (Join-Path $package 'windows\ExamNetwork.psm1') -Scope Local -ErrorAction Stop
+        $enrollment = Get-ExamLabEnrollmentInputs (Join-Path $examLabReportsPath 'Enrollment') '@ENROLLMENT_URL@' '@CONTROLLER_URL@' $ordinaryRoster
+        $pcPath = $enrollment.ComputerConfigPath
+        $registrationPath = $enrollment.RegistrationPath
+        $wazuhKey = $enrollment.WazuhKeyPath
+        $manager = $enrollment.ManagerIPv4
+        $pc = Read-ExamLabProtectedJson $pcPath
+        $published = Join-Path $examLabReportsPath 'Downloads'
+        if (-not (Test-Path -LiteralPath $published)) { New-SetupDirectory $published }
+        Assert-ExamLabProtectedPath $published
+        $lgpoZip = Get-PublishedTool 'LGPO.zip' '@LGPO_URL@'
+        $pfeZip = Get-PublishedTool 'PolicyFileEditor-3.0.1.zip' '@PFE_URL@'
+        $msi = Get-PublishedTool 'wazuh-agent-4.14.10-1.msi' '@WAZUH_URL@'
+        $idea = 'ideaIC-2025.2.6.4.exe'
+        $null = Get-PublishedTool $idea "@TOOLS_URL@/$idea" -Idea
+        foreach ($name in 'OpenJDK25U-jdk_x64_windows_hotspot_25.0.5_8.msi',
+            'Git-2.56.1-64-bit.exe', 'gradle-9.8.2-bin.zip') {
+            $null = Get-PublishedTool $name "@TOOLS_URL@/$name"
+        }
+        Add-InstallPhase 'verify-policy-tools'
+        $lgpoRoot = Join-Path $stage 'lgpo'
+        Expand-Archive -LiteralPath $lgpoZip -DestinationPath $lgpoRoot
+        $lgpo = Get-Item -LiteralPath (Join-Path $lgpoRoot 'LGPO_30\LGPO.exe')
+        $pfe = Join-Path $stage 'pfe'
+        Expand-Archive -LiteralPath $pfeZip -DestinationPath $pfe
+
+        Add-InstallPhase 'check-local-ownership'
+        $pollWasEnabled = Suspend-ExamLabPolling
+        foreach ($name in $examLabTaskNames) {
+            $pendingProtection = Test-ExamLabTaskNeedsProtection $ownership $name
+            $task = Get-ExamLabTask $name -AllowPendingProtection:$pendingProtection
+            Register-ExamLabResource $ownership $name ([bool]$task)
+        }
+        foreach ($path in @($examLabCodePath, $examLabStatePath, $examLabArpKey, 'HKLM:\SOFTWARE\ExamLabAlertPilot')) {
+            Register-ExamLabResource $ownership $path (Test-Path -LiteralPath $path)
+        }
+        Register-ExamLabResource $ownership 'ExamLab-Alert event source' ([Diagnostics.EventLog]::SourceExists('ExamLab-Alert'))
+        foreach ($name in 'ExamLabAlert', 'ExamLabBrowser', 'ExamLabIdea', 'ExamLabGradleCache') {
+            $path = Join-Path $programFiles $name
+            Register-ExamLabResource $ownership $path (Test-Path -LiteralPath $path)
+        }
+        foreach ($name in 'ExamLab - Moodle.lnk', 'ExamLab - IDEA.lnk') {
+            $path = Join-Path ([Environment]::GetFolderPath('CommonDesktopDirectory')) $name
+            Register-ExamLabResource $ownership $path (Test-Path -LiteralPath $path)
+        }
+        $installedRegistration = Join-Path $examLabStatePath 'controller-registration.json'
+        Register-ExamLabResource $ownership $installedRegistration (Test-Path -LiteralPath $installedRegistration)
+
+        $runReports = Join-Path $examLabReportsPath 'LatestAttempt'
+        if (-not (Test-Path -LiteralPath $runReports)) { New-SetupDirectory $runReports }
+        Assert-ExamLabProtectedPath $runReports
+        $softwareReport = Join-Path $runReports 'software.json'
+        $machineReport = Join-Path $runReports 'installation.json'
+        $prepareArguments = @('-Action', 'Prepare', '-HumanOutput', '-ReportPath', $softwareReport,
+            '-CacheDirectory', $published, '-UsePublishedInstallers')
+        $pilotArguments = @('-HumanOutput', '-ReportPath', $machineReport, '-DeferPolling', '-UsePublishedInstallers')
+        $wazuhArguments = @('-Action', 'Install', '-MsiPath', $msi, '-ManagerIPv4', $manager, '-AgentKeyPath', $wazuhKey,
+            '-UsePublishedInstallers')
+        # The old completion marker cannot attest to a partially changed installation.
+        if (Test-Path -LiteralPath $examLabFinalReport) {
+            Assert-ExamLabProtectedPath $examLabFinalReport
+            [IO.File]::Delete($examLabFinalReport)
+        }
+        $componentsChanged = $true
+        $restartRequired = $false
+        Write-Host 'Checking and preparing IDEA, JDK, Git, and Gradle.'
+        Invoke-Setup 'Prepare-ExamLab.ps1' $prepareArguments -RestartRequired ([ref]$restartRequired)
+        if ($restartRequired) {
+            $ownership.RebootBootUtc = $boot
+            Save-ExamLabOwnership $ownership
+            exit 3010
+        }
+        $ownership.RebootBootUtc = $null
+        Add-InstallPhase 'prepare-gradle-cache'
+        Install-PilotGradleCache
+        Invoke-Setup 'Install-ExamLabIdea.ps1' @('-SoftwareReportPath', $softwareReport,
+            '-GradleCachePath', (Join-Path $programFiles 'ExamLabGradleCache'),
+            '-GradleArchivePath', (Join-Path $published 'gradle-9.8.2-bin.zip'))
+        Invoke-Setup 'Install-LocalPilot.ps1' (@('-LGPOPath', $lgpo.FullName, '-PolicyFileEditorPath', $pfe,
+            '-ConfigurationPath', $pcPath, '-ControllerConfigurationPath', $registrationPath,
+            '-EnableLabControllerPolicyProbe') + $pilotArguments)
+        $ownership = Read-ExamLabOwnership
+        $machine = Read-ExamLabProtectedJson $machineReport
+        $verifiedCode = @($machine.Files | Where-Object Path -Like "$examLabCodePath\*").Path
+        Add-InstallPhase 'register-alert-event-source'
+        Set-UpAlert
+        Invoke-Setup 'Install-ExamLabWazuh.ps1' $wazuhArguments
+        Add-InstallPhase 'system-prepare'
+        $prepared = Invoke-ExamLabSystemTask 'prepare' 610
+        if ($prepared.Prepared -ne $true -or $prepared.SharedPCTargetMatches -ne $true -or $prepared.Conflicts.Count) {
+            throw 'Shared PC preparation is unconfirmed. See prepare.log.'
+        }
+        Add-InstallPhase 'system-normal'
+        $normal = Invoke-ExamLabSystemTask 'normal'
+        if ($normal.OwnSourceNormal -ne $true -or $normal.Normal.SourceCleanupCompleted -ne $true -or
+            $normal.Conflicts.Count -or $normal.Normal.Collection.Errors.Count) {
+            throw 'Local normal was not verified. See normal.log.'
+        }
+        Add-InstallPhase 'publish-local-installation'
+        Install-PilotMoodleShortcut
+        Save-ExamLabOwnedTree $ownership $examLabCodePath $verifiedCode
+        foreach ($name in 'ExamLabAlert', 'ExamLabBrowser', 'ExamLabIdea', 'ExamLabGradleCache') {
+            Save-ExamLabOwnedTree $ownership (Join-Path $programFiles $name)
+        }
+        foreach ($name in 'ExamLab - Moodle.lnk', 'ExamLab - IDEA.lnk') {
+            Save-ExamLabOwnedFile $ownership (Join-Path ([Environment]::GetFolderPath('CommonDesktopDirectory')) $name)
+        }
+        Assert-ExamLabProtectedPath $installedRegistration
+        Save-ExamLabOwnedFile $ownership $installedRegistration
+        Save-ExamLabAlertRegistration $ownership
+        Complete-ExamLabInstallation $ownership '@REVISION@'
+        Add-InstallPhase 'complete'
+        Write-Host 'ExamLab installation and Shared PC preparation completed.'
+    } finally {
+        try {
+            if ($pollWasEnabled -and -not $componentsChanged) { Start-ExamLabPolling }
+        } finally {
+            if ($maintenance) { $maintenance.Dispose() }
+            if ($stage -and (Test-Path -LiteralPath $stage)) { Remove-Item -LiteralPath $stage -Recurse -Force }
+        }
+    }
+}

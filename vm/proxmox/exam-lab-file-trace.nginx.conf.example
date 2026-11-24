@@ -1,0 +1,21 @@
+# Подключается вручную в TLS-сервере изолированного стенда.
+# Перед включением создайте рядом с controller.sqlite3 каталог file-traces
+# с правами 0700 и владельцем процесса контроллера. ZIP хранятся вне Git.
+location = /exam/v1/file-trace {
+    allow REPLACE_WITH_EXACT_CLIENT_CIDR;
+    deny all;
+    limit_except POST { deny all; }
+    access_log off;
+
+    # Контроллер сверяет свободное место перед записью и резервирует место для БД.
+    client_max_body_size 0;
+    client_body_timeout 20s;
+    proxy_http_version 1.1;
+    proxy_request_buffering off;
+    proxy_connect_timeout 3s;
+    proxy_send_timeout 25s;
+    proxy_read_timeout 31m;
+    proxy_set_header Authorization $http_authorization;
+    proxy_set_header Cookie "";
+    proxy_pass http://127.0.0.1:21651/exam/v1/file-trace;
+}

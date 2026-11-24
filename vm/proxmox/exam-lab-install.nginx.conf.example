@@ -1,0 +1,32 @@
+location ~ "^/install/(exam-lab-[0-9a-f]{40}\.ps1)$" {
+    allow 10.0.0.0/8;
+    deny all;
+    limit_except GET { deny all; }
+    alias /srv/exam-lab-release/$1;
+    types {}
+    default_type text/plain;
+    add_header Cache-Control "no-store";
+}
+
+location ~ "^/install/(exam-lab-[0-9a-f]{40}\.zip)$" {
+    allow 10.0.0.0/8;
+    deny all;
+    limit_except GET { deny all; }
+    alias /srv/exam-lab-release/$1;
+    types {}
+    default_type application/zip;
+    add_header Cache-Control "no-store";
+}
+
+location ~ "^/install/(exam-lab-[0-9a-f]{40}/tools/[A-Za-z0-9_-][A-Za-z0-9._-]*)$" {
+    allow 10.0.0.0/8;
+    deny all;
+    limit_except GET { deny all; }
+    alias /srv/exam-lab-release/$1;
+    types {}
+    default_type application/octet-stream;
+    add_header Cache-Control "no-store";
+}
+
+location = /install { return 404; }
+location /install/ { return 404; }

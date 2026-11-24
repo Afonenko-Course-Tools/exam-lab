@@ -1,0 +1,50 @@
+@echo off
+setlocal EnableExtensions DisableDelayedExpansion
+set "NATIVE=%SystemRoot%\System32"
+if /I "%~1"=="stage" goto :Stage
+if /I not "%COMPUTERNAME%"=="EXAM-LAB-VM" exit /b 1
+if /I not "%PROCESSOR_ARCHITECTURE%"=="AMD64" exit /b 1
+"%NATIVE%\whoami.exe" /user /fo csv /nh | "%NATIVE%\findstr.exe" /L /C:"S-1-5-18" >nul
+if errorlevel 1 exit /b 1
+
+set "MEDIA="
+for %%D in (D E F G H I J K L M N O P Q R S T U V W X Y Z) do (
+    if exist "%%D:\ExamLab-Seed.id" (
+        if defined MEDIA exit /b 1
+        set "MEDIA=%%D:"
+    )
+)
+if not defined MEDIA exit /b 1
+"%NATIVE%\findstr.exe" /I /L /X /C:"EXAM-LAB-DEVELOPMENT-SEED" "%MEDIA%\ExamLab-Seed.id" >nul
+if errorlevel 1 exit /b 1
+
+set "REPORT=%ProgramData%\ExamLab-VM"
+if not exist "%REPORT%" md "%REPORT%"
+if errorlevel 1 exit /b 1
+"%NATIVE%\icacls.exe" "%REPORT%" /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" >nul
+if errorlevel 1 exit /b 1
+del /q "%REPORT%\bootstrap-complete" >nul 2>&1
+
+set "PWSH=%ProgramFiles%\PowerShell\7\pwsh.exe"
+set "MSI=%MEDIA%\PowerShell.msi"
+"%NATIVE%\certutil.exe" -hashfile "%MSI%" SHA256 >"%REPORT%\powershell-sha256.log" 2>&1
+if errorlevel 1 exit /b 1
+"%NATIVE%\findstr.exe" /I /L /X /C:"@PWSH_SHA256@" "%REPORT%\powershell-sha256.log" >nul
+if errorlevel 1 exit /b 1
+if not exist "%PWSH%" (
+    "%NATIVE%\msiexec.exe" /i "%MSI%" /qn /norestart USE_MU=0 ENABLE_MU=0 /L*v "%REPORT%\powershell-msi.log"
+    if errorlevel 1 if not errorlevel 3010 exit /b 1
+    if errorlevel 3011 exit /b 1
+)
+"%PWSH%" -NoLogo -NoProfile -NonInteractive -Command "if ($PSVersionTable.PSVersion -ne [semver]'@PWSH_VERSION@' -or -not [Environment]::Is64BitProcess) { exit 1 }" >>"%REPORT%\bootstrap-native.log" 2>&1
+if errorlevel 1 exit /b 1
+"%PWSH%" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%MEDIA%\bootstrap.ps1" >>"%REPORT%\bootstrap-native.log" 2>&1
+exit /b %ERRORLEVEL%
+
+:Stage
+set "SETUP_SCRIPTS=%SystemRoot%\Setup\Scripts"
+if exist "%SETUP_SCRIPTS%\SetupComplete.cmd" exit /b 1
+if not exist "%SETUP_SCRIPTS%" md "%SETUP_SCRIPTS%"
+if errorlevel 1 exit /b 1
+copy /y "%~f0" "%SETUP_SCRIPTS%\SetupComplete.cmd" >nul
+exit /b %ERRORLEVEL%
