@@ -1,6 +1,7 @@
 import base64
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
-from datetime import timedelta
+from datetime import timedelta, timezone
 from http.client import HTTPConnection
 from http.server import ThreadingHTTPServer
 import json
@@ -128,7 +129,13 @@ class ControllerTest(unittest.TestCase):
         path.write_text(json.dumps(receipt), encoding="utf-8")
         slot = EnrollmentSlot(self.path.parent / "windows-enrollment")
         with closing(connect(self.path)) as db:
-            slot.arm(enrollment_receipt(path, db), 20)
+            validated = enrollment_receipt(path, db)
+        slot.path.mkdir(mode=0o700)
+        with slot.locked() as directory:
+            slot.write(directory, {
+                "receipt": validated, "claimDigest": None,
+                "expiresUtc": iso_utc(utc_now() + timedelta(minutes=20)),
+            })
         claim = json.dumps({"claim": "f" * 64})
         proof = self.enable_teacher_panel()
         self.assertEqual(404, self.send(claim, path=ENROLLMENT_PATH)[0])
@@ -139,6 +146,33 @@ class ControllerTest(unittest.TestCase):
         self.assertEqual(409, self.send(other, path=ENROLLMENT_PATH, headers=proof)[0])
         slot.disarm()
         self.assertEqual(404, self.send(claim, path=ENROLLMENT_PATH, headers=proof)[0])
+
+    def test_windows_enrollment_ten_concurrent_places_and_retries(self):
+        receipts = [{"registration": {"deviceId": "pc-01", "token": self.token}}]
+        with closing(connect(self.path)) as db:
+            for number in range(2, 11):
+                device_id = f"pc-{number:02}"
+                with db:
+                    token = register(db, device_id)
+                receipts.append({"registration": {"deviceId": device_id, "token": token}})
+        slot = EnrollmentSlot(self.path.parent / "windows-enrollment")
+        expires = (utc_now() + timedelta(minutes=20)).astimezone(timezone(timedelta(hours=3)))
+        slot.arm(receipts, expires)
+        self.assertEqual(iso_utc(expires.astimezone(timezone.utc)), json.loads(slot.state.read_text())["expiresUtc"])
+        headers = self.enable_teacher_panel()
+
+        def enroll(number):
+            claim = json.dumps({"claim": f"{number:064x}"})
+            return self.send(claim, path=ENROLLMENT_PATH, headers=headers)
+
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            results = list(pool.map(enroll, [0, 0, *range(1, 10)]))
+        self.assertEqual(results[0], results[1])
+        allocations = [results[0], *results[2:]]
+        self.assertEqual([200] * 10, [code for code, _ in allocations])
+        self.assertCountEqual([receipt for _, receipt in allocations], receipts)
+        self.assertEqual((409, {"error": "enrollment-already-claimed"}), enroll(10))
+        self.assertEqual(results[0], enroll(0))
 
     def test_report_order_override_and_connection_age(self):
         normal = self.assign(None)

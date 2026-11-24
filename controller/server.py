@@ -1110,19 +1110,32 @@ class EnrollmentSlot:
             finally:
                 staging.unlink(missing_ok=True)
 
-    def arm(self, receipt, minutes):
+    def arm(self, receipts, expires, *, replace_unclaimed=False):
+        devices = {receipt["registration"]["deviceId"] for receipt in receipts}
+        if not devices or len(devices) != len(receipts):
+            raise ValueError("Для каждого места нужна отдельная регистрация ПК")
+        expires = iso_utc(expires.astimezone(timezone.utc))
+        if expires <= iso_utc(utc_now()):
+            raise ValueError("Срок регистрации уже истёк")
         self.path.mkdir(mode=0o700, exist_ok=True)
         with self.locked() as directory:
-            if self.state.exists() and self.read()["expiresUtc"] > iso_utc(utc_now()):
-                raise ValueError("Окно регистрации уже открыто. Закройте его перед заменой ПК")
+            if self.state.exists():
+                previous = self.read()
+                if previous["expiresUtc"] > iso_utc(utc_now()) and (
+                    not replace_unclaimed or any(place["claimDigest"] for place in previous["places"])
+                ):
+                    raise ValueError("Окно регистрации уже открыто. Закройте его перед заменой мест")
             self.write(directory, {
-                "expiresUtc": iso_utc(utc_now() + timedelta(minutes=minutes)),
-                "claimDigest": None,
-                "receipt": receipt,
+                "expiresUtc": expires,
+                "places": [{"claimDigest": None, "receipt": receipt} for receipt in receipts],
             })
 
     def read(self):
-        return json.loads(self.state.read_text(encoding="utf-8"))
+        state = json.loads(self.state.read_text(encoding="utf-8"))
+        if "places" not in state:
+            state["places"] = [{"claimDigest": state.pop("claimDigest"), "receipt": state.pop("receipt")}]
+        state["expiresUtc"] = iso_utc(datetime.fromisoformat(state["expiresUtc"]).astimezone(timezone.utc))
+        return state
 
     def disarm(self):
         if not self.path.exists():
@@ -1140,16 +1153,19 @@ class EnrollmentSlot:
                     os.fsync(directory)
                     return HTTPStatus.GONE, {"error": "enrollment-expired"}
                 digest = token_digest(claim).hex()
-                if state["claimDigest"] and not secrets.compare_digest(state["claimDigest"], digest):
+                claimed = next((place for place in state["places"] if place["claimDigest"] and
+                                secrets.compare_digest(place["claimDigest"], digest)), None)
+                place = claimed or next((place for place in state["places"] if place["claimDigest"] is None), None)
+                if place is None:
                     return HTTPStatus.CONFLICT, {"error": "enrollment-already-claimed"}
-                registration = state["receipt"]["registration"]
+                registration = place["receipt"]["registration"]
                 device = authenticated_device(db, registration["deviceId"], registration["token"])
-                if state["claimDigest"] is None:
+                if claimed is None:
                     if not new_enrollment_device(db, device):
                         return HTTPStatus.GONE, {"error": "enrollment-unavailable"}
-                    state["claimDigest"] = digest
+                    place["claimDigest"] = digest
                     self.write(directory, state)
-                return HTTPStatus.OK, state["receipt"]
+                return HTTPStatus.OK, place["receipt"]
         except FileNotFoundError:
             return HTTPStatus.NOT_FOUND, {"error": "enrollment-closed"}
 
@@ -1535,8 +1551,8 @@ def main():
     serve_cmd.add_argument("--teacher-uid", type=int, action="append", default=[], metavar="UID")
     for command in ("register", "rotate-token", "assign", "status", "confirm-guest"):
         commands.add_parser(command).add_argument("device_id")
-    arm = commands.add_parser("arm-enrollment", help="Открыть короткое окно регистрации одного ПК")
-    arm.add_argument("--receipt", required=True, type=Path, metavar="PATH")
+    arm = commands.add_parser("arm-enrollment", help="Открыть регистрацию подготовленных ПК")
+    arm.add_argument("--receipt", required=True, action="append", type=Path, metavar="PATH")
     arm.add_argument("--minutes", type=int, default=20, choices=range(5, 61), metavar="MINUTES")
     commands.add_parser("close-enrollment", help="Закрыть окно регистрации и удалить временные данные")
     commands.add_parser("readiness", help="Показать готовность зарегистрированных ПК")
@@ -1592,8 +1608,9 @@ def main():
             elif command in ("arm-enrollment", "close-enrollment"):
                 slot = EnrollmentSlot(path.parent / "windows-enrollment")
                 if command == "arm-enrollment":
-                    slot.arm(enrollment_receipt(args.receipt, db), args.minutes)
-                    result = "Окно регистрации открыто"
+                    receipts = [enrollment_receipt(path, db) for path in args.receipt]
+                    slot.arm(receipts, utc_now() + timedelta(minutes=args.minutes))
+                    result = f"Регистрация открыта. Подготовлено мест: {len(receipts)}"
                 else:
                     slot.disarm()
                     result = "Окно регистрации закрыто"
