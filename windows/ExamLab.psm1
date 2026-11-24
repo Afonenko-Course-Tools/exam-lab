@@ -205,6 +205,14 @@ function Test-ExamLabInactiveGuestEvidence($Account, [object[]]$Profiles, [int]$
         $special -and $special.Value -is [bool] -and -not $special.Value)
 }
 
+function Test-ExamLabElevatedNonSystemAdministrator {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    try {
+        return (-not $identity.IsSystem -and [Security.Principal.WindowsPrincipal]::new($identity).IsInRole(
+            [Security.Principal.WindowsBuiltInRole]::Administrator))
+    } finally { $identity.Dispose() }
+}
+
 function Get-ExamLabGuestRosterEvidence([object[]]$LocalAccounts, [object[]]$OrdinaryAccounts, [switch]$IdentifyOnly, [switch]$PreviouslyPrepared, $ObservedGuest) {
     $declared = @(foreach ($account in $OrdinaryAccounts) { $account.Sid })
     $observedSid = if ($ObservedGuest) { $ObservedGuest.Sid }
@@ -222,8 +230,9 @@ function Get-ExamLabGuestRosterEvidence([object[]]$LocalAccounts, [object[]]$Ord
                 $observed = @($LocalAccounts | Where-Object { $_.SID.Value -ceq $observedSid })
                 if ($observed.Count -eq 1 -and $observed[0].Name -cmatch $script:SharedPcGuestName) { $observed[0].Name }
             }
+            $allowRecordedPreparation = $PreviouslyPrepared -and -not $ObservedGuest -and (Test-ExamLabElevatedNonSystemAdministrator)
             if ($eligible.Count -and (-not $ObservedGuest -or $observedName) -and
-                (Test-SharedPCGuestRosterReady (Get-SharedPCState) -PreviouslyPrepared:($PreviouslyPrepared -and -not $ObservedGuest)) -and
+                (Test-SharedPCGuestRosterReady (Get-SharedPCState) -AllowRecordedPreparation:$allowRecordedPreparation) -and
                 (Test-ControllerNoGuestSession $ObservedGuest $observedName)) {
                 $admins = @(Get-LocalGroupMember -SID 'S-1-5-32-544' -ErrorAction Stop | ForEach-Object { $_.SID.Value })
                 # Для WQL ниже используются только SID, проверенные Test-ExamLabInactiveGuestAccount.
@@ -326,11 +335,13 @@ function Test-SharedPCTarget {
         $i.SetEduPolicies -eq $false -and $i.SetPowerPolicies -eq $false -and $i.RestrictLocalStorage -eq $false)
 }
 
-function Test-SharedPCGuestRosterReady($Shared, [switch]$PreviouslyPrepared) {
+function Test-SharedPCGuestRosterReady($Shared, [switch]$AllowRecordedPreparation) {
     if (Test-SharedPCTarget $Shared) { return $true }
-    # Только повторная установка вправе опереться на собственную проверенную подготовку,
-    # когда повышенному администратору закрыт SYSTEM-раздел WMI Bridge.
-    return ($PreviouslyPrepared -and $Shared.State -ceq 'Unknown' -and $null -eq $Shared.Count -and $Shared.AccessDenied)
+    # Закрытый SYSTEM-раздел WMI Bridge отвечает повышенному администратору
+    # отказом доступа или пустым успешным результатом.
+    return ($AllowRecordedPreparation -and $Shared.State -ceq 'Unknown' -and
+        (($null -eq $Shared.Count -and $Shared.AccessDenied) -or
+            ($Shared.Count -is [int] -and $Shared.Count -eq 0 -and -not $Shared.AccessDenied)))
 }
 
 function Test-SharedPCUnset {

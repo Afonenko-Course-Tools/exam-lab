@@ -274,15 +274,18 @@ try {
     $mdmDenied = [pscustomobject]@{State='Unknown'; Count=$null; AccessDenied=$true}
     $mdmUnavailable = [pscustomobject]@{State='Unknown'; Count=$null; AccessDenied=$false}
     $mdmNoInstance = [pscustomobject]@{State='Unknown'; Count=0; AccessDenied=$false}
+    $mdmManyInstances = [pscustomobject]@{State='Unknown'; Count=2; AccessDenied=$false}
     if (-not (& $module { param($s) Test-SharedPCGuestRosterReady $s } $target) -or
         (& $module { param($s) Test-SharedPCGuestRosterReady $s } $mdmDenied) -or
-        -not (& $module { param($s) Test-SharedPCGuestRosterReady $s -PreviouslyPrepared } $mdmDenied) -or
-        (& $module { param($s) Test-SharedPCGuestRosterReady $s -PreviouslyPrepared } $mdmUnavailable) -or
-        (& $module { param($s) Test-SharedPCGuestRosterReady $s -PreviouslyPrepared } $mdmNoInstance)) {
-        throw 'FAIL сохранённая подготовка заменяет только подтверждённый отказ доступа к WMI Bridge'
+        (& $module { param($s) Test-SharedPCGuestRosterReady $s } $mdmNoInstance) -or
+        -not (& $module { param($s) Test-SharedPCGuestRosterReady $s -AllowRecordedPreparation } $mdmDenied) -or
+        -not (& $module { param($s) Test-SharedPCGuestRosterReady $s -AllowRecordedPreparation } $mdmNoInstance) -or
+        (& $module { param($s) Test-SharedPCGuestRosterReady $s -AllowRecordedPreparation } $mdmUnavailable) -or
+        (& $module { param($s) Test-SharedPCGuestRosterReady $s -AllowRecordedPreparation } $mdmManyInstances)) {
+        throw 'FAIL сохранённая подготовка заменяет только отказ доступа или пустой ответ WMI Bridge'
     }
     $target.Instance.DeletionPolicy=$null
-    if (& $module {param($s) Test-SharedPCGuestRosterReady $s -PreviouslyPrepared} $target) {
+    if (& $module {param($s) Test-SharedPCGuestRosterReady $s -AllowRecordedPreparation} $target) {
         throw 'FAIL сохранённая подготовка не заменяет прочитанное расхождение Shared PC'
     }
     'PASS SharedPC target: explicit0 принят, null не приводится к0'
