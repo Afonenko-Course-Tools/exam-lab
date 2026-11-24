@@ -9,12 +9,12 @@ location = /exam/v1/file-trace {
 
     # Контроллер сверяет свободное место перед записью и резервирует место для БД.
     client_max_body_size 0;
-    client_body_timeout 20s;
+    client_body_timeout 120s;
     proxy_http_version 1.1;
     proxy_request_buffering off;
     proxy_connect_timeout 3s;
-    proxy_send_timeout 25s;
-    proxy_read_timeout 31m;
+    proxy_send_timeout 125s;
+    proxy_read_timeout 121m;
     proxy_set_header Authorization $http_authorization;
     proxy_set_header Cookie "";
     proxy_pass http://127.0.0.1:21651/exam/v1/file-trace;

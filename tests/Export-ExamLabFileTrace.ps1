@@ -244,7 +244,7 @@ function Send-TraceArchive($Registration, [Uri]$Controller, $Route, [Net.IPAddre
     $client = [Net.Http.HttpClient]::new($handler)
     $request = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Post, $endpoint)
     try {
-        $client.Timeout = [TimeSpan]::FromMinutes(60)
+        $client.Timeout = [TimeSpan]::FromMinutes(125)
         $client.MaxResponseContentBufferSize = 4096
         $request.Headers.Authorization = [Net.Http.Headers.AuthenticationHeaderValue]::new('Bearer', $Registration.token)
         $request.Headers.Add('X-ExamLab-Device', $Registration.deviceId)

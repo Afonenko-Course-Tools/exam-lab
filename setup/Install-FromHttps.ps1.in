@@ -42,7 +42,7 @@
     function Get-Download([string]$Url, [string]$Target) {
         Add-InstallPhase ('download-' + [IO.Path]::GetFileName($Target))
         Write-Host ('Downloading ' + [IO.Path]::GetFileName($Target))
-        Invoke-WebRequest -Uri $Url -OutFile $Target -ConnectionTimeoutSeconds 60 -OperationTimeoutSeconds 600 -MaximumRedirection 0 -NoProxy -ErrorAction Stop
+        Invoke-WebRequest -Uri $Url -OutFile $Target -ConnectionTimeoutSeconds 120 -OperationTimeoutSeconds 900 -MaximumRedirection 0 -NoProxy -ErrorAction Stop
     }
 
     function Get-IdeaDownload([string]$Url, [string]$Target) {
@@ -53,8 +53,8 @@
         $request = [Net.WebRequest]::CreateHttp($Url)
         $request.AllowAutoRedirect = $false
         $request.Proxy = $null
-        $request.Timeout = 600000
-        $request.ReadWriteTimeout = 600000
+        $request.Timeout = 900000
+        $request.ReadWriteTimeout = 900000
         $response = $source = $file = $null
         try {
             Write-Progress -Activity $activity -Status 'Connecting...'
@@ -70,7 +70,7 @@
             $timer = [Diagnostics.Stopwatch]::StartNew()
             $deadline = [Diagnostics.Stopwatch]::StartNew()
             while (($read = $source.Read($buffer, 0, $buffer.Length)) -gt 0) {
-                if ($deadline.Elapsed.TotalMinutes -ge 20) { throw 'The IDEA download exceeded its time limit.' }
+                if ($deadline.Elapsed.TotalHours -ge 4) { throw 'The IDEA download exceeded its time limit.' }
                 $file.Write($buffer, 0, $read)
                 $received += $read
                 if ($timer.ElapsedMilliseconds -ge 500) {

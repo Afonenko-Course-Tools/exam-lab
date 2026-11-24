@@ -192,7 +192,7 @@ set "CURL_TLS_FLAGS=--ssl-no-revoke"
 exit /b 0
 
 :Download
-"%CURL%" -q --proto "=https" --noproxy "*" --tlsv1.2@CURL_RESOLVE@ %CURL_TLS_FLAGS% --fail --silent --show-error --connect-timeout 8 --max-time 180 --output "%~2" "%~1" >> "%LOG%" 2>&1
+"%CURL%" -q --proto "=https" --noproxy "*" --tlsv1.2@CURL_RESOLVE@ %CURL_TLS_FLAGS% --fail --silent --show-error --connect-timeout 30 --max-time 2700 --output "%~2" "%~1" >> "%LOG%" 2>&1
 exit /b %ERRORLEVEL%
 
 :Step
@@ -211,7 +211,7 @@ for %%F in ("%WORK%\diagnostics.zip") do if %%~zF GTR 8388608 (
     echo Diagnostic ZIP is larger than 8 MiB. It is available locally.
     exit /b 0
 )
-"%CURL%" -q --proto "=https" --noproxy "*" --tlsv1.2@CURL_RESOLVE@ %CURL_TLS_FLAGS% --fail --silent --show-error --connect-timeout 4 --max-time 12 --header "Content-Type: application/zip" --header "Expect:" --data-binary "@%WORK%\diagnostics.zip" --output "%WORK%\upload-result.json" "@DIAGNOSTICS_URL@" >> "%LOG%" 2>&1
+"%CURL%" -q --proto "=https" --noproxy "*" --tlsv1.2@CURL_RESOLVE@ %CURL_TLS_FLAGS% --fail --silent --show-error --connect-timeout 30 --max-time 1200 --header "Content-Type: application/zip" --header "Expect:" --data-binary "@%WORK%\diagnostics.zip" --output "%WORK%\upload-result.json" "@DIAGNOSTICS_URL@" >> "%LOG%" 2>&1
 if not "%ERRORLEVEL%"=="0" (
     echo Diagnostic upload unavailable. The ZIP is available locally.
     exit /b 0
