@@ -50,6 +50,18 @@ try {
     $traceState.Result.revision = 17
     $traceState.Result.outcome = 'blocked'
     Assert-ActiveExam 'назначение есть, подтверждения политики нет' $false
+    foreach ($case in @(
+        @{Status='Connected'; Elapsed=2500; Delay=12500},
+        @{Status='Connected'; Elapsed=14750; Delay=1000},
+        @{Status='Connected'; Elapsed=28000; Delay=1000},
+        @{Status='Unavailable'; Elapsed=8000; Delay=15000},
+        @{Status='Rejected'; Elapsed=1000; Delay=15000},
+        @{Status='LocalError'; Elapsed=28000; Delay=15000}
+    )) {
+        $delay = & $module { param($Elapsed,$Status) Get-ControllerPollDelayMilliseconds $Elapsed $Status } $case.Elapsed $case.Status
+        if ($delay -ne $case.Delay) { throw "FAIL интервал опроса $($case.Status), длительность $($case.Elapsed) мс" }
+    }
+    'PASS опрос: 15 секунд от начала успешного цикла, минимум 1 секунда, после отказа полные 15 секунд.'
     function Test-Config([string]$Name,[string]$Json,[bool]$Expected) {
         $passed=$false
         try { & $module {param($c) Test-DeclaredConfig $c} ($Json|ConvertFrom-Json) | Out-Null; $passed=$true } catch {}

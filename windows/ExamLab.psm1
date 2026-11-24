@@ -925,6 +925,11 @@ function Invoke-ExamLabControllerAlertAcknowledgement($Command, $Assignment, $Sn
     } finally { $lock.Dispose() }
 }
 
+function Get-ControllerPollDelayMilliseconds([long]$ElapsedMilliseconds, [string]$Status) {
+    if ($Status -cne 'Connected') { return 15000 }
+    return [int][Math]::Max(1000L, 15000L - $ElapsedMilliseconds)
+}
+
 function Invoke-ExamLabControllerLoop {
     Assert-Host
     if ($PSScriptRoot -ne $script:CodeRoot) { throw 'Запустите установленную задачу опроса.' }
@@ -953,6 +958,7 @@ function Invoke-ExamLabControllerLoop {
     $client = New-ExamLabHttpClient
     try {
         while ($true) {
+            $cycle = [Diagnostics.Stopwatch]::StartNew()
             $health.LastAttemptUtc = Get-ControllerUtc
             $health.ActionDetail = $null
             $health.Readiness = $null
@@ -965,7 +971,7 @@ function Invoke-ExamLabControllerLoop {
                 $health.Status='LocalError'
                 $health.Reason='controller-state-unreadable'
                 Write-ControllerJson $script:ControllerHealthFile $health
-                Start-Sleep -Seconds 15
+                Start-Sleep -Milliseconds (Get-ControllerPollDelayMilliseconds $cycle.ElapsedMilliseconds $health.Status)
                 continue
             }
             try {
@@ -1005,7 +1011,7 @@ function Invoke-ExamLabControllerLoop {
                 $health.Reason = $_.Exception.Message
                 Write-ControllerJson $script:ControllerHealthFile $health
             }
-            Start-Sleep -Seconds 15
+            Start-Sleep -Milliseconds (Get-ControllerPollDelayMilliseconds $cycle.ElapsedMilliseconds $health.Status)
         }
     } finally { $client.Dispose() }
 }
