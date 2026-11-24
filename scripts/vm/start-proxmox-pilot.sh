@@ -36,26 +36,6 @@ else
 fi
 
 cd "$pilot_home/git/deployment"
-native="$pilot_home/native/exam"
-starter_path=questions/java-semester-one/exr-numbers-console-greeting/clientFilesQuestion/starter.zip
-starter="$native/$starter_path"
-correction="$pilot_home/transfer/handoff-java"
-if [[ ${EXAMLAB_REPUBLISH_LEGACY_STARTER:-} == 1 ]]; then
-    cmp -- "$correction/original.zip" <(git -C "$native" show "HEAD:$starter_path")
-    if cmp -s -- "$starter" "$correction/canary.zip"; then
-        git -C "$native" restore --source=HEAD --worktree -- "$starter_path"
-    else
-        cmp -- "$starter" "$correction/original.zip"
-    fi
-fi
 python3 scripts/fixture.py up --env-file "$pilot_home/config/exam-server.env" --kind exam
-if [[ ${EXAMLAB_REPUBLISH_LEGACY_STARTER:-} == 1 ]]; then
-    (
-        next=$(mktemp "$(dirname "$starter")/.starter.zip.XXXXXX")
-        trap 'rm -f -- "$next"' EXIT
-        install -m 0644 -- "$correction/canary.zip" "$next"
-        mv -T -- "$next" "$starter"
-    )
-fi
 python3 scripts/fixture.py up --env-file "$pilot_home/config/ordinary-server.env" --kind ordinary
 bash "$wazuh_home/private/control.sh" up
