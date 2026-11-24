@@ -10,7 +10,9 @@ function Get-ExamLabEnrollmentRoster {
         }
         if ([long]$Matches.Rid -ge 1000) { [pscustomobject]@{ Sid = $sid; Name = $user.Name } }
     })
-    if (-not $roster.Count) { throw 'Windows has no ordinary local user accounts for ExamLab.' }
+    if (-not ($roster | Where-Object Name -ne 'defaultuser0')) {
+        throw 'Windows has no ordinary local user accounts for ExamLab.'
+    }
     $roster | Sort-Object Sid
 }
 

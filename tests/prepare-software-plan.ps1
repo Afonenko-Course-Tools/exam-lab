@@ -63,6 +63,12 @@ try {
     }
     'PASS JDK: обнаружен корень по bin, запланирован отдельный JDK 25.'
 
+    $gradlePlan = $plan.Actions | Where-Object Name -eq Gradle | ConvertTo-Json -Compress | ConvertFrom-Json
+    if ($gradlePlan.Operation -ne 'Install' -or $null -ne $gradlePlan.ExistingPath -or $null -ne $gradlePlan.ExistingVersion) {
+        throw 'Ожидались JSON null для версии и пути отсутствующей установки Gradle.'
+    }
+    'PASS План: версия и путь отсутствующего Gradle сериализованы как JSON null.'
+
     $jdkHome = Get-JdkDestination
     New-FixtureJdk $jdkHome $pins.JDK.Version
     $JdkPath = Join-Path $jdkHome 'bin'

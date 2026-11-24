@@ -471,8 +471,15 @@ function Get-SoftwarePlan($Inventory) {
                 $packages.Add([pscustomobject]@{ Name=$name; File=$pin.File; SHA256=$pin.Hash; Uri=$pin.Uri; Destination=$destination })
             }
         }
+        # Windows PowerShell 5.1 can serialize an empty pipeline as {} instead of null.
+        $existingPath = $null
+        $existingVersion = $null
+        if ($selected) {
+            $existingPath = $selected.Path
+            $existingVersion = $selected.Version
+        }
         $actions.Add([pscustomobject]@{ Name=$name; Operation=$operation;
-            ExistingPath=$(if ($selected) { $selected.Path }); ExistingVersion=$(if ($selected) { $selected.Version });
+            ExistingPath=$existingPath; ExistingVersion=$existingVersion;
             Destination=$destination; Replacement=$remove })
     }
     [pscustomobject]@{ Actions=$actions.ToArray(); Packages=$packages.ToArray(); Blockers=$blockers.ToArray() }

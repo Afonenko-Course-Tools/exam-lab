@@ -82,6 +82,12 @@ try {
     Assert-Expected $blocked $true 'незавершённой подготовки Windows'
     Assert-Expected ($script:checkedSetupUsers.Count -eq 2) $true 'проверки текущего SAM'
     $script:setupAccountIssue = $null
+    $script:fakeUsers = @($placeholder)
+    $blocked = $false
+    try { $null = Get-ExamLabEnrollmentRoster }
+    catch { $blocked = $_.Exception.Message -ceq 'Windows has no ordinary local user accounts for ExamLab.' }
+    Assert-Expected $blocked $true 'отсутствия обычной учётки при одном defaultuser0'
+    $script:fakeUsers = @($ordinary, $placeholder)
     $roster = @(Get-ExamLabEnrollmentRoster)
     Assert-Expected ($roster.Count -eq 2 -and $roster[0].Name -ceq $ordinary.Name -and
         $roster[1].Name -ceq $placeholder.Name -and $roster[1].Sid -ceq $placeholder.Sid.Value) $true 'сохранения обеих отключённых учёток'
