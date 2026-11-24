@@ -1,5 +1,5 @@
 # Переносимый тест. Подменены чтение томов Win32, проверка Windows ACL и размеры компонентов.
-# Проверяются расчёт порогов, отчёт и очистка реальных временных файлов по SHA-256.
+# Проверяются расчёт порогов, очистка файлов и квитанция диагностики с подменённым HTTP.
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2
 
@@ -8,7 +8,7 @@ $source = [IO.File]::ReadAllText($launcher) -creplace '@[A-Z0-9_]+@', '0'
 $parseErrors = $null
 $ast = [Management.Automation.Language.Parser]::ParseInput($source, [ref]$null, [ref]$parseErrors)
 if ($parseErrors.Count) { throw ($parseErrors | Out-String) }
-foreach ($name in 'Test-Artifact', 'New-SpaceNeed', 'Test-ReleaseSpace', 'Remove-CachedReleaseInstallers') {
+foreach ($name in 'Test-Artifact', 'New-SpaceNeed', 'Test-ReleaseSpace', 'Remove-CachedReleaseInstallers', 'Send-Diagnostics') {
     $definition = $ast.EndBlock.Statements | Where-Object {
         $_ -is [Management.Automation.Language.FunctionDefinitionAst] -and $_.Name -ceq $name
     }
@@ -105,3 +105,60 @@ try {
     }
     'PASS: раздельные тома, отказ при подтверждённой нехватке, оценочный риск и адресная очистка EXE.'
 } finally { Remove-Item -LiteralPath $temporary -Recurse -Force }
+
+& {
+    $offline = $admin = $false
+    $baseUrl = 'https://fixture.invalid/install'
+    $receiver = 'diagnostics-fixture'
+    $reportId = 'c0ffee1234567890c0ffee1234567890'
+    $response = [pscustomobject]@{ StatusCode=201; Body=(@{reportId=$reportId} | ConvertTo-Json -Compress) }
+    $response | Add-Member ScriptMethod GetResponseStream {
+        [IO.MemoryStream]::new([Text.Encoding]::UTF8.GetBytes($this.Body))
+    }
+    $response | Add-Member ScriptMethod Dispose { }
+    $request = [pscustomobject]@{
+        Method=$null; ContentType=$null; AllowWriteStreamBuffering=$true; ContentLength=0L
+        ServicePoint=[pscustomobject]@{ Expect100Continue=$true }; Uploaded=$null; Response=$response
+    }
+    $request | Add-Member ScriptMethod GetRequestStream {
+        $this.Uploaded = [IO.MemoryStream]::new()
+        $this.Uploaded
+    }
+    $request | Add-Member ScriptMethod GetResponse { $this.Response }
+    $transport = [pscustomobject]@{ Calls=0; CurrentRequest=$request }
+    $transport | Add-Member ScriptMethod Request { $this.Calls++; $this.CurrentRequest }
+    function Start-BootstrapTransport { }
+
+    $directory = Join-Path ([IO.Path]::GetTempPath()) ('exam-lab-bootstrap-receipt-' + [Guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($directory)
+    try {
+        $inputFile = Join-Path $directory 'report.txt'
+        $archive = Join-Path $directory 'diagnostics.zip'
+        $receiptPath = Join-Path $directory 'upload-result.json'
+        [IO.File]::WriteAllText($inputFile, 'Synthetic Check report')
+        Compress-Archive -LiteralPath $inputFile -DestinationPath $archive
+        [IO.File]::WriteAllText((Join-Path $directory 'delivery-target.txt'), $receiver)
+        $archiveHash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($archiveHash.StartsWith($reportId, [StringComparison]::Ordinal)) { throw 'Тесту нужен независимый номер архива.' }
+
+        if ((Send-Diagnostics $directory) -cne $reportId) { throw 'Случайный номер из ответа 201 отклонён.' }
+        $uploaded = [IO.MemoryStream]::new($request.Uploaded.ToArray())
+        try { $uploadedHash = (Get-FileHash -InputStream $uploaded -Algorithm SHA256).Hash.ToLowerInvariant() }
+        finally { $uploaded.Dispose() }
+        $saved = Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json
+        if ($uploadedHash -cne $archiveHash -or $saved.reportId -cne $reportId -or $saved.archiveSha256 -cne $archiveHash) {
+            throw 'Локальная квитанция не связывает номер с SHA-256 фактически отправленного ZIP.'
+        }
+        if ((Send-Diagnostics $directory) -cne $reportId -or $transport.Calls -ne 1) { throw 'ZIP с совпадающим SHA-256 отправлен повторно.' }
+
+        [IO.File]::WriteAllText($receiptPath, $response.Body)
+        if ((Send-Diagnostics $directory) -cne $reportId -or $transport.Calls -ne 1) { throw 'Квитанция прежнего формата вызвала повторную отправку.' }
+
+        $saved.archiveSha256 = '0' * 64
+        [IO.File]::WriteAllText($receiptPath, ($saved | ConvertTo-Json -Compress))
+        if ((Send-Diagnostics $directory) -cne $reportId -or $transport.Calls -ne 2) { throw 'Квитанция с неверным SHA-256 помешала отправить ZIP.' }
+        $retried = Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json
+        if ($retried.archiveSha256 -cne $archiveHash) { throw 'Повтор не сохранил правильный SHA-256.' }
+        'PASS: случайный номер из ответа 201, SHA-256 отправленного ZIP и проверка повтора для обеих форм квитанции.'
+    } finally { Remove-Item -LiteralPath $directory -Recurse -Force }
+}
