@@ -25,6 +25,12 @@ function Get-ReleaseVolume([string]$Path) {
 
 function Get-InstallationSpaceNeeds {
     New-SpaceNeed $installation 'SetupFiles' 16MB
+    New-SpaceNeed $installation 'WorkingEstimates' 8MB
+}
+
+function Read-InstallVolumeReport {
+    $saved = Get-Content -LiteralPath (Join-Path $report 'release-plan.json') -Raw | ConvertFrom-Json
+    $saved.SpaceChecks[-1].Volumes | Where-Object VolumeId -CEQ 'Install'
 }
 
 function Assert-ExamLabProtectedPath([string]$Path) {
@@ -61,10 +67,30 @@ try {
 
     $action = 'Apply'
     if (Test-ReleaseSpace $plan $true 'Initial') { throw 'Apply пропустил известную нехватку места на томе установки.' }
-    $saved = Get-Content -LiteralPath (Join-Path $report 'release-plan.json') -Raw | ConvertFrom-Json
-    $installVolume = $saved.SpaceChecks[-1].Volumes | Where-Object VolumeId -CEQ 'Install'
+    $installVolume = Read-InstallVolumeReport
     if ($installVolume.Status -cne 'InsufficientSpace' -or $installVolume.RequiredBytesForAction -ne 16MB) {
         throw 'В отчёте Apply потеряна причина отказа.'
+    }
+
+    $action = 'Check'
+    if (Test-ReleaseSpace $plan $true 'Initial') { throw 'Check пропустил известную нехватку места.' }
+    $installVolume = Read-InstallVolumeReport
+    if ($installVolume.Status -cne 'InsufficientSpace' -or $installVolume.AvailableBytes -ne 2MB -or
+        $installVolume.RequiredBytesForAction -ne 16MB -or -not $installVolume.Reason) {
+        throw 'В отчёте Check отсутствуют измерение и причина отказа.'
+    }
+
+    $action = 'Apply'
+    $script:fixtureVolumes[$installation].FreeBytes = 20MB
+    $result = @(Test-ReleaseSpace $plan $true 'Initial' 3>&1)
+    $warnings = @($result | Where-Object { $_ -is [Management.Automation.WarningRecord] })
+    if ($result[-1] -ne $true -or $warnings.Count -ne 1) {
+        throw 'Apply должен продолжиться с предупреждением при оценочном риске.'
+    }
+    $installVolume = Read-InstallVolumeReport
+    if ($installVolume.Status -cne 'EstimatedSpaceRisk' -or $installVolume.RequiredBytesForAction -ne 16MB -or
+        $installVolume.EstimatedPeakBytes -ne 24MB -or -not $installVolume.Reason) {
+        throw 'В отчёте Apply потеряна причина предупреждения об оценочном риске.'
     }
 
     $tools = @(New-TestPackage 'release.exe'; New-TestPackage 'renamed.exe'; New-TestPackage 'release.msi')
@@ -79,5 +105,5 @@ try {
     if (($cleanup | Where-Object Name -CEQ 'renamed.exe').Status -cne 'Retained') {
         throw 'В отчёте очистки отсутствует сохранённый EXE с другим SHA-256.'
     }
-    'PASS: раздельные тома, отказ при нехватке подтверждённого места и адресная очистка EXE.'
+    'PASS: раздельные тома, отказ при подтверждённой нехватке, оценочный риск и адресная очистка EXE.'
 } finally { Remove-Item -LiteralPath $temporary -Recurse -Force }
