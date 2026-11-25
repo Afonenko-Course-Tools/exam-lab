@@ -257,7 +257,7 @@ $lockPath = Join-Path $private 'app-locker-pilot.lock'
 $lockExists = Test-Path -LiteralPath $lockPath
 if ($Action -ne 'Audit' -and -not $lockExists) {
     if ((Test-Path -LiteralPath $intentPath) -or (Test-Path -LiteralPath $phasePath)) { throw 'Отсутствует блокировка действующей пробы.' }
-    [pscustomobject]@{ OwnedPolicy = $false; Loaded = $false }
+    [pscustomobject]@{ OwnedPolicy = $false; Loaded = $false; RuntimeClearConfirmed = $false }
     return
 }
 if ($lockExists) { Assert-ProtectedPath $lockPath }
@@ -278,7 +278,7 @@ try {
     if ($Action -eq 'Audit' -and $intent) { throw 'Сначала прочитайте Status или завершите текущую пробу действием Normal.' }
     if ($Action -ne 'Audit' -and -not $intent) {
         if (Test-Path -LiteralPath $phasePath) { throw 'Осталась фаза записи без намерения AppLocker.' }
-        [pscustomobject]@{ OwnedPolicy = $false; Loaded = $false }
+        [pscustomobject]@{ OwnedPolicy = $false; Loaded = $false; RuntimeClearConfirmed = $false }
         return
     }
 
@@ -380,7 +380,7 @@ try {
         }
     }
     [pscustomobject]@{
-        ProbeId = $intent.ProbeId; LocalEmpty = $true; EffectiveEmpty = $true
+        ProbeId = $intent.ProbeId; LocalEmpty = $true; EffectiveEmpty = $true; RuntimeClearConfirmed = $false
         AppIdState = $service.State; AppIdStartMode = $service.StartMode; Utc = [DateTimeOffset]::UtcNow.ToString('o')
     }
 } finally { $lock.Dispose() }
