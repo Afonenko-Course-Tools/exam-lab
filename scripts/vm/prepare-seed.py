@@ -43,7 +43,7 @@ seed.mkdir(exist_ok=True)
 seed.chmod(0o700)
 shutil.copyfile(ROOT / 'vm/bootstrap.ps1', seed / 'bootstrap.ps1')
 shutil.copyfile(args.powershell_msi, seed / 'PowerShell.msi')
-(seed / 'ExamLab-Seed.id').write_text('EXAM-LAB-DEVELOPMENT-SEED\n', encoding='ascii')
+(seed / 'ExamLab-Seed.id').write_text('EXAM-LAB-DEVELOPMENT-SEED\n', encoding='ascii', newline='\r\n')
 setup_complete = (ROOT / 'vm/bootstrap.cmd.in').read_text(encoding='ascii').replace(
     '@PWSH_SHA256@', powershell_sha256
 ).replace('@PWSH_VERSION@', powershell_pin['PWSH_VERSION'])
