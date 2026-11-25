@@ -22,6 +22,7 @@ param(
     [switch]$EnableLabControllerPolicyProbe,
     [switch]$UsePublishedInstallers,
     [switch]$DeferPolling,
+    [ValidatePattern('\A[0-9a-f]{32}\z')][string]$InstallAttemptId,
     [string]$ReportPath,
     [switch]$HumanOutput
 )
@@ -30,14 +31,15 @@ Set-StrictMode -Version 2
 if ($HumanOutput -and -not $ReportPath) { throw 'HumanOutput requires ReportPath.' }
 $lock = $null
 $maintenance = $null
+$worker = $null
+$ownsAttempt = $false
 $pollWasEnabled = $false
-$backupFiles = @{}
-$existingTasks = @{}
-$deliveryPending = $false
+$code = $null
+$state = $null
 . (Join-Path $PSScriptRoot 'ExamLabMaintenance.Core.ps1')
 $sources = [Collections.Generic.List[object]]::new()
-$actions = @('prepare','check','exam','normal')
-$codeFiles = @('ExamLab.psm1','exam-lab.ps1','ExamLab.Usb.psm1','ExamNetwork.psm1','ExamLab.Controller.psm1')
+$actions = @($examLabTaskNames | Where-Object { $_ -cne $examLabPollTask } | ForEach-Object { $_.Substring('ExamLab-Local-'.Length) })
+$codeFiles = @('ExamLab.Usb.psm1','ExamNetwork.psm1','ExamLab.Controller.psm1','ExamLab.psm1','exam-lab.ps1')
 $maintenanceFiles = @('ExamLabMaintenance.ps1', 'ExamLabMaintenance.Core.ps1', 'ExamLabRootTrust.ps1')
 $pollTask = $examLabPollTask
 $roots = @()
@@ -59,7 +61,7 @@ $pfeFiles = [ordered]@{
     'en-US/about_RegistryValuesForAdminTemplates.Help.txt'='06f286bfa5d2dd9b16ad24c8dee8245948dd3f0b3033b65a5dcfacd851a83b5b'
     'package/services/metadata/core-properties/445e8411c5804e3690b6e21eed01e358.psmdcp'='ad5ce893115e275622393531920d6e484d7ae3f2fa53af92765c9246a21e1d00'
 }
-$result = [ordered]@{ Installed=$false; ActionsExecuted=$false; PolicyActivationRequested=$false; Files=@(); Tasks=@(); TrustedRoots=@(); LabControllerPolicyProbe=$false }
+$result = [ordered]@{ Installed=$false; ActionsExecuted=$false; PolicyActivationRequested=$false; Files=@(); Tasks=@(); TaskChecks=@(); Rollback=@(); TrustedRoots=@(); LabControllerPolicyProbe=$false }
 
 function Assert-NativeAMD64 {
     # Тот же native API, что в Prepare-ExamLab; x64-эмуляция на ARM64 не подходит.
@@ -148,8 +150,9 @@ function Assert-ConfigurationRevision([string]$Path, [string]$Hash) {
     }
 }
 
-function Assert-SafeDirectory([string]$Path, [switch]$Readable) {
+function Assert-SafeDirectory([string]$Path, [switch]$Readable, [switch]$TrackCreation) {
     if (-not (Test-Path -LiteralPath $Path)) {
+        if ($TrackCreation) { Add-ExamLabInstallChange ([ordered]@{ Kind = 'Directory'; Target = $Path }) }
         $acl = New-Object Security.AccessControl.DirectorySecurity
         $acl.SetAccessRuleProtection($true,$false)
         foreach ($sid in @('S-1-5-18','S-1-5-32-544')) {
@@ -181,48 +184,53 @@ function Assert-SafeDirectory([string]$Path, [switch]$Readable) {
     }
 }
 
-function Copy-Source([string]$From, [string]$To, [string]$ExpectedHash) {
-    $inputFile = [IO.File]::Open($From,'Open','Read','Read')
-    $sources.Add($inputFile)
+function Copy-InstallStream([IO.Stream]$InputFile, [string]$To, [string]$ExpectedHash) {
     $hash = (Get-FileHash -InputStream $inputFile -Algorithm SHA256).Hash
     if ($ExpectedHash -and $hash -ne $ExpectedHash) { throw "Не совпадает ожидаемый SHA256 перед записью $To" }
-    $changed = -not (Test-Path -LiteralPath $To) -or (Get-FileHash -LiteralPath $To -Algorithm SHA256).Hash -ne $hash
+    $readable = $To.StartsWith($code + '\', [StringComparison]::OrdinalIgnoreCase)
+    $prior = Get-ExamLabProtectedFileHash $To $readable
+    $changed = $prior -cne $hash
     if ($changed) {
+        if ($prior) {
+            $tree = $ownership.Trees.PSObject.Properties[$code]
+            $proof = if ($readable -and $tree) {
+                $tree.Value.PSObject.Properties[$To.Substring($code.Length + 1)]
+            } else { $ownership.Trees.PSObject.Properties[$To] }
+            $resource = if ($readable) { $code } else { $To }
+            if (-not (Test-ExamLabOwnedResource $ownership $resource) -or -not $proof -or $proof.Value -cne $prior) {
+                throw "Не подтверждено владение изменяемым файлом $To."
+            }
+        }
         $staged = $To + '.' + [Guid]::NewGuid().ToString('N') + '.tmp'
+        Save-ExamLabInstallTemporaryFile $staged $readable
         try {
             $inputFile.Position = 0
             $outputFile = [IO.File]::Open($staged,'CreateNew','Write','None')
             try { $inputFile.CopyTo($outputFile); $outputFile.Flush($true) } finally { $outputFile.Dispose() }
             if ((Get-FileHash -LiteralPath $staged -Algorithm SHA256).Hash -ne $hash) { throw "Не совпадает копия $To" }
-            $backup = $null
-            if ([IO.File]::Exists($To)) {
-                $backup = $To + '.' + [Guid]::NewGuid().ToString('N') + '.previous'
-                [IO.File]::Replace($staged, $To, $backup)
-            } else { [IO.File]::Move($staged, $To) }
-            $backupFiles[$To] = $backup
+            Set-ExamLabInstallFile $staged $To -Readable:$readable
         } finally { [IO.File]::Delete($staged) }
     }
     if ((Get-FileHash -LiteralPath $To -Algorithm SHA256).Hash -ne $hash) { throw "Не совпадает копия $To" }
     [pscustomobject]@{ Name=[IO.Path]::GetFileName($To); SHA256=$hash; Changed=$changed; Path=$To }
 }
 
-function Copy-GeneratedSource([string]$Content, [string]$Target) {
-    $source = Join-Path $state ('generated-' + [Guid]::NewGuid().ToString('N') + '.tmp')
-    $sourceCount = $sources.Count
-    try {
-        [IO.File]::WriteAllText($source, $Content, [Text.UTF8Encoding]::new($false))
-        Copy-Source $source $Target
-    } finally {
-        if ($sources.Count -gt $sourceCount) {
-            $sources[$sources.Count - 1].Dispose()
-            $sources.RemoveAt($sources.Count - 1)
-        }
-        [IO.File]::Delete($source)
-    }
+function Copy-Source([string]$From, [string]$To, [string]$ExpectedHash) {
+    $inputFile = [IO.File]::Open($From, 'Open', 'Read', 'Read')
+    $sources.Add($inputFile)
+    Copy-InstallStream $inputFile $To $ExpectedHash
+}
+
+function Copy-GeneratedSource([string]$Content, [string]$Target, [switch]$Bom) {
+    $encoding = [Text.UTF8Encoding]::new([bool]$Bom)
+    $bytes = [byte[]]($encoding.GetPreamble() + $encoding.GetBytes($Content))
+    $stream = [IO.MemoryStream]::new($bytes)
+    try { Copy-InstallStream $stream $Target }
+    finally { $stream.Dispose() }
 }
 
 function Write-InstallReport {
-    $json = $result | ConvertTo-Json -Depth 5
+    $json = $result | ConvertTo-Json -Depth 12
     if ($ReportPath) { $json | Set-Content -LiteralPath $ReportPath -Encoding UTF8 }
     if ($HumanOutput) { Write-Host "ExamLab installation report saved to $ReportPath" }
     else { Write-Output $json }
@@ -243,12 +251,21 @@ try {
     }
     $code = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'ExamLab'
     $state = Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'ExamLab'
-    if (-not $DeferPolling) {
+    if ($DeferPolling) {
+        $worker = Open-ExamLabInstallWorkerLock
+        $journal = Read-ExamLabInstallChanges
+        if (-not $journal -or $journal.Committed -or -not $InstallAttemptId -or $journal.Id -cne $InstallAttemptId) {
+            throw 'DeferPolling requires the current parent installation attempt.'
+        }
+        $ownsAttempt = $true
+    } else {
         $maintenance = Open-ExamLabMaintenanceLock
-        $pollWasEnabled = Suspend-ExamLabPolling
+        $result.Recovery = @(Invoke-ExamLabInstallRecovery)
     }
     Assert-ExamLabInactive
     $ownership = Read-ExamLabOwnership
+    $result.TaskChecks = @(Get-ExamLabTaskCheck)
+    foreach ($check in $result.TaskChecks) { Assert-ExamLabTaskCheck $check -RequireOwnership }
     # Старый активный цикл отказывается до создания каталогов/lock и изменения задач.
     Assert-NoLegacyState $state
     $powershell = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'PowerShell\7\pwsh.exe'
@@ -302,13 +319,22 @@ try {
     if (-not $UsePublishedInstallers -and (Get-FileHash -InputStream $lgpoLock -Algorithm SHA256).Hash -ne $lgpoSha256) { throw 'Не совпадает SHA256 LGPO3.0 из проверенного SCT' }
     $signature = Get-AuthenticodeSignature -LiteralPath $LGPOPath
     if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') { throw 'LGPO.exe должен иметь действительную подпись Microsoft' }
+    if (-not $DeferPolling) {
+        Start-ExamLabInstallChanges
+        $ownsAttempt = $true
+        $pollWasEnabled = Suspend-ExamLabPolling
+    }
+    Register-ExamLabResource $ownership $state (Test-Path -LiteralPath $state)
     Assert-SafeDirectory $state
-    $lock = [IO.File]::Open((Join-Path $state 'operation.lock'),'OpenOrCreate','ReadWrite','None')
+    $operationPath = Join-Path $state 'operation.lock'
+    if (Test-Path -LiteralPath $operationPath) { Assert-ExamLabProtectedPath $operationPath }
+    $lock = [IO.File]::Open($operationPath,'OpenOrCreate','ReadWrite','None')
     Assert-NoLegacyState $state
     Assert-ExamLabInactive
     Assert-ConfigurationRevision $state $configurationHash
     $registrationFile = Join-Path $state 'controller-registration.json'
     if (Test-Path -LiteralPath $registrationFile) {
+        Assert-ExamLabProtectedPath $registrationFile
         $installedRegistration = Read-ControllerConfiguration $registrationFile
         if ($registration -and ($registration.url -cne $installedRegistration.url -or $registration.deviceId -cne $installedRegistration.deviceId -or
             $registration.token -cne $installedRegistration.token)) {
@@ -332,24 +358,23 @@ try {
         }
     }
 
-    $scheduler = New-Object -ComObject Schedule.Service
-    $scheduler.Connect()
-    $taskFolder = $scheduler.GetFolder('\')
-    $existingTasks = @{}
-    foreach ($name in $examLabTaskNames) {
-        $pendingProtection = Test-ExamLabTaskNeedsProtection $ownership $name
-        $task = Get-ExamLabTask $name -AllowPendingProtection:$pendingProtection
-        if ($task) {
-            if ($taskFolder.GetTask($name).GetInstances(0).Count -gt 0) { throw "Дождитесь завершения $name, затем повторите установку." }
-            $existingTasks[$name] = $task
+    $result.TaskChecks = @(Get-ExamLabTaskCheck)
+    foreach ($check in $result.TaskChecks) {
+        Assert-ExamLabTaskCheck $check -RequireOwnership
+        if ($check.Exists -and $check.State -in @(2, 4)) {
+            throw "Дождитесь завершения $($check.Name), затем повторите установку."
         }
     }
-    $deliveryPending = $true
-    Assert-SafeDirectory $code -Readable
+    Register-ExamLabResource $ownership $code (Test-Path -LiteralPath $code)
+    foreach ($path in @((Join-Path $state 'pc.json'), $registrationFile, $probeFile)) {
+        Register-ExamLabResource $ownership $path (Test-Path -LiteralPath $path)
+    }
+    Assert-SafeDirectory $code -Readable -TrackCreation
     $files = @()
+    foreach ($name in 'windows-fileio-light.ps1', 'Export-ExamLabFileTrace.ps1', 'ExamLab.FileTrace.ps1') {
+        $files += Copy-Source (Join-Path $PSScriptRoot ('..\windows\trace\' + $name)) (Join-Path $code $name)
+    }
     foreach ($name in $codeFiles) { $files += Copy-Source (Join-Path $SourceDirectory $name) (Join-Path $code $name) }
-    $files += Copy-Source (Join-Path $PSScriptRoot '..\tests\windows-fileio-light.ps1') (Join-Path $code 'windows-fileio-light.ps1')
-    $files += Copy-Source (Join-Path $PSScriptRoot '..\tests\Export-ExamLabFileTrace.ps1') (Join-Path $code 'Export-ExamLabFileTrace.ps1')
     $files += Copy-GeneratedSource $fileTraceExam (Join-Path $code 'file-trace-exam.txt')
     $fileTraceLauncher = @'
 @echo off
@@ -363,8 +388,8 @@ if errorlevel 1 pause
     $files += Copy-Source $LGPOPath (Join-Path $code 'LGPO.exe') $lgpoSha256
     $files += Copy-Source $ConfigurationPath (Join-Path $state 'pc.json') $configurationHash
     $pfeTarget=Join-Path $code 'PolicyFileEditor\3.0.1'
-    Assert-SafeDirectory (Join-Path $code 'PolicyFileEditor') -Readable
-    Assert-SafeDirectory $pfeTarget -Readable
+    Assert-SafeDirectory (Join-Path $code 'PolicyFileEditor') -Readable -TrackCreation
+    Assert-SafeDirectory $pfeTarget -Readable -TrackCreation
     foreach ($name in $pfeFiles.Keys) {
         $target=Join-Path $pfeTarget $name
         # Все уровни — фиксированные пути готового dependency package.
@@ -372,20 +397,29 @@ if errorlevel 1 pause
         $current=$pfeTarget
         foreach ($segment in @($relative -split '[\\/]' | Where-Object {$_})) {
             $current=Join-Path $current $segment
-            Assert-SafeDirectory $current -Readable
+            Assert-SafeDirectory $current -Readable -TrackCreation
         }
         $expectedHash = if (-not $UsePublishedInstallers) { $pfeFiles[$name] }
         $files += Copy-Source (Join-Path $PolicyFileEditorPath $name) $target $expectedHash
     }
     $result.Files=$files
-    if ($roots.Count) { $result.TrustedRoots = @(Install-PinnedRoots $roots) }
-    if ($registration -and -not (Test-Path -LiteralPath $registrationFile)) { Write-ControllerJson $registrationFile $registration }
+    if ($roots.Count) { $result.TrustedRoots = @(Set-ExamLabRootTrust $ownership $roots -PassThru) }
+    if ($registration -and -not (Test-Path -LiteralPath $registrationFile)) {
+        Write-ExamLabMaintenanceJson $registrationFile $registration -InstallChange
+    }
     if ($EnableLabControllerPolicyProbe) {
-        Write-ControllerJson $probeFile $true
+        if (Test-Path -LiteralPath $probeFile) {
+            if ((Read-ExamLabProtectedJson $probeFile) -cne $true) { throw 'Существующий маркер стендовой пробы отличается.' }
+        } else { Write-ExamLabMaintenanceJson $probeFile $true -InstallChange }
         $result.LabControllerPolicyProbe=$true
-    } elseif (Test-Path -LiteralPath $probeFile) { Remove-Item -LiteralPath $probeFile }
-    $tasks = @()
-    $principal = New-ScheduledTaskPrincipal -UserId 'S-1-5-18' -LogonType ServiceAccount -RunLevel Highest
+    } elseif (Test-Path -LiteralPath $probeFile) {
+        $proof = $ownership.Trees.PSObject.Properties[$probeFile]
+        if (-not (Test-ExamLabOwnedResource $ownership $probeFile) -or -not $proof -or
+            (Get-ExamLabProtectedFileHash $probeFile $false) -cne $proof.Value) {
+            throw 'Владение существующим маркером стендовой пробы не подтверждено.'
+        }
+        Remove-ExamLabInstallFile $probeFile
+    }
     foreach ($action in $actions) {
         $wrapper = Join-Path $code ('task-'+$action+'.ps1')
         $log = Join-Path $state ($action+'.log')
@@ -399,84 +433,70 @@ try {
 } catch { $_ | Out-File -LiteralPath '__LOG__' -Encoding UTF8 -Append; exit 1 }
 '@
         $body = $body.Replace('__ENTRY__',(Join-Path $code 'exam-lab.ps1').Replace("'","''")).Replace('__ACTION__',$action).Replace('__LOG__',$log.Replace("'","''"))
-        $wrapperSource = Join-Path $state ('wrapper-' + [Guid]::NewGuid().ToString('N') + '.tmp')
-        $sourceCount = $sources.Count
-        try {
-            [IO.File]::WriteAllText($wrapperSource, $body, (New-Object Text.UTF8Encoding($true)))
-            $files += Copy-Source $wrapperSource $wrapper
-        } finally {
-            # Copy-Source keeps payload handles open until the package verification ends.
-            if ($sources.Count -gt $sourceCount) {
-                $sources[$sources.Count - 1].Dispose()
-                $sources.RemoveAt($sources.Count - 1)
-            }
-            [IO.File]::Delete($wrapperSource)
-        }
-        $taskAction = New-ScheduledTaskAction -Execute $powershell -Argument ('-NoProfile -ExecutionPolicy Bypass -File "'+$wrapper+'"')
-        $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 10) -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Disable
-        $name = 'ExamLab-Local-'+$action
-        if (-not $existingTasks.ContainsKey($name)) {
-            Register-ScheduledTask -TaskName $name -TaskPath '\' -Action $taskAction -Principal $principal -Settings $settings -Description 'ExamLab: локальный экспериментальный пилот' | Out-Null
-        }
-        if (-not $existingTasks.ContainsKey($name) -or (Test-ExamLabTaskNeedsProtection $ownership $name)) {
-            $taskFolder.GetTask($name).SetSecurityDescriptor($examLabTaskDacl, 0x10)
-        }
-        $tasks += $name
-        $result.Tasks=$tasks
+        $files += Copy-GeneratedSource $body $wrapper -Bom
     }
-    if ($registration) {
-        $entry = Join-Path $code 'exam-lab.ps1'
-        $taskAction = New-ScheduledTaskAction -Execute $powershell -Argument ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "'+$entry+'" -Action poll')
-        $trigger = New-ScheduledTaskTrigger -AtStartup
-        $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew `
-            -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -Disable
-        if (-not $existingTasks.ContainsKey($pollTask)) {
-            Register-ScheduledTask -TaskName $pollTask -TaskPath '\' -Action $taskAction -Trigger $trigger -Principal $principal -Settings $settings -Description 'ExamLab: исходящий опрос контроллера при запуске Windows' | Out-Null
+    $taskNames = @($result.TaskChecks | Where-Object { $_.Name -cne $pollTask -or $registration } | ForEach-Object Name)
+    foreach ($name in $taskNames) {
+        $check = $result.TaskChecks | Where-Object Name -ceq $name
+        if (-not $check.Exists) {
+            $source = Add-ExamLabInstallTask $name
+            Register-ExamLabResource $ownership $name $false
+            $check = Get-ExamLabTaskCheck $name
+            $result.TaskChecks = @($result.TaskChecks | Where-Object Name -cne $name) + @($check)
+            Assert-ExamLabTaskCheck $check
+            if ($check.Source -cne $source -or $check.Enabled) { throw "Не подтверждена новая отключённая задача $name." }
+            Add-Member -InputObject $ownership.TasksVerified -NotePropertyName $name -NotePropertyValue $source -Force
+            Save-ExamLabOwnership $ownership
         }
-        if (-not $existingTasks.ContainsKey($pollTask) -or (Test-ExamLabTaskNeedsProtection $ownership $pollTask)) {
-            $taskFolder.GetTask($pollTask).SetSecurityDescriptor($examLabTaskDacl, 0x10)
-        }
-        $tasks += $pollTask
     }
     Assert-SafeDirectory $code -Readable
     Assert-SafeDirectory $state
-    foreach ($name in $tasks) {
-        Confirm-ExamLabTaskProtection $ownership $name
-        $task = Get-ExamLabTask $name
+    foreach ($name in $taskNames) {
         if ($name -eq $pollTask -and $DeferPolling) { continue }
-        if ($task.State -eq 'Disabled') { Enable-ScheduledTask -InputObject $task | Out-Null }
+        $check = Get-ExamLabTaskCheck $name
+        Assert-ExamLabTaskCheck $check -RequireOwnership
+        if (-not $check.Enabled) {
+            Save-ExamLabTaskEnabledChange $check
+            $task = Get-ExamLabRegisteredTask $name
+            $task.Enabled = $true
+        }
     }
-    $deliveryPending = $false
-    foreach ($backup in $backupFiles.Values) { if ($backup) { [IO.File]::Delete($backup) } }
-    $result.Files=$files; $result.Tasks=$tasks; $result.Installed=$true
+    $verifiedPaths = @($files | Where-Object { $_.Path.StartsWith($code + '\', [StringComparison]::OrdinalIgnoreCase) } | ForEach-Object Path)
+    Save-ExamLabOwnedTree $ownership $code $verifiedPaths
+    foreach ($path in @((Join-Path $state 'pc.json'), $registrationFile, $probeFile)) { Save-ExamLabOwnedFile $ownership $path }
+    $result.TaskChecks = @(Get-ExamLabTaskCheck)
+    $result.Files=$files; $result.Tasks=$taskNames; $result.Installed=$true
     Write-InstallReport
+    if (-not $DeferPolling) {
+        $lock.Dispose(); $lock = $null
+        if ($pollWasEnabled) { Start-ExamLabPolling }
+        Complete-ExamLabInstallChanges
+    }
 } catch {
     $failure = $_
-    if ($deliveryPending) {
-        foreach ($target in $backupFiles.Keys) {
-            try {
-                $backup = $backupFiles[$target]
-                if ($backup) { [IO.File]::Replace($backup, $target, [NullString]::Value) }
-                else { [IO.File]::Delete($target) }
-            } catch { Write-Warning "Не восстановлен файл ${target}. Резервная копия: $($backupFiles[$target])." }
-        }
-        # A previous normal task was never disabled or replaced.
-        if ($existingTasks -and -not $existingTasks.ContainsKey('ExamLab-Local-normal')) {
-            try { Disable-ScheduledTask -TaskName 'ExamLab-Local-normal' -TaskPath '\' -ErrorAction SilentlyContinue | Out-Null } catch { }
-        }
+    $result.Installed = $false
+    $result.Error = $failure.Exception.Message
+    $result.ErrorRecord = [ordered]@{
+        Message = $failure.ToString(); Exception = $failure.Exception.ToString(); Id = $failure.FullyQualifiedErrorId
+        Category = [string]$failure.CategoryInfo; Position = $failure.InvocationInfo.PositionMessage
+        ScriptStackTrace = $failure.ScriptStackTrace
     }
-    $result.Error=$failure.Exception.Message
+    if ($lock) { $lock.Dispose(); $lock = $null }
+    if ($result.TaskChecks.Count) {
+        try { $result.TaskChecks = @(Get-ExamLabTaskCheck) } catch { $result.TaskReadError = $_.Exception.Message }
+    }
+    if ($worker) { $worker.Dispose(); $worker = $null }
+    if ($ownsAttempt) {
+        try { $result.Rollback = @(Undo-ExamLabInstallChanges) }
+        catch { $result.Rollback = @([pscustomobject]@{ Status = 'Conflict'; Error = $_.Exception.Message }) }
+    }
     try { Write-InstallReport }
     finally { Write-Error $failure -ErrorAction Continue }
     exit 1
-}
-finally {
+} finally {
     if ($lock) { $lock.Dispose() }
-    if ($maintenance) {
-        try {
-            if ($pollWasEnabled) { Start-ExamLabPolling }
-        } finally { $maintenance.Dispose() }
-    }
+    if ($worker) { $worker.Dispose() }
+    if ($maintenance) { $maintenance.Dispose() }
     foreach ($source in $sources) { $source.Dispose() }
     foreach ($root in $roots) { $root.Dispose() }
 }

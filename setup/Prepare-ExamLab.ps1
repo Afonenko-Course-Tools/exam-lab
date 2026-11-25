@@ -1,11 +1,15 @@
-﻿#requires -Version 7.6
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
 Проверяет и подготавливает инструменты на существующей Windows без экзаменационных политик.
 .DESCRIPTION
-Оба действия требуют повышенного административного token. Prepare устанавливает только отсутствующие инструменты.
-Конфликт версий требует выбора подходящей существующей установки через явный путь.
-Коды: 0 готово; 2 обнаружен блокирующий конфликт; 1 ошибка; 3010 нужен перезапуск.
+Check строит план по метаданным и доступен в Windows PowerShell 5.1 без повышения.
+Prepare (Apply) и Verify требуют PowerShell 7.6 x64 и повышенного token.
+Коды: 0 план выполним или инструменты готовы; 2 конфликт; 1 ошибка; 3010 нужен перезапуск.
+.PARAMETER ExpectedPlanPath
+Отчёт Check. Prepare сверяет действия, версии и пути перед изменениями.
+.PARAMETER ReplaceIdeaPath
+Явное согласие на удаление одной зарегистрированной машинной установки IDEA по её полному пути.
 .PARAMETER UsePublishedInstallers
 Внутренний режим локального пилота. Требует защищённый CacheDirectory с готовой HTTPS-поставкой.
 .PARAMETER HumanOutput
@@ -13,7 +17,7 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('Check','Prepare')][string]$Action = 'Check',
+    [ValidateSet('Check','Prepare','Apply','Verify')][string]$Action = 'Check',
     [string]$CacheDirectory = "$env:ProgramData\ExamLab\Installers",
     [string]$ReportPath,
     [string]$IdeaPath,
@@ -24,6 +28,8 @@ param(
     [switch]$DisableBundledGenerativePlugins,
     [string]$GradlePath,
     [switch]$UsePublishedInstallers,
+    [string]$ExpectedPlanPath,
+    [string]$ReplaceIdeaPath,
     [switch]$HumanOutput
 )
 $ErrorActionPreference = 'Stop'
@@ -34,19 +40,28 @@ $script:Changes = [Collections.Generic.List[object]]::new()
 $script:Failures = [Collections.Generic.List[string]]::new()
 $script:InstallerLocks = [Collections.Generic.List[object]]::new()
 $script:WorkingDirectory = $null
+# PayloadBytes are the pinned files. InstalledBytes and ScratchBytes are rounded disk-planning estimates.
 $pins = @{
     IDEA = @{ File='ideaIC-2025.2.6.4.exe'; Version='2025.2.6.4'; Publisher='JetBrains';
         Uri='https://download.jetbrains.com/idea/ideaIC-2025.2.6.4.exe';
-        Hash='57301793b57b9f2b87a5c79fd06b619e6bbd881501d793ecd78482b20525ea34' }
+        Hash='57301793b57b9f2b87a5c79fd06b619e6bbd881501d793ecd78482b20525ea34';
+        PayloadBytes=993423664; InstalledBytes=4GB; ScratchBytes=1GB }
     JDK = @{ File='OpenJDK25U-jdk_x64_windows_hotspot_25.0.5_8.msi'; Version='25.0.5'; Publisher='Eclipse';
         Uri='https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.5%2B8/OpenJDK25U-jdk_x64_windows_hotspot_25.0.5_8.msi';
-        Hash='e1d3c94032579dc16af9abb311f4552ba271466b74c8767e8ce39585a4c64d40' }
+        Hash='e1d3c94032579dc16af9abb311f4552ba271466b74c8767e8ce39585a4c64d40';
+        PayloadBytes=116088832; InstalledBytes=512MB; ScratchBytes=384MB }
     Git = @{ File='Git-2.56.1-64-bit.exe'; Version='2.56.1'; Publisher='O=Johannes Schindelin';
         Uri='https://github.com/git-for-windows/git/releases/download/v2.56.1.windows.1/Git-2.56.1-64-bit.exe';
-        Hash='c330c72e10b408cc39994bfefdb63542b0d93d21699325c3e0bd874af8a5a559' }
+        Hash='c330c72e10b408cc39994bfefdb63542b0d93d21699325c3e0bd874af8a5a559';
+        PayloadBytes=66870448; InstalledBytes=512MB; ScratchBytes=128MB }
     Gradle = @{ File='gradle-9.8.2-bin.zip'; Version='9.8.2';
         Uri='https://services.gradle.org/distributions/gradle-9.8.2-bin.zip';
-        Hash='21bd5da2de49b642904077f38c0efdc7778e92b3ed0889392dca61b97e389607' }
+        Hash='21bd5da2de49b642904077f38c0efdc7778e92b3ed0889392dca61b97e389607';
+        PayloadBytes=151620138; InstalledBytes=192MB; ScratchBytes=0 }
+    WinDirStat = @{ File='WinDirStat-2.9.3-x64.msi'; Version='2.9.3'; Publisher='CN=Open Source Developer Bryan Berns';
+        Uri='https://github.com/windirstat/windirstat/releases/download/release/v2.9.3/WinDirStat-x64.msi';
+        Hash='96c4c4beb63c7c5ad6b1a206f96560d7a9a2b6063f3cd175a82f392977a9af5d';
+        PayloadBytes=2486272; InstalledBytes=16MB; ScratchBytes=8MB }
 }
 
 function Invoke-Native([string]$Executable, [string[]]$Arguments, [string]$WorkingDirectory) {
@@ -58,7 +73,7 @@ function Invoke-Native([string]$Executable, [string[]]$Arguments, [string]$Worki
     $info.RedirectStandardOutput = $true
     $info.RedirectStandardError = $true
     $info.CreateNoWindow = $true
-    if ($WorkingDirectory) { $info.WorkingDirectory = $WorkingDirectory }
+    $info.WorkingDirectory = if ($WorkingDirectory) { $WorkingDirectory } else { Split-Path $Executable -Parent }
     if ([IO.Path]::GetFileName($Executable) -eq 'git.exe') {
         foreach ($name in @($info.EnvironmentVariables.Keys | Where-Object { $_ -like 'GIT_*' })) { $info.EnvironmentVariables.Remove($name) }
         $info.EnvironmentVariables['GIT_CONFIG_NOSYSTEM'] = '1'
@@ -85,18 +100,21 @@ function Get-UninstallEntries {
     foreach ($key in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
         'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
         'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*')) {
-        Get-ItemProperty $key -ErrorAction SilentlyContinue | Select-Object DisplayName,DisplayVersion,InstallLocation,DisplayIcon | ForEach-Object {
+        Get-ItemProperty $key -ErrorAction SilentlyContinue |
+            Select-Object DisplayName,DisplayVersion,InstallLocation,DisplayIcon,Publisher,UninstallString,PSPath | ForEach-Object {
             [pscustomobject]@{ Name=[string]$_.DisplayName; Version=[string]$_.DisplayVersion;
-                Location=[string]$_.InstallLocation; DisplayIcon=[string]$_.DisplayIcon }
+                Location=[string]$_.InstallLocation; DisplayIcon=[string]$_.DisplayIcon;
+                Publisher=[string]$_.Publisher; UninstallString=[string]$_.UninstallString; RegistryPath=[string]$_.PSPath;
+                Machine=$key.StartsWith('HKLM:', [StringComparison]::OrdinalIgnoreCase) }
         }
     }
 }
 
 function Test-TrustedExecutable([string]$Path, [switch]$ParentTrusted) {
-    if (-not $script:IsAdmin) { return $true }
     # Elevated inventory не выполняет код из доступных обычному пользователю путей.
     $trusted = @('S-1-5-18','S-1-5-32-544',
-        'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464', $script:CurrentSid)
+        'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
+    if ($script:IsAdministratorAccount) { $trusted += $script:CurrentSid }
     $current = Get-Item -LiteralPath $Path
     $root = [IO.Path]::GetPathRoot($current.FullName)
     if ($root -notmatch '^[A-Za-z]:\\$') { return $false }
@@ -153,6 +171,28 @@ function Get-GradleDestination {
     Join-Path $env:ProgramFiles "gradle-$($pins.Gradle.Version)"
 }
 
+function Get-JdkDestination {
+    Join-Path $env:ProgramFiles 'ExamLab-JDK-25'
+}
+
+function ConvertTo-ToolRoot([string]$Path, [string]$Kind) {
+    $fullPath = [IO.Path]::GetFullPath($Path.Trim().Trim('"'))
+    if ($fullPath -ne [IO.Path]::GetPathRoot($fullPath)) { $fullPath = $fullPath.TrimEnd('\', '/') }
+    if ($Kind -eq 'JDK' -and [IO.Path]::GetFileName($fullPath) -ieq 'bin') {
+        $fullPath = [IO.Path]::GetDirectoryName($fullPath)
+    }
+    $fullPath
+}
+
+function Get-IdeaRegisteredExecutable($Entry) {
+    # Accept only the vendor executable directly registered for a standalone installation.
+    $command = $Entry.UninstallString.Trim()
+    if ($command -match '^"([^"]+\\bin\\uninstall\.exe)"$' -or $command -match '^([^"\r\n]+\\bin\\uninstall\.exe)$') {
+        $path = $Matches[1]
+        if ($path -match '^[A-Za-z]:\\') { [IO.Path]::GetFullPath($path) }
+    }
+}
+
 function Assert-TrustedGradleTree([string]$Path) {
     if (-not (Test-TrustedExecutable $Path)) { throw "Незащищённый каталог Gradle: $Path" }
     $directories = [Collections.Generic.Stack[string]]::new()
@@ -165,39 +205,47 @@ function Assert-TrustedGradleTree([string]$Path) {
     }
 }
 
-function Get-Tool([string]$Kind, [string]$ExplicitPath, [object[]]$Entries) {
+function Get-Tool([string]$Kind, [string]$ExplicitPath, [object[]]$Entries, [switch]$VerifyVersion) {
     if ($UsePublishedInstallers) { Write-Host "Checking $Kind..." }
     $paths = [Collections.Generic.List[string]]::new()
     $registered = @()
     if ($ExplicitPath) {
-        $paths.Add([IO.Path]::GetFullPath($ExplicitPath))
+        $paths.Add($ExplicitPath)
     } else {
         switch ($Kind) {
             IDEA {
                 $registered = @($Entries | Where-Object Name -match 'IntelliJ IDEA')
-                foreach ($entry in $registered) { if ($entry.Location) { $paths.Add($entry.Location.TrimEnd('\')) } }
+                foreach ($entry in $registered) {
+                    if ($entry.Location) { $paths.Add($entry.Location) }
+                    else {
+                        $uninstaller = Get-IdeaRegisteredExecutable $entry
+                        if ($uninstaller) { $paths.Add((Split-Path (Split-Path $uninstaller -Parent) -Parent)) }
+                    }
+                }
                 foreach ($base in @("$env:ProgramFiles\JetBrains", "$env:LOCALAPPDATA\Programs")) {
                     if (Test-Path -LiteralPath $base) {
                         Get-ChildItem -LiteralPath $base -Directory | Where-Object Name -match 'IntelliJ|IDEA' |
                             ForEach-Object { $paths.Add($_.FullName) }
                     }
                 }
-                foreach ($cmd in @(Get-Command idea64.exe -ErrorAction SilentlyContinue)) {
+                foreach ($cmd in @(Get-Command idea64.exe -CommandType Application -All -ErrorAction SilentlyContinue)) {
                     $paths.Add((Split-Path (Split-Path $cmd.Source -Parent) -Parent))
                 }
             }
             JDK {
                 $registered = @($Entries | Where-Object Name -match 'JDK|Java.*Development|Temurin.*Hotspot')
-                foreach ($entry in $registered) { if ($entry.Location) { $paths.Add($entry.Location.TrimEnd('\')) } }
-                foreach ($base in @("$env:ProgramFiles\Eclipse Adoptium", "$env:ProgramFiles\Java", "$env:ProgramFiles\Microsoft")) {
+                $paths.Add((Get-JdkDestination))
+                foreach ($entry in $registered) { if ($entry.Location) { $paths.Add($entry.Location) } }
+                foreach ($base in @($env:ProgramFiles, "$env:ProgramFiles\Eclipse Adoptium", "$env:ProgramFiles\Java", "$env:ProgramFiles\Microsoft")) {
                     if (Test-Path -LiteralPath $base) {
-                        Get-ChildItem -LiteralPath $base -Directory | Where-Object Name -match 'jdk' |
+                        Get-ChildItem -LiteralPath $base -Directory | Where-Object Name -match '^jdk(?:[-_\d]|$)' |
                             ForEach-Object { $paths.Add($_.FullName) }
                     }
                 }
                 if ($env:JAVA_HOME) { $paths.Add($env:JAVA_HOME) }
-                foreach ($cmd in @(Get-Command javac.exe -ErrorAction SilentlyContinue)) {
-                    $paths.Add((Split-Path (Split-Path $cmd.Source -Parent) -Parent))
+                foreach ($cmd in @(Get-Command java.exe,javac.exe -CommandType Application -All -ErrorAction SilentlyContinue)) {
+                    $directory = Split-Path $cmd.Source -Parent
+                    if ((Split-Path $directory -Leaf) -ieq 'bin') { $paths.Add($directory) }
                 }
                 foreach ($key in @('HKLM:\SOFTWARE\JavaSoft\JDK\*','HKLM:\SOFTWARE\JavaSoft\Java Development Kit\*')) {
                     Get-ItemProperty $key -ErrorAction SilentlyContinue | Select-Object JavaHome | ForEach-Object {
@@ -209,7 +257,7 @@ function Get-Tool([string]$Kind, [string]$ExplicitPath, [object[]]$Entries) {
                 $registered = @($Entries | Where-Object Name -match '^Git( version)?( |$)')
                 foreach ($entry in $registered) { if ($entry.Location) { $paths.Add($entry.Location.TrimEnd('\')) } }
                 $paths.Add("$env:ProgramFiles\Git")
-                foreach ($cmd in @(Get-Command git.exe -ErrorAction SilentlyContinue)) {
+                foreach ($cmd in @(Get-Command git.exe -CommandType Application -All -ErrorAction SilentlyContinue)) {
                     $paths.Add((Split-Path (Split-Path $cmd.Source -Parent) -Parent))
                 }
                 $key = Get-ItemProperty 'HKLM:\SOFTWARE\GitForWindows' -ErrorAction SilentlyContinue | Select-Object InstallPath
@@ -228,10 +276,20 @@ function Get-Tool([string]$Kind, [string]$ExplicitPath, [object[]]$Entries) {
                     $paths.Add((Split-Path (Split-Path $cmd.Source -Parent) -Parent))
                 }
             }
+            WinDirStat {
+                $registered = @($Entries | Where-Object { $_.Machine -and $_.Name -match '^WinDirStat(?:\s|$)' })
+                foreach ($entry in $registered) { if ($entry.Location) { $paths.Add($entry.Location) } }
+                $paths.Add("$env:ProgramFiles\WinDirStat")
+            }
         }
     }
     $candidates = [Collections.Generic.List[object]]::new()
-    foreach ($path in @($paths | Sort-Object -Unique)) {
+    $roots = @($paths | ForEach-Object {
+        $candidatePath = $_
+        try { ConvertTo-ToolRoot $candidatePath $Kind }
+        catch { $candidates.Add([pscustomobject]@{ Path=$candidatePath; Version=''; Compatible=$false; Probe=''; Error=$_.Exception.Message }) }
+    } | Sort-Object -Unique)
+    foreach ($path in $roots) {
         $version = ''; $compatible = $false; $probe = ''; $errorText = ''
         try {
             if (-not (Test-Path -LiteralPath $path -PathType Container)) { continue }
@@ -239,37 +297,62 @@ function Get-Tool([string]$Kind, [string]$ExplicitPath, [object[]]$Entries) {
                 IDEA {
                     $productFile = Join-Path $path 'product-info.json'
                     if (-not (Test-Path -LiteralPath $productFile)) { continue }
-                    $product = Get-Content -LiteralPath $productFile -Raw | ConvertFrom-Json -DateKind String
+                    $product = Get-Content -LiteralPath $productFile -Raw -Encoding UTF8 | ConvertFrom-Json
                     $version = [string]$product.version
+                    $launcher = Join-Path $path 'bin\idea64.exe'
                     $compatible = $product.productCode -eq 'IC' -and $version -match '^2025\.2(?:\.|$)' -and
-                        (Test-Path -LiteralPath (Join-Path $path 'bin\idea64.exe'))
+                        (Test-Path -LiteralPath $launcher -PathType Leaf) -and (Test-TrustedExecutable $productFile) -and
+                        (Test-TrustedExecutable $launcher)
                     $probe = "product-info: $($product.productCode) $version build $($product.buildNumber)"
                 }
                 JDK {
                     $java = Join-Path $path 'bin\java.exe'; $javac = Join-Path $path 'bin\javac.exe'
-                    if (-not (Test-Path -LiteralPath $java)) { continue }
-                    if (-not (Test-TrustedExecutable $java) -or -not (Test-Path -LiteralPath $javac) -or -not (Test-TrustedExecutable $javac)) {
-                        throw 'Elevated CLI blocked: путь JDK не защищён от записи обычным пользователем; выберите защищённую установку JDK'
+                    if (-not (Test-Path -LiteralPath $java -PathType Leaf)) { continue }
+                    $release = Join-Path $path 'release'
+                    if (Test-Path -LiteralPath $release -PathType Leaf) {
+                        $details = Get-Content -LiteralPath $release -Raw
+                        $version = [regex]::Match($details, '(?m)^JAVA_VERSION="(\d+(?:\.\d+){0,3})(?:[+"-])').Groups[1].Value
                     }
-                    $run = Invoke-Native $java @('--version')
-                    $compile = $null
-                    if (Test-Path -LiteralPath $javac) { $compile = Invoke-Native $javac @('--version') }
-                    $match = [regex]::Match($run.Output, '(?:openjdk|java)\s+(\d+(?:\.\d+){0,3})')
-                    $version = $match.Groups[1].Value
-                    $compatible = $run.ExitCode -eq 0 -and $null -ne $compile -and $compile.ExitCode -eq 0 -and
-                        $version -match '^25(?:\.|$)' -and $compile.Output -match '^javac 25(?:\.|\s|$)'
-                    $probe = $run.Output + $(if ($compile) { "`n" + $compile.Output } else { '`njavac missing' })
+                    $probe = "release: JAVA_VERSION=$version"
+                    if ($version -match '^25(?:\.|$)' -and (Test-Path -LiteralPath $javac -PathType Leaf)) {
+                        if (-not (Test-TrustedExecutable $release) -or -not (Test-TrustedExecutable $java) -or -not (Test-TrustedExecutable $javac)) {
+                            throw 'Путь JDK не защищён от записи обычным пользователем.'
+                        }
+                        $compatible = $true
+                        if ($VerifyVersion) {
+                            $run = Invoke-Native $java @('--version')
+                            $compile = Invoke-Native $javac @('--version')
+                            $version = [regex]::Match($run.Output, '(?:openjdk|java)\s+(\d+(?:\.\d+){0,3})').Groups[1].Value
+                            $compatible = $run.ExitCode -eq 0 -and $compile.ExitCode -eq 0 -and
+                                $version -match '^25(?:\.|$)' -and $compile.Output -match '^javac 25(?:\.|\s|$)'
+                            $probe = "$($run.Output)`n$($compile.Output)"
+                        }
+                    }
                 }
                 Git {
                     $exe = Join-Path $path 'cmd\git.exe'
                     if (-not (Test-Path -LiteralPath $exe)) { $exe = Join-Path $path 'bin\git.exe' }
                     if (-not (Test-Path -LiteralPath $exe)) { continue }
-                    if (-not (Test-TrustedExecutable $exe)) { throw 'Elevated CLI blocked: путь Git не защищён от записи обычным пользователем; выберите защищённую установку Git' }
-                    $run = Invoke-Native $exe @('--version')
-                    $match = [regex]::Match($run.Output, 'git version (\d+\.\d+\.\d+)')
-                    $version = $match.Groups[1].Value
-                    $compatible = $run.ExitCode -eq 0 -and $match.Success -and [version]$version -ge [version]'2.56.1'
-                    $probe = $run.Output
+                    if (-not (Test-TrustedExecutable $exe)) { throw 'Путь Git не защищён от записи обычным пользователем.' }
+                    $gitBinary = Join-Path $path 'mingw64\bin\git.exe'
+                    if (-not (Test-Path -LiteralPath $gitBinary -PathType Leaf)) { $gitBinary = $exe }
+                    if (-not (Test-TrustedExecutable $gitBinary)) { throw 'Двоичный файл Git не защищён от записи обычным пользователем.' }
+                    $metadata = (Get-Item -LiteralPath $gitBinary).VersionInfo
+                    $probe = "PE: ProductVersion=$($metadata.ProductVersion); FileVersion=$($metadata.FileVersion)"
+                    $match = [regex]::Match("$($metadata.ProductVersion) $($metadata.FileVersion)", '\d+\.\d+\.\d+')
+                    $version = $match.Value
+                    if (-not $match.Success) {
+                        $entry = $registered | Where-Object { $_.Machine -and $_.Location -and
+                            (ConvertTo-ToolRoot $_.Location Git) -ieq $path } | Select-Object -First 1
+                        if ($entry) { $version = [regex]::Match($entry.Version, '\d+\.\d+\.\d+').Value }
+                    }
+                    $compatible = $version -and [version]$version -ge [version]$pins.Git.Version
+                    if ($VerifyVersion) {
+                        $run = Invoke-Native $exe @('--version')
+                        $version = [regex]::Match($run.Output, 'git version (\d+\.\d+\.\d+)').Groups[1].Value
+                        $compatible = $run.ExitCode -eq 0 -and $version -and [version]$version -ge [version]$pins.Git.Version
+                        $probe = $run.Output
+                    }
                 }
                 Gradle {
                     $batch = Join-Path $path 'bin\gradle.bat'
@@ -287,12 +370,26 @@ function Get-Tool([string]$Kind, [string]$ExplicitPath, [object[]]$Entries) {
                         (Test-Path -LiteralPath (Join-Path $lib 'plugins') -PathType Container)
                     $probe = "Структура и ACL дистрибутива Gradle $version"
                 }
+                WinDirStat {
+                    $exe = Join-Path $path 'WinDirStat.exe'
+                    if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { continue }
+                    if (-not (Test-TrustedExecutable $exe)) { throw 'Путь WinDirStat не защищён от записи обычным пользователем.' }
+                    $metadata = (Get-Item -LiteralPath $exe).VersionInfo
+                    $version = [regex]::Match("$($metadata.ProductVersion) $($metadata.FileVersion)", '\d+\.\d+\.\d+').Value
+                    $compatible = $version -and [version]$version -ge [version]$pins.WinDirStat.Version
+                    $probe = "PE: ProductVersion=$($metadata.ProductVersion); FileVersion=$($metadata.FileVersion)"
+                }
             }
         } catch { $errorText = $_.Exception.Message }
         $candidates.Add([pscustomobject]@{ Path=$path; Version=$version; Compatible=[bool]$compatible; Probe=$probe; Error=$errorText })
     }
     $compatibleCandidates = $candidates | Where-Object Compatible
-    if ($Kind -eq 'Gradle') {
+    if ($Kind -eq 'IDEA') {
+        $compatibleCandidates = $compatibleCandidates | Sort-Object -Property @{Expression={[version]$_.Version};Descending=$true},Path
+    } elseif ($Kind -eq 'JDK') {
+        $own = Get-JdkDestination
+        $compatibleCandidates = $compatibleCandidates | Sort-Object -Property @{Expression={$_.Path -ieq $own};Descending=$true},Path
+    } elseif ($Kind -eq 'Gradle') {
         $compatibleCandidates = $compatibleCandidates | Sort-Object -Property @{Expression={[version]$_.Version};Descending=$true},Path
     }
     $selected = @($compatibleCandidates | Select-Object -First 1)
@@ -303,10 +400,181 @@ function Get-Tool([string]$Kind, [string]$ExplicitPath, [object[]]$Entries) {
         Candidates=@($candidates.ToArray()); Registered=@($registered | Select-Object Name,Version,Location); ExplicitPath=[bool]$ExplicitPath }
 }
 
-function Get-Inventory {
+function Get-Inventory([switch]$VerifyVersions) {
     $entries = @(Get-UninstallEntries)
-    [pscustomobject]@{ IDEA=(Get-Tool IDEA $IdeaPath $entries); JDK=(Get-Tool JDK $JdkPath $entries);
-        Git=(Get-Tool Git $GitPath $entries); Gradle=(Get-Tool Gradle $GradlePath $entries) }
+    [pscustomobject]@{ IDEA=(Get-Tool IDEA $IdeaPath $entries); JDK=(Get-Tool JDK $JdkPath $entries -VerifyVersion:$VerifyVersions);
+        Git=(Get-Tool Git $GitPath $entries -VerifyVersion:$VerifyVersions); Gradle=(Get-Tool Gradle $GradlePath $entries);
+        WinDirStat=(Get-Tool WinDirStat '' $entries) }
+}
+
+function Get-IdeaReplacement($Inventory) {
+    if ($ReplaceIdeaPath -notmatch '^[A-Za-z]:[\\/]') { throw 'Conflict: -ReplaceIdeaPath требует полный локальный путь.' }
+    $target = ConvertTo-ToolRoot $ReplaceIdeaPath IDEA
+    $candidate = @($Inventory.IDEA.Candidates | Where-Object Path -ieq $target)
+    if ($candidate.Count -and $candidate[0].Compatible -and $candidate[0].Version -eq $pins.IDEA.Version) { return }
+    $launcher = Join-Path $target 'bin\idea64.exe'
+    $uninstaller = Join-Path $target 'bin\uninstall.exe'
+    $matches = @(Get-UninstallEntries | Where-Object {
+        $_.Name -match '^IntelliJ IDEA' -and (Get-IdeaRegisteredExecutable $_) -ieq $uninstaller
+    })
+    if (-not $matches.Count -and -not (Test-Path -LiteralPath $launcher) -and -not (Test-Path -LiteralPath $uninstaller)) { return }
+    if ($candidate.Count -ne 1 -or -not $candidate[0].Version -or
+        -not (Test-Path -LiteralPath $launcher -PathType Leaf) -or -not (Test-TrustedExecutable $launcher) -or
+        -not (Test-TrustedExecutable (Join-Path $target 'product-info.json'))) {
+        throw "Conflict: не подтверждён установленный экземпляр IntelliJ IDEA в $target."
+    }
+    if ($matches.Count -ne 1 -or -not $matches[0].Machine -or $matches[0].Publisher -notmatch 'JetBrains' -or
+        ($matches[0].Location -and (ConvertTo-ToolRoot $matches[0].Location IDEA) -ine $target) -or
+        -not (Test-Path -LiteralPath $uninstaller -PathType Leaf) -or -not (Test-TrustedExecutable $uninstaller)) {
+        throw "Conflict: для $target нужна единственная машинная запись со штатным защищённым bin\uninstall.exe."
+    }
+    $environment = Get-EnvironmentObservation
+    $registeredPaths = @($environment.MachinePath -split ';') + @($environment.UserPath -split ';')
+    foreach ($entryPath in @($registeredPaths | Where-Object { $_ })) {
+        $expanded = [Environment]::ExpandEnvironmentVariables($entryPath.Trim().Trim('"')).TrimEnd('\', '/')
+        if ($expanded -ieq $target -or $expanded.StartsWith("$target\", [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Conflict: $target используется в PATH. Замену с сохранением прежнего PATH должен выполнить администратор."
+        }
+    }
+    foreach ($process in @(Get-Process -Name idea64,idea -ErrorAction SilentlyContinue)) {
+        if (-not $process.Path -or $process.Path.StartsWith("$target\", [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Conflict: закройте экземпляр IDEA в $target перед заменой."
+        }
+    }
+    [pscustomobject]@{ Path=$target; Version=$candidate[0].Version; RegistryPath=$matches[0].RegistryPath;
+        Build=$candidate[0].Probe; RegisteredVersion=$matches[0].Version;
+        Uninstaller=$uninstaller; SHA256=(Get-FileHash -LiteralPath $uninstaller -Algorithm SHA256).Hash }
+}
+
+function Get-SoftwarePlan($Inventory) {
+    $destinations = @{ IDEA="$env:ProgramFiles\JetBrains\IntelliJ IDEA Community Edition 2025.2.6.4";
+        JDK=(Get-JdkDestination); Git="$env:ProgramFiles\Git"; Gradle=(Get-GradleDestination); WinDirStat="$env:ProgramFiles\WinDirStat" }
+    $actions = [Collections.Generic.List[object]]::new()
+    $packages = [Collections.Generic.List[object]]::new()
+    $componentSizes = [Collections.Generic.List[object]]::new()
+    $blockers = [Collections.Generic.List[string]]::new()
+    $replacement = $null
+    if ($ReplaceIdeaPath) {
+        try {
+            if ($IdeaPath) { throw 'Conflict: -IdeaPath и -ReplaceIdeaPath задают несовместимые действия.' }
+            $replacement = Get-IdeaReplacement $Inventory
+        } catch { $blockers.Add($_.Exception.Message) }
+    }
+    foreach ($name in $installOrder) {
+        $pin = $pins[$name]
+        $tool = $Inventory.$name
+        $selected = $tool.Selected
+        $remove = $null
+        $explicitIdeaReplacement = $name -eq 'IDEA' -and $ReplaceIdeaPath -and -not $blockers.Count
+        if ($explicitIdeaReplacement) {
+            $remove = $replacement
+            $selected = $tool.Candidates | Where-Object { $_.Compatible -and $_.Version -eq $pins.IDEA.Version -and
+                (-not $remove -or $_.Path -ine $remove.Path) } | Select-Object -First 1
+        }
+        $operation = 'Keep'
+        if ($remove) { $operation = 'Replace' }
+        $destination = $null
+        $payloadBytes = 0L
+        $additionalInstalledBytes = 0L
+        $stagingBytes = 0L
+        if (-not $selected) {
+            $alongside = -not $tool.ExplicitPath -and ($name -eq 'JDK' -or ($InstallAlongside -and $name -in @('IDEA','Gradle')))
+            $existingTemurin25 = $name -eq 'JDK' -and @($tool.Registered | Where-Object {
+                $_.Name -match 'Temurin' -and ($_.Version -match '^25(?:\.|$)' -or $_.Name -match '\b25(?:\.|\s|$)')
+            }).Count -gt 0
+            $destination = $destinations[$name]
+            $reason = $null
+            if ($existingTemurin25) {
+                $reason = 'Непригодный Temurin 25 уже зарегистрирован. Второй MSI этой версии может изменить прежний JDK.'
+            } elseif ($name -eq 'WinDirStat' -and $tool.State -eq 'Conflict') {
+                $reason = 'Обнаружена машинная установка WinDirStat, пригодность которой не подтверждена. Проверьте её перед установкой.'
+            } elseif ($tool.State -eq 'Conflict' -and -not ($alongside -or $explicitIdeaReplacement)) {
+                $reason = "Выберите подходящий каталог через -${name}Path. IDEA и Gradle можно установить рядом с -InstallAlongside."
+            } elseif (Test-Path -LiteralPath $destination) {
+                $reason = "Занят каталог назначения $destination."
+            }
+            if ($reason) {
+                $operation = 'Block'
+                $blockers.Add("${name}: $reason")
+            } else {
+                if (-not $remove) { $operation = 'Install' }
+                $payloadBytes = [long]$pin.PayloadBytes
+                $additionalInstalledBytes = [long]$pin.InstalledBytes
+                $stagingBytes = $payloadBytes + [long]$pin.ScratchBytes
+                $packages.Add([pscustomobject]@{ Name=$name; File=$pin.File; SHA256=$pin.Hash; Uri=$pin.Uri;
+                    Destination=$destination; PayloadBytes=$payloadBytes })
+            }
+        }
+        # Windows PowerShell 5.1 can serialize an empty pipeline as {} instead of null.
+        $existingPath = $null
+        $existingVersion = $null
+        if ($selected) {
+            $existingPath = $selected.Path
+            $existingVersion = $selected.Version
+        }
+        $actions.Add([pscustomobject]@{ Name=$name; Operation=$operation;
+            ExistingPath=$existingPath; ExistingVersion=$existingVersion;
+            Destination=$destination; Replacement=$remove })
+        $footprint = [long]$pin.InstalledBytes
+        $basis = 'PinnedReleaseEstimate'
+        if ($operation -eq 'Block') {
+            $footprint = $null
+            $basis = 'Unavailable'
+        } elseif ($selected -and $existingVersion -ne $pin.Version) {
+            $basis = 'CompatibleVersionEstimate'
+        }
+        $componentSizes.Add([pscustomobject]@{ Name=$name; Operation=$operation;
+            Destination=$(if ($destination) { $destination } else { $existingPath });
+            PayloadBytes=$payloadBytes; AdditionalInstalledBytes=$additionalInstalledBytes;
+            EstimatedInstalledFootprintBytes=$footprint; InstalledSizeBasis=$basis;
+            StagingBytes=$stagingBytes; StagingDestination=$env:ProgramFiles })
+    }
+    $size = [pscustomobject]@{
+        KnownPayloadBytes=[long](($componentSizes | Measure-Object -Property PayloadBytes -Sum).Sum);
+        EstimatedAdditionalInstalledBytes=[long](($componentSizes | Measure-Object -Property AdditionalInstalledBytes -Sum).Sum);
+        EstimatedInstalledFootprintBytes=[long](($componentSizes | Measure-Object -Property EstimatedInstalledFootprintBytes -Sum).Sum);
+        EstimatedStagingBytes=[long](($componentSizes | Measure-Object -Property StagingBytes -Sum).Sum);
+        Complete=($blockers.Count -eq 0); Components=$componentSizes.ToArray()
+    }
+    [pscustomobject]@{ Actions=$actions.ToArray(); Packages=$packages.ToArray(); Blockers=$blockers.ToArray(); Size=$size }
+}
+
+function Get-SoftwareDiskSpace($Size) {
+    $volume = [IO.Path]::GetPathRoot([Environment]::GetFolderPath('ProgramFiles'))
+    $estimatedPeak = $Size.EstimatedAdditionalInstalledBytes + $Size.EstimatedStagingBytes
+    $observation = [ordered]@{ Volume=$volume; AvailableBytes=$null; RequiredPackageStagingBytes=$Size.KnownPayloadBytes;
+        EstimatedPeakAdditionalBytes=$estimatedPeak; Status='Unknown'; Detail=$null }
+    try { $observation.AvailableBytes = [IO.DriveInfo]::new($volume).AvailableFreeSpace }
+    catch { $observation.Detail = $_.Exception.Message; return [pscustomobject]$observation }
+    $observation.Status = if ($observation.AvailableBytes -lt $Size.KnownPayloadBytes) { 'InsufficientForStagedPackages' }
+        elseif ($observation.AvailableBytes -lt $estimatedPeak) { 'BelowEstimatedPeak' }
+        else { 'SufficientForEstimate' }
+    [pscustomobject]$observation
+}
+
+function Confirm-SoftwareDiskSpace($Space, [switch]$Apply) {
+    if ($Space.Status -eq 'InsufficientForStagedPackages') {
+        $message = "На $($Space.Volume) свободно $($Space.AvailableBytes) байт, для временных копий пакетов нужно $($Space.RequiredPackageStagingBytes) байт."
+        if ($Apply) { throw "Conflict: $message" }
+        Write-Warning $message
+    } elseif ($Space.Status -eq 'BelowEstimatedPeak') {
+        Write-Warning "На $($Space.Volume) свободно $($Space.AvailableBytes) байт при расчётном пике установки $($Space.EstimatedPeakAdditionalBytes) байт."
+    }
+}
+
+function Remove-ReplacedIdea($Approved) {
+    $inventory = Get-Inventory
+    $current = Get-IdeaReplacement $inventory
+    if (-not $current -or ($current | ConvertTo-Json -Compress) -cne ($Approved | ConvertTo-Json -Compress)) {
+        throw 'Conflict: экземпляр IDEA или штатный деинсталлятор изменился после проверки.'
+    }
+    Write-Host "Удаление IDEA $($Approved.Version) по согласованному пути $($Approved.Path)."
+    $process = Start-Process -FilePath $Approved.Uninstaller -ArgumentList '/S' -WorkingDirectory (Split-Path $Approved.Uninstaller -Parent) -Wait -PassThru
+    $script:Changes.Add([pscustomobject]@{ Tool='IDEA'; Operation='Uninstall'; Path=$Approved.Path; Version=$Approved.Version; ExitCode=$process.ExitCode })
+    if ($process.ExitCode -ne 0 -or (Test-Path -LiteralPath (Join-Path $Approved.Path 'bin\idea64.exe')) -or
+        (Test-Path -LiteralPath $Approved.RegistryPath)) {
+        throw "Деинсталляция IDEA в $($Approved.Path) не подтверждена, код $($process.ExitCode)."
+    }
 }
 
 function Get-Platform {
@@ -358,7 +626,7 @@ public static class ExamLabNativePlatform {
     [pscustomobject]@{ Caption=[string]$registry.ProductName; Edition=$edition; Version=('10.0.'+$build); Build=$build;
         UBR=[int]$registry.UBR; NativeX64=$x64; NativeMachine=('0x{0:X4}' -f $nativeMachine);
         ArchitectureDetection='IsWow64Process2'; ClientWindows=$client; PowerShell=[string]$PSVersionTable.PSVersion;
-        SoftwareEligible=($x64 -and $client -and $build -ge 17763 -and $PSVersionTable.PSVersion -ge [version]'7.6');
+        SoftwareEligible=($x64 -and $client -and $build -ge 17763);
         SharedPCPlatformEligible=($client -and $build -ge 14393 -and $editionEligible); SharedPCBridge=$bridge;
         SharedPCEditionRecognition=$(if ($editionEligible) { 'KnownSupportedFamily' } elseif ($edition -match '^Core') { 'HomeUnsupported' } else { 'UnknownEdition' });
         PartOfDomain=$domain; FreeMemoryGiB=$memory; OptionalObservations=@($observations.ToArray());
@@ -366,7 +634,7 @@ public static class ExamLabNativePlatform {
         OsBuildMatchMeaning='Совпадает с ОС испытательного стенда; это не приёмка данного ПК и не проверка Guest/IDEA/USB/network.' }
 }
 
-function Get-EarlyPreflight($Platform) {
+function Get-EarlyPreflight($Platform, [switch]$InspectOnly) {
     $system = [Environment]::GetFolderPath('System')
     $modules = [ordered]@{}
     $specifications = @(
@@ -383,18 +651,25 @@ function Get-EarlyPreflight($Platform) {
         try {
             if (Test-Path -LiteralPath $manifest) {
                 if (-not (Test-TrustedExecutable $manifest)) { throw 'Незащищённый путь штатного модуля' }
-                $loaded = Import-Module -Name $manifest -SkipEditionCheck -PassThru -ErrorAction Stop
-                $moduleVersion = [string]@($loaded | Where-Object Name -eq $specification.Name | Select-Object -First 1)[0].Version
-                $commands = @($specification.Commands | Where-Object {
-                    -not (Get-Command -Name $_ -Module $specification.Name -ListImported -ErrorAction SilentlyContinue)
-                }).Count -eq 0
-                if (-not $commands) { throw 'Не найден обязательный штатный cmdlet' }
-                switch ($specification.Name) {
-                    'NetSecurity' { $null = Get-NetFirewallProfile -PolicyStore ActiveStore -ErrorAction Stop }
-                    'ScheduledTasks' { $null = Get-ScheduledTask -ErrorAction Stop | Select-Object -First 1 }
-                    'Microsoft.PowerShell.LocalAccounts' { $null = Get-LocalUser -ErrorAction Stop | Select-Object -First 1 }
+                if ($InspectOnly) {
+                    if ($available.Count) { $moduleVersion = [string]$available[0].Version }
+                    $commands = $null
+                    $readProbe = $null
+                    $status = 'PresentNotProbed'
+                } else {
+                    $loaded = Import-Module -Name $manifest -SkipEditionCheck -PassThru -ErrorAction Stop
+                    $moduleVersion = [string]@($loaded | Where-Object Name -eq $specification.Name | Select-Object -First 1)[0].Version
+                    $commands = @($specification.Commands | Where-Object {
+                        -not (Get-Command -Name $_ -Module $specification.Name -ListImported -ErrorAction SilentlyContinue)
+                    }).Count -eq 0
+                    if (-not $commands) { throw 'Не найден обязательный штатный cmdlet' }
+                    switch ($specification.Name) {
+                        'NetSecurity' { $null = Get-NetFirewallProfile -PolicyStore ActiveStore -ErrorAction Stop }
+                        'ScheduledTasks' { $null = Get-ScheduledTask -ErrorAction Stop | Select-Object -First 1 }
+                        'Microsoft.PowerShell.LocalAccounts' { $null = Get-LocalUser -ErrorAction Stop | Select-Object -First 1 }
+                    }
+                    $readProbe = $true; $status = 'Available'
                 }
-                $readProbe = $true; $status = 'Available'
             }
         } catch { $status = 'UnknownOrUnavailable'; $detail = $_.Exception.Message }
         $modules[$specification.Name] = [pscustomobject]@{ Status=$status; Manifest=$manifest; Version=$moduleVersion;
@@ -423,7 +698,7 @@ function Get-EarlyPreflight($Platform) {
             SharedPCEditions='Pro/Enterprise/Education/IoT Enterprise; Home не поддерживает экзаменационный Guest' };
         LocalMLGPO=$gpo; Modules=[pscustomobject]$modules; Services=$services;
         ServiceMeaning='Проверяется наличие и отсутствие Disabled; demand/trigger-start service может быть Stopped. Запуск/перенастройка не выполняются';
-        ExamPlatformPrerequisitesAvailable=[bool]$capabilities; SoftwareOnlyRequested=[bool]$SoftwareOnly;
+        ExamPlatformPrerequisitesAvailable=$(if ($InspectOnly) { $null } else { [bool]$capabilities }); SoftwareOnlyRequested=[bool]$SoftwareOnly;
         Acceptance='Это чтение предпосылок, не проверка действия Guest/USB/network и не приёмка ПК' }
 }
 
@@ -436,10 +711,7 @@ function Get-Installer([string]$Kind) {
     if (Test-Path -LiteralPath $file) {
         $lock = [IO.File]::Open($file,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
         $script:InstallerLocks.Add($lock)
-        if (-not $UsePublishedInstallers) {
-            if ((Get-FileHash -InputStream $lock -Algorithm SHA256).Hash -ne $pin.Hash) { throw "SHA256 $file не совпадает; файл не запускается и не заменяется автоматически" }
-            $lock.Position = 0
-        }
+        if ($lock.Length -ne $pin.PayloadBytes) { throw "Размер $Kind не совпадает с закреплённым пакетом." }
         $output = [IO.File]::Open($staged,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
         try { $lock.CopyTo($output) } finally { $output.Dispose() }
     } else {
@@ -449,13 +721,10 @@ function Get-Installer([string]$Kind) {
     }
     $stageLock = [IO.File]::Open($staged,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
     $script:InstallerLocks.Add($stageLock)
-    $verifiedHash = $null
-    if (-not $UsePublishedInstallers) {
-        if ((Get-FileHash -InputStream $stageLock -Algorithm SHA256).Hash -ne $pin.Hash) { throw "SHA256 staging $Kind не совпадает" }
-        $verifiedHash = $pin.Hash
-    }
+    $verifiedHash = (Get-FileHash -InputStream $stageLock -Algorithm SHA256).Hash
+    if ($verifiedHash -ne $pin.Hash) { throw "SHA256 staging $Kind не совпадает: $verifiedHash" }
     if ($Kind -eq 'Gradle') {
-        if ($verifiedHash) { $script:Changes.Add([pscustomobject]@{ Tool=$Kind; Operation='ArchiveVerified'; SHA256=$verifiedHash }) }
+        $script:Changes.Add([pscustomobject]@{ Tool=$Kind; Operation='ArchiveVerified'; SHA256=$verifiedHash })
     } else {
         $signature = Get-AuthenticodeSignature -LiteralPath $staged
         if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch [regex]::Escape($pin.Publisher)) {
@@ -501,6 +770,12 @@ function Install-Tool([string]$Kind, [string]$Installer, [string]$Destination) {
             $exe = "$env:SystemRoot\System32\msiexec.exe"
             $arguments = @('/i', "`"$Installer`"", '/qn','/norestart','ADDLOCAL=FeatureMain',
                 "INSTALLDIR=`"$Destination`"", '/L*v', "`"$logDirectory\jdk-install.log`"")
+        }
+        WinDirStat {
+            $exe = "$env:SystemRoot\System32\msiexec.exe"
+            $arguments = @('/i', "`"$Installer`"", '/qn','/norestart', 'ENABLE_SHORTCUT=0',
+                'DISABLE_CONTEXTMENU=1', 'ENABLE_ADD_TO_PATH=0', "INSTALLFOLDER=`"$Destination`"",
+                '/L*v', "`"$logDirectory\windirstat-install.log`"")
         }
         Git { $arguments = @('/VERYSILENT','/NORESTART','/ALLUSERS','/SP-','/o:PathOption=BashOnly', '/COMPONENTS=',"/DIR=`"$Destination`"", "/LOG=`"$logDirectory\git-install.log`"") }
         IDEA {
@@ -569,50 +844,58 @@ function Get-IDEPlugins($Tool) {
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $script:CurrentSid = $identity.User.Value
 $script:IsAdmin = ([Security.Principal.WindowsPrincipal]$identity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+$script:IsAdministratorAccount = $script:IsAdmin -or 'S-1-5-32-544' -in @($identity.Groups | ForEach-Object Value)
+$inspectOnly = $Action -eq 'Check'
+$apply = $Action -in @('Prepare','Apply')
 $report = [ordered]@{ Timestamp=[DateTime]::UtcNow.ToString('o'); ScriptSHA256=(Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash;
-    Action=$Action; Platform=$null; Preflight=$null; Before=$null; After=$null;
+    Action=$Action; Platform=$null; Preflight=$null; Plan=$null; DiskSpace=$null; Before=$null; After=$null;
     EnvironmentBefore=$null; EnvironmentAfter=$null; EnvironmentPreserved=$null; CLIProbe=$null; WorkingDirectory=$null;
     Changes=@(); Errors=@(); RebootRequired=$false; SoftwareReady=$false; ExamReady=$false;
     ManualChecks=@('Настоящий Shared PC Guest','IDEA: SDK/run/debug, completion/inspection/refactoring, отсутствие генеративных помощников',
         'Gradle с JDK 25: запуск и сборка исходного проекта в IDEA из Guest',
         'Moodle и PrairieLearn','Физические флешки','Локальное завершение и сохранность обычных занятий') }
-$toolNames = @('IDEA','JDK','Git','Gradle')
+$installOrder = @('JDK','Git','IDEA','Gradle','WinDirStat')
 $exitCode = 0
 try {
-    if (-not $script:IsAdmin) { throw 'Запустите 64-битный PowerShell 7 от администратора (повышенный UAC token)' }
-    if (-not [Environment]::Is64BitProcess) { throw 'Запустите 64-битный PowerShell 7' }
-    if ($UsePublishedInstallers -and (-not $PSBoundParameters.ContainsKey('CacheDirectory') -or
-        -not (Test-Path -LiteralPath $CacheDirectory -PathType Container) -or -not (Test-TrustedExecutable $CacheDirectory))) {
-        throw 'Для локального пилота укажите защищённый каталог опубликованных установщиков.'
+    if (-not [Environment]::Is64BitProcess) { throw 'Conflict: запустите 64-битный PowerShell.' }
+    if (-not $inspectOnly -and (-not $script:IsAdmin -or $PSVersionTable.PSVersion -lt [version]'7.6')) {
+        throw 'Запустите 64-битный PowerShell 7.6 от администратора (повышенный UAC token).'
     }
     if ($UsePublishedInstallers) { Write-Host 'Checking Windows prerequisites...' }
     $report.Platform = Get-Platform
-    $report.Preflight = Get-EarlyPreflight $report.Platform
-    if (-not $report.Platform.SoftwareEligible -or $PSVersionTable.PSEdition -ne 'Core' -or $PSVersionTable.PSVersion -lt [version]'7.6') {
-        throw 'Conflict: нужны client Windows10 1809+ x64 и native PowerShell 7'
+    $report.Preflight = Get-EarlyPreflight $report.Platform -InspectOnly:$inspectOnly
+    if (-not $report.Platform.SoftwareEligible) {
+        throw 'Conflict: нужна клиентская Windows 10 1809+ x64.'
     }
-    if (-not $SoftwareOnly -and -not $report.Preflight.ExamPlatformPrerequisitesAvailable) {
+    if (-not $SoftwareOnly -and ((-not $inspectOnly -and -not $report.Preflight.ExamPlatformPrerequisitesAvailable) -or
+        ($inspectOnly -and -not $report.Platform.SharedPCPlatformEligible))) {
         throw 'Conflict: не подтверждены предпосылки GPO/SharedPC/NetSecurity/ScheduledTasks/LocalAccounts; см. Preflight. Для одних программ используйте явный -SoftwareOnly'
     }
     $report.EnvironmentBefore = Get-EnvironmentObservation
     $inventory = Get-Inventory
     $report.Before = $inventory
-    if ($Action -eq 'Prepare') {
-        $alongsideTools = @('IDEA','JDK','Gradle')
-        $installOrder = @('JDK','Git','IDEA','Gradle')
-        foreach ($name in $toolNames) {
-            if ($inventory.$name.State -eq 'Conflict' -and
-                -not ($InstallAlongside -and $name -in $alongsideTools -and -not $inventory.$name.ExplicitPath)) {
-                throw "Conflict: $name. Выберите подходящий каталог через -${name}Path; IDEA/JDK/Gradle можно установить отдельно с -InstallAlongside"
+    $report.Plan = Get-SoftwarePlan $inventory
+    $report.DiskSpace = Get-SoftwareDiskSpace $report.Plan.Size
+    if ($report.Plan.Blockers.Count) { throw ('Conflict: ' + ($report.Plan.Blockers -join ' ')) }
+    if ($apply -or $inspectOnly) { Confirm-SoftwareDiskSpace $report.DiskSpace -Apply:$apply }
+    if ($apply) {
+        if ($ExpectedPlanPath) {
+            $expected = Get-Content -LiteralPath $ExpectedPlanPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($expected.Action -ne 'Check' -or $expected.ExitCode -ne 0 -or $null -eq $expected.Plan -or
+                ($expected.Plan.Actions | ConvertTo-Json -Compress -Depth 6) -cne ($report.Plan.Actions | ConvertTo-Json -Compress -Depth 6)) {
+                throw 'Conflict: план программ изменился. Сравните ожидаемые и текущие Plan.Actions и повторите Check.'
             }
         }
-        $destinations = @{ IDEA="$env:ProgramFiles\JetBrains\IntelliJ IDEA Community Edition 2025.2.6.4";
-            JDK="$env:ProgramFiles\Eclipse Adoptium\jdk-25"; Git="$env:ProgramFiles\Git"; Gradle=(Get-GradleDestination) }
-        $pending = @($installOrder | Where-Object {
-            $inventory.$_.State -eq 'Missing' -or ($InstallAlongside -and $inventory.$_.State -eq 'Conflict' -and $_ -in $alongsideTools)
-        })
-        foreach ($name in $pending) {
-            if (Test-Path -LiteralPath $destinations[$name]) { throw "Conflict: занят каталог $($destinations[$name]); разрешите конфликт вручную" }
+        $pending = @($report.Plan.Packages)
+        if ($pending.Count -and $UsePublishedInstallers -and (-not $PSBoundParameters.ContainsKey('CacheDirectory') -or
+            -not (Test-Path -LiteralPath $CacheDirectory -PathType Container) -or -not (Test-TrustedExecutable $CacheDirectory))) {
+            throw 'Для локального пилота укажите защищённый каталог опубликованных установщиков.'
+        }
+        foreach ($actionItem in @($report.Plan.Actions | Where-Object { $_.Operation -eq 'Keep' -and $_.Name -in @('JDK','Git') })) {
+            $observed = Get-Tool $actionItem.Name $actionItem.ExistingPath @() -VerifyVersion
+            if ($observed.State -ne 'Compatible' -or $observed.Selected.Version -ne $actionItem.ExistingVersion) {
+                throw "Conflict: проба $($actionItem.Name) не подтвердила план. См. Before и After."
+            }
         }
         if ($pending.Count) {
             $script:WorkingDirectory = New-ProtectedDirectory
@@ -620,30 +903,40 @@ try {
         }
         # Проверка всех требуемых файлов до первого запуска установщика.
         $installers = @{}
-        foreach ($name in $pending) { $installers[$name] = Get-Installer $name }
-        foreach ($name in $installOrder) {
+        foreach ($package in $pending) { $installers[$package.Name] = Get-Installer $package.Name }
+        foreach ($actionItem in $report.Plan.Actions) {
+            $name = $actionItem.Name
+            if ($actionItem.Replacement) {
+                if ($script:RebootRequired) { continue }
+                # Части выпуска IDEA могут использовать одну запись удаления Windows.
+                # Сначала проверен весь кэш, затем выполняется явная замена.
+                Remove-ReplacedIdea $actionItem.Replacement
+            }
             if ($installers.ContainsKey($name)) {
-                Install-Tool $name $installers[$name] $destinations[$name]
+                Install-Tool $name $installers[$name] $actionItem.Destination
             } else {
-                if ($UsePublishedInstallers) { Write-Host "Keeping installed $name $($inventory.$name.Selected.Version)." }
-                $script:Changes.Add([pscustomobject]@{ Tool=$name; Operation='PreservedCompatible'; Path=$inventory.$name.Selected.Path })
+                if ($UsePublishedInstallers) { Write-Host "Keeping installed $name $($actionItem.ExistingVersion)." }
+                $script:Changes.Add([pscustomobject]@{ Tool=$name; Operation='PreservedCompatible'; Path=$actionItem.ExistingPath })
             }
         }
         if ($UsePublishedInstallers) { Write-Host 'Verifying the installed tool versions...' }
-        $inventory = Get-Inventory
-        if ($UsePublishedInstallers -and -not $script:RebootRequired) {
-            foreach ($name in $pending) {
-                if ($inventory.$name.State -ne 'Compatible' -or $inventory.$name.Selected.Version -ne $pins[$name].Version) {
-                    throw "Не подтверждена версия $name $($pins[$name].Version) из поставки."
+        if (-not $script:RebootRequired) {
+            foreach ($package in $pending) {
+                $name = $package.Name
+                $installed = Get-Tool $name $package.Destination @() -VerifyVersion
+                if ($installed.State -ne 'Compatible' -or $installed.Selected.Version -ne $pins[$name].Version) {
+                    throw "Не подтверждена версия $name $($pins[$name].Version) в $($package.Destination)."
                 }
             }
         }
+        $inventory = Get-Inventory
         if ($inventory.IDEA.State -eq 'Compatible') {
             $freshIdea = $installers.ContainsKey('IDEA')
-            $pluginRoot = Join-Path $inventory.IDEA.Selected.Path 'plugins'
+            $pluginTarget = if ($freshIdea) { ($pending | Where-Object Name -eq 'IDEA').Destination } else { $inventory.IDEA.Selected.Path }
+            $pluginRoot = Join-Path $pluginTarget 'plugins'
             $excluded = @(@('plugin-classpath.txt','fullLine') | ForEach-Object { Join-Path $pluginRoot $_ } |
                 Where-Object { Test-Path -LiteralPath $_ })
-            if (($freshIdea -or $DisableBundledGenerativePlugins) -and $excluded.Count) {
+            if (-not $script:RebootRequired -and ($freshIdea -or $DisableBundledGenerativePlugins) -and $excluded.Count) {
                 foreach ($path in $excluded) {
                     if (-not (Test-TrustedExecutable $path)) { throw 'Путь плагина или bundled descriptor не защищён от записи обычным пользователем; автоматическое перемещение запрещено' }
                 }
@@ -664,7 +957,7 @@ try {
             }
         }
     }
-    $report.After = Get-Inventory
+    $report.After = if ($inspectOnly) { $inventory } else { Get-Inventory -VerifyVersions }
     $report.EnvironmentAfter = Get-EnvironmentObservation
     $report.EnvironmentPreserved = $report.EnvironmentBefore.MachineJAVA_HOME -ceq $report.EnvironmentAfter.MachineJAVA_HOME -and
         $report.EnvironmentBefore.UserJAVA_HOME -ceq $report.EnvironmentAfter.UserJAVA_HOME -and
@@ -672,24 +965,31 @@ try {
         $report.EnvironmentBefore.UserGRADLE_HOME -ceq $report.EnvironmentAfter.UserGRADLE_HOME -and
         $report.EnvironmentBefore.MachinePath -ceq $report.EnvironmentAfter.MachinePath -and
         $report.EnvironmentBefore.UserPath -ceq $report.EnvironmentAfter.UserPath
-    if ($UsePublishedInstallers) { Write-Host 'Testing Java compilation and local Git commands...' }
-    $report.CLIProbe = Test-CLI $report.After
+    if (-not $inspectOnly) {
+        if ($UsePublishedInstallers) { Write-Host 'Testing Java compilation and local Git commands...' }
+        $report.CLIProbe = Test-CLI $report.After
+        $report.SoftwareReady = $report.Platform.SoftwareEligible -and $installOrder.Where({ $report.After.$_.State -ne 'Compatible' }).Count -eq 0 -and $report.CLIProbe.Passed
+        if (-not $report.SoftwareReady) { $exitCode = 2 }
+    }
     $report.PluginReview = Get-IDEPlugins $report.After.IDEA
-    $report.SoftwareReady = $report.Platform.SoftwareEligible -and $toolNames.Where({ $report.After.$_.State -ne 'Compatible' }).Count -eq 0 -and $report.CLIProbe.Passed
-    if (-not $report.SoftwareReady) { $exitCode = 2 }
-    if (-not $report.EnvironmentPreserved) { $script:Failures.Add('Обнаружено изменение JAVA_HOME, GRADLE_HOME или PATH; автоматический откат не выполняется'); $exitCode = 1 }
-    if ($script:RebootRequired -and $exitCode -eq 0 -and $script:Failures.Count -eq 0) { $exitCode = 3010 }
+    if (-not $report.EnvironmentPreserved) { $script:Failures.Add('Обнаружено изменение JAVA_HOME, GRADLE_HOME или PATH.'); $exitCode = 1 }
+    if ($script:RebootRequired -and $report.EnvironmentPreserved -and $script:Failures.Count -eq 0) { $exitCode = 3010 }
 } catch {
     if ($UsePublishedInstallers) { Write-Host "Tool preparation failed. $($_.Exception.Message)" }
     $script:Failures.Add($_.Exception.Message)
     $exitCode = 1
     if ($_.Exception.Message -like 'Conflict:*') { $exitCode = 2 }
-    if ($report.Before) { try { $report.After = Get-Inventory } catch { $script:Failures.Add($_.Exception.Message) } }
+    if ($report.Before) {
+        try { $report.After = Get-Inventory -VerifyVersions:(!$inspectOnly) }
+        catch { $script:Failures.Add($_.Exception.Message) }
+        try { $report.EnvironmentAfter = Get-EnvironmentObservation }
+        catch { $script:Failures.Add($_.Exception.Message) }
+    }
 } finally {
     foreach ($lock in $script:InstallerLocks) { $lock.Dispose() }
     if ($script:WorkingDirectory) {
         # The private working directory keeps logs; signed or pinned installer inputs are reusable upstream.
-        foreach ($kind in $toolNames) {
+        foreach ($kind in $installOrder) {
             $stagedInstaller = Join-Path $script:WorkingDirectory $pins[$kind].File
             if (Test-Path -LiteralPath $stagedInstaller -PathType Leaf) {
                 try { [IO.File]::Delete($stagedInstaller) }

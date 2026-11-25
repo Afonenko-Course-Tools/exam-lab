@@ -274,11 +274,16 @@ public sealed class ExamLabConsoleLogon {
 
     // Учитываем заблокированные и отключенные интерактивные сеансы наряду с активным.
     public static bool HasNoGuestSession() {
+        return HasNoGuestSession(null, null);
+    }
+
+    public static bool HasNoGuestSession(ExamLabConsoleLogon allowedGuest, string allowedName) {
         IntPtr entries;
         uint count;
         bool ok = WTSEnumerateSessionsW(IntPtr.Zero, 0, 1, out entries, out count);
         try {
             if (!ok || entries == IntPtr.Zero || count == 0 || count > 4096) return false;
+            bool seenAllowedGuest = false;
             int entrySize = Marshal.SizeOf(typeof(SessionEntry));
             for (int i = 0; i < count; i++) {
                 SessionEntry entry = (SessionEntry)Marshal.PtrToStructure(IntPtr.Add(entries, i * entrySize), typeof(SessionEntry));
@@ -289,12 +294,20 @@ public sealed class ExamLabConsoleLogon {
                 try {
                     if (!ok || buffer == IntPtr.Zero || bytes < 2 || bytes > 1024 || bytes % 2 != 0) return false;
                     string user = Marshal.PtrToStringUni(buffer, (int)bytes / 2 - 1);
-                    if (user.StartsWith("shpctac", StringComparison.OrdinalIgnoreCase)) return false;
+                    if (user.StartsWith("shpctac", StringComparison.OrdinalIgnoreCase)) {
+                        if (allowedGuest == null || seenAllowedGuest || entry.SessionId != allowedGuest.SessionId ||
+                            entry.State != WTSActive || !String.Equals(user, allowedName, StringComparison.Ordinal)) return false;
+                        ExamLabConsoleLogon current = Read();
+                        if (current == null || current.SessionId != allowedGuest.SessionId ||
+                            !String.Equals(current.Sid, allowedGuest.Sid, StringComparison.Ordinal) ||
+                            current.AuthenticationId != allowedGuest.AuthenticationId) return false;
+                        seenAllowedGuest = true;
+                    }
                 } finally {
                     if (buffer != IntPtr.Zero) WTSFreeMemory(buffer);
                 }
             }
-            return true;
+            return allowedGuest == null || seenAllowedGuest;
         } finally {
             if (entries != IntPtr.Zero) WTSFreeMemory(entries);
         }
@@ -309,9 +322,10 @@ function Get-ControllerConsoleLogon {
     return [ExamLabConsoleLogon]::Read()
 }
 
-function Test-ControllerNoGuestSession {
+function Test-ControllerNoGuestSession($ObservedGuest, [string]$ObservedGuestName) {
     try {
         Initialize-ControllerConsoleApi
+        if ($ObservedGuest) { return [ExamLabConsoleLogon]::HasNoGuestSession($ObservedGuest, $ObservedGuestName) }
         return [ExamLabConsoleLogon]::HasNoGuestSession()
     } catch { return $false }
 }
@@ -416,6 +430,15 @@ function Compare-ControllerAssignment($Incoming, $Previous) {
     return 'repeat'
 }
 
+function Test-ControllerActiveExam($State) {
+    $assignment = $State.Assignment
+    $result = $State.Result
+    return ($assignment -and $result -and $assignment.mode -ceq 'exam' -and
+        $result.revision -eq $assignment.revision -and $result.mode -ceq 'exam' -and
+        $result.examId -ceq $assignment.examId -and $State.StoppedExamId -cne $assignment.examId -and
+        $result.outcome -ceq 'source-applied' -and $result.reason -ceq 'machine-policies-only')
+}
+
 function New-ExamLabHttpClient {
     Add-Type -AssemblyName System.Net.Http
     $handler = [Net.Http.HttpClientHandler]::new()
@@ -464,6 +487,6 @@ function Invoke-ControllerRequest {
 }
 
 Export-ModuleMember -Function Read-ControllerConfiguration,ConvertTo-ControllerAssignment,Get-ControllerUtc,
-    Read-ControllerState,Write-ControllerJson,Set-ControllerResult,Compare-ControllerAssignment,
+    Read-ControllerState,Write-ControllerJson,Set-ControllerResult,Compare-ControllerAssignment,Test-ControllerActiveExam,
     New-ExamLabHttpClient,Invoke-ControllerRequest,Get-ControllerConsoleLogon,Get-ControllerGuestSessionId,
     Get-ControllerInstallReport,Test-ControllerNoGuestSession,ConvertFrom-ControllerResponse

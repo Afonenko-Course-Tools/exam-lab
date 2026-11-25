@@ -1,4 +1,4 @@
-#requires -Version 7.6
+﻿#requires -Version 7.6
 [CmdletBinding()]
 param([Parameter(Mandatory)][ValidateSet('Disable', 'Enable', 'Uninstall')][string]$Action)
 
@@ -39,7 +39,7 @@ function Set-ExamLabTasksEnabled([bool]$Enabled) {
     foreach ($name in $examLabTaskNames) {
         # The local emergency normal task remains available even when polling is disabled.
         if ($name -eq 'ExamLab-Local-normal' -or ($Enabled -and $name -eq $examLabPollTask)) { continue }
-        $task = Get-ExamLabTask $name
+        $task = Get-ExamLabTask $name -RequireOwnership
         if (-not $task) {
             if ($Enabled) { throw "Required task $name is missing." }
             continue
@@ -170,6 +170,7 @@ function Remove-ExamLabEnrollmentSecrets {
 
 $maintenance = Open-ExamLabMaintenanceLock
 try {
+    $null = Invoke-ExamLabInstallRecovery
     $ownership = Read-ExamLabOwnership
     if (-not $ownership.Version) { throw 'ExamLab has no verified local installation.' }
     Assert-ExamLabArp $ownership

@@ -179,7 +179,7 @@ Application `6101` от `ExamLab-Alert` и номер записи Application. 
 ## Короткое окно FileIO.light
 
 Передайте оператору VM сценарий
-[`tests/windows-fileio-light.ps1`](../../../tests/windows-fileio-light.ps1).
+[`windows/trace/windows-fileio-light.ps1`](../../../windows/trace/windows-fileio-light.ps1).
 Выполните из повышенного PowerShell испытательной машины с согласованным именем.
 
 ```powershell

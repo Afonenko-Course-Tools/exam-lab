@@ -10,7 +10,9 @@ try {
     $traceAttempt = [pscustomobject]@{ revision=17; examId='file-trace-demo'; localGeneration='baseline' }
     $traceState = [pscustomobject]@{
         Assignment = [pscustomobject]@{ mode='exam'; revision=17; examId='file-trace-demo' }
-        Result = [pscustomobject]@{ outcome='source-applied'; reason='machine-policies-only' }
+        Result = [pscustomobject]@{
+            mode='exam'; revision=17; examId='file-trace-demo'; outcome='source-applied'; reason='machine-policies-only'
+        }
         StoppedExamId = $null
         LocalGeneration = 'baseline'
     }
@@ -32,8 +34,34 @@ try {
     $traceState.Assignment.mode = 'normal'
     Assert-TraceAssignment 'обычный режим' $false
     $traceState.Assignment.mode = 'exam'
-    $traceState.Assignment.examId = $traceAttempt.examId = 'regular-demo'
+    $traceState.Assignment.examId = $traceState.Result.examId = $traceAttempt.examId = 'regular-demo'
     Assert-TraceAssignment 'обычный экзамен' $false
+    function Assert-ActiveExam([string]$Name,[bool]$Expected) {
+        $active = & $module { param($State) Test-ControllerActiveExam $State } $traceState
+        if ($active -ne $Expected) { throw "FAIL назначение Wazuh: $Name" }
+        "PASS назначение Wazuh: $Name"
+    }
+    Assert-ActiveExam 'текущий обычный экзамен с подтверждёнными политиками' $true
+    $traceState.StoppedExamId = 'regular-demo'
+    Assert-ActiveExam 'локальный normal запретил восстановление старого назначения' $false
+    $traceState.StoppedExamId = $null
+    $traceState.Result.revision = 16
+    Assert-ActiveExam 'результат предыдущей ревизии' $false
+    $traceState.Result.revision = 17
+    $traceState.Result.outcome = 'blocked'
+    Assert-ActiveExam 'назначение есть, подтверждения политики нет' $false
+    foreach ($case in @(
+        @{Status='Connected'; Elapsed=2500; Delay=12500},
+        @{Status='Connected'; Elapsed=14750; Delay=1000},
+        @{Status='Connected'; Elapsed=28000; Delay=1000},
+        @{Status='Unavailable'; Elapsed=8000; Delay=15000},
+        @{Status='Rejected'; Elapsed=1000; Delay=15000},
+        @{Status='LocalError'; Elapsed=28000; Delay=15000}
+    )) {
+        $delay = & $module { param($Elapsed,$Status) Get-ControllerPollDelayMilliseconds $Elapsed $Status } $case.Elapsed $case.Status
+        if ($delay -ne $case.Delay) { throw "FAIL интервал опроса $($case.Status), длительность $($case.Elapsed) мс" }
+    }
+    'PASS опрос: 15 секунд от начала успешного цикла, минимум 1 секунда, после отказа полные 15 секунд.'
     function Test-Config([string]$Name,[string]$Json,[bool]$Expected) {
         $passed=$false
         try { & $module {param($c) Test-DeclaredConfig $c} ($Json|ConvertFrom-Json) | Out-Null; $passed=$true } catch {}
@@ -84,6 +112,26 @@ try {
         @($serviceSpecs | Where-Object {$_.Direction -ne 'Outbound' -or $_.Protocol -ne 'TCP' -or $_.RemoteAddress -ne '192.0.2.10'}).Count -or
         $controllerSpec.RemotePort -ne '443' -or $wazuhSpec.RemotePort -ne '1514') { throw 'FAIL точные исходящие правила контроллера и агента.' }
     'PASS Network: описание исходящих правил контроллера и Wazuh; фильтры Windows не испытывались.'
+    & $networkModule {
+        $own = New-NetInstanceIndex @(
+            [pscustomobject]@{InstanceID='unique'}, [pscustomobject]@{InstanceID='duplicate'},
+            [pscustomobject]@{InstanceID='collision'}, [pscustomobject]@{InstanceID='missing'},
+            [pscustomobject]@{InstanceID='rule-collision'}, [pscustomobject]@{InstanceID='RULE-COLLISION'}
+        )
+        $unique = [pscustomobject]@{InstanceID='unique'; Marker=42}
+        $filters = New-NetInstanceIndex @(
+            $unique, [pscustomobject]@{InstanceID='duplicate'}, [pscustomobject]@{InstanceID='duplicate'},
+            [pscustomobject]@{InstanceID='collision'}, [pscustomobject]@{InstanceID='COLLISION'},
+            [pscustomobject]@{InstanceID='foreign'}, [pscustomobject]@{Other='no identifier'}
+        ) $own
+        if ((Find-NetInstance $filters 'unique').Marker -ne 42 -or $filters.ContainsKey('foreign') -or
+            (Find-NetInstance $filters 'UNIQUE') -or (Find-NetInstance $filters 'duplicate') -or
+            (Find-NetInstance $filters 'collision') -or (Find-NetInstance $filters 'missing') -or
+            (Find-NetInstance $own 'rule-collision')) {
+            throw 'FAIL Network: bulk join требует единственный точный собственный CIM InstanceID.'
+        }
+    }
+    'PASS Network: точный ключ CIM, пропуск чужих фильтров, отказ отсутствующим и неоднозначным bulk keys.'
     Test-Config 'TechnicalAccess explicit address/local port' ($withNetwork.Replace('[]','[{"RemoteIP":"192.0.2.20","LocalPort":5985}]')) $true
     Test-Config 'TechnicalAccess arbitrary direction refused' ($withNetwork.Replace('[]','[{"RemoteIP":"192.0.2.20","LocalPort":5985,"Direction":"Inbound"}]')) $false
     Test-Config 'TechnicalAccess duplicate refused' ($withNetwork.Replace('[]','[{"RemoteIP":"192.0.2.20","LocalPort":5985},{"RemoteIP":"192.0.2.20","LocalPort":5985}]')) $false
@@ -129,6 +177,91 @@ try {
         throw 'FAIL: исключение roster должно действовать только для точного наблюдённого SID'
     }
     'PASS: исключение roster действует только на подтверждённый SID наблюдаемого сеанса'
+    $inactive = [pscustomobject]@{Name='shpctac0ffee'; SID=$guest.SID; Enabled=$false}
+    $similar = [pscustomobject]@{Name='SHPCTAC0FFEF'; SID=$other.SID; Enabled=$false}
+    $profile = [pscustomobject]@{SID=$inactive.SID.Value; Loaded=$false; Special=$false}
+    function Assert-InactiveGuestEvidence([bool]$Expected, [object[]]$Profiles, [int]$CreationCount) {
+        $allowed = & $module { param($Account,$Profiles,$Count) Test-ExamLabInactiveGuestEvidence $Account $Profiles $Count } `
+            $inactive $Profiles $CreationCount
+        if ($allowed -ne $Expected) { throw 'FAIL подтверждение неактивного Guest' }
+    }
+    if (-not (& $module { param($Account) Test-ExamLabInactiveGuestAccount $Account } $inactive) -or
+        (& $module { param($Account) Test-ExamLabInactiveGuestAccount $Account } $similar)) {
+        throw 'FAIL неактивный Guest требует канонического регистра имени'
+    }
+    $inactive.Enabled = $true
+    if (& $module { param($Account) Test-ExamLabInactiveGuestAccount $Account } $inactive) {
+        throw 'FAIL неактивный Guest не может быть включён'
+    }
+    $inactive.Enabled = $false
+    Assert-InactiveGuestEvidence $true @($profile) 1
+    Assert-InactiveGuestEvidence $false @($profile) 0
+    Assert-InactiveGuestEvidence $false @($profile) 2
+    Assert-InactiveGuestEvidence $false @() 1
+    Assert-InactiveGuestEvidence $false @($profile,$profile) 1
+    $profile.Loaded = $true
+    Assert-InactiveGuestEvidence $false @($profile) 1
+    $profile.Loaded = $false
+    $profile.SID = $similar.SID.Value
+    Assert-InactiveGuestEvidence $false @($profile) 1
+    $prefixOnly = New-AccountData 'S-1-5-21-1-2-3-1004' 'shpctac-teacher'
+    $identified = @(Get-ExamLabGuestRosterEvidence -LocalAccounts @($student,$inactive,$similar,$prefixOnly) -OrdinaryAccounts @() -IdentifyOnly)
+    if ($identified.Count -ne 2 -or @($identified | Where-Object VerifiedInactive).Count) {
+        throw 'FAIL первая регистрация выявляет только точную форму Guest с любым регистром'
+    }
+    $repeatRoster = @([pscustomobject]@{Sid=$inactive.SID.Value; Name=$inactive.Name})
+    $notDeclared = @(Get-ExamLabGuestRosterEvidence -LocalAccounts @($inactive,$similar) -OrdinaryAccounts $repeatRoster -IdentifyOnly)
+    if ($notDeclared.Count -ne 1 -or $notDeclared[0].Sid -cne $similar.SID.Value) {
+        throw 'FAIL ранее сохранённая обычная учётная запись не является остатком Guest'
+    }
+    $rosterException = & $module {param($c,$a,$sid) Test-LiveRoster $c $a -InactiveGuestSids @($sid) -AllowDrift} `
+        $rosterConfig @($student,$inactive,$similar) $inactive.SID.Value
+    if (-not $rosterException.IdentityUnconfirmed -or $rosterException.UnlistedAccounts.Count -ne 1 -or
+        $rosterException.UnlistedAccounts[0].Sid -cne $similar.SID.Value) {
+        throw 'FAIL только точный подтверждённый остаток исключается из списка расхождений'
+    }
+    'PASS остаточный Guest: отключённое каноническое имя, единственные профиль и событие, неизменный ordinary roster.'
+    $setupAccount = [pscustomobject]@{Name='defaultuser0'; SID=$guest.SID; Enabled=$false}
+    function Assert-SetupAccount([bool]$Expected) {
+        $accepted = & $module { param($Account) Test-ExamLabSetupAccount $Account } $setupAccount
+        if ($accepted -ne $Expected) { throw 'FAIL canonical inactive defaultuser0' }
+    }
+    Assert-SetupAccount $true
+    $setupAccount.Enabled = $true
+    Assert-SetupAccount $false
+    $setupAccount.Enabled = $false
+    $setupAccount.Name = 'DefaultUser0'
+    Assert-SetupAccount $false
+    $setupAccount.Name = 'defaultuser0'
+    $setupAccount.SID = $builtin.SID
+    Assert-SetupAccount $false
+    $setupAccount.SID = $guest.SID
+    $setupRoster = [pscustomobject]@{OrdinaryAccounts=@($rosterConfig.OrdinaryAccounts[0],
+        [pscustomobject]@{Sid=$setupAccount.SID.Value;Name=$setupAccount.Name})}
+    $declaredSetup = & $module { param($c,$a) Test-LiveRoster $c $a } $setupRoster @($student,$setupAccount)
+    if ($declaredSetup.IdentityUnconfirmed -or (Get-ExamLabSetupAccountIssue -LocalAccounts @($student))) {
+        throw 'FAIL defaultuser0 сохраняется в обычном roster, чистый список обходится без чтения Setup.'
+    }
+    $completeImage = 'IMAGE_STATE_COMPLETE'
+    $stateIni = "[State]`r`nImageState=`"$completeImage`"`r`n"
+    $setup = [pscustomobject]@{OOBEInProgress=0; SystemSetupInProgress=0; SetupType=0}
+    function Assert-SetupCompletion([bool]$Expected, $Image, [string]$Ini, [object[]]$Profiles) {
+        $issue = & $module { param($r,$i,$s,$p) Get-ExamLabSetupCompletionIssue $r $i $s $p } $Image $Ini $setup $Profiles
+        if ((-not $issue) -ne $Expected) { throw 'FAIL Windows Setup/OOBE completion' }
+    }
+    Assert-SetupCompletion $true $completeImage $stateIni @([pscustomobject]@{Loaded=$false})
+    Assert-SetupCompletion $true $completeImage $stateIni @()
+    Assert-SetupCompletion $false 'IMAGE_STATE_UNDEPLOYABLE' $stateIni @()
+    Assert-SetupCompletion $false $completeImage ($stateIni.Replace('[State]', '[Other]')) @()
+    Assert-SetupCompletion $false $completeImage ($stateIni + 'ImageState=IMAGE_STATE_UNDEPLOYABLE') @()
+    Assert-SetupCompletion $false $completeImage $stateIni @([pscustomobject]@{Loaded=$true})
+    Assert-SetupCompletion $false $completeImage $stateIni @([pscustomobject]@{Loaded=$null})
+    foreach ($flag in $setup.PSObject.Properties) {
+        $flag.Value = 1
+        Assert-SetupCompletion $false $completeImage $stateIni @()
+        $flag.Value = 0
+    }
+    'PASS defaultuser0: канонический SID, два источника, флаги, незагруженный профиль и сохранение в roster.'
     $unset=[pscustomobject]@{EnableSharedPCMode=$null;EnableAccountManager=$null;AccountModel=$null;DeletionPolicy=$null;SetEduPolicies=$null;SetPowerPolicies=$null;RestrictLocalStorage=$null}
     if (-not (& $module {param($s) Test-SharedPCUnset $s} $unset)) { throw 'FAIL all-null SharedPC должен быть unset.' }
     $unset.DeletionPolicy=0
@@ -138,8 +271,23 @@ try {
     'PASS SharedPC unset: all-null принят, configured 0/false отклонены без default/coercion'
     $target=[pscustomobject]@{State='Observed';Instance=[pscustomobject]@{EnableSharedPCMode=$true;EnableAccountManager=$true;AccountModel=2;DeletionPolicy=0;SetEduPolicies=$false;SetPowerPolicies=$false;RestrictLocalStorage=$false}}
     if (-not (& $module {param($s) Test-SharedPCTarget $s} $target)) { throw 'FAIL explicit SharedPC target.' }
+    $mdmDenied = [pscustomobject]@{State='Unknown'; Count=$null; AccessDenied=$true}
+    $mdmUnavailable = [pscustomobject]@{State='Unknown'; Count=$null; AccessDenied=$false}
+    $mdmNoInstance = [pscustomobject]@{State='Unknown'; Count=0; AccessDenied=$false}
+    $mdmManyInstances = [pscustomobject]@{State='Unknown'; Count=2; AccessDenied=$false}
+    if (-not (& $module { param($s) Test-SharedPCGuestRosterReady $s } $target) -or
+        (& $module { param($s) Test-SharedPCGuestRosterReady $s } $mdmDenied) -or
+        (& $module { param($s) Test-SharedPCGuestRosterReady $s } $mdmNoInstance) -or
+        -not (& $module { param($s) Test-SharedPCGuestRosterReady $s -AllowRecordedPreparation } $mdmDenied) -or
+        -not (& $module { param($s) Test-SharedPCGuestRosterReady $s -AllowRecordedPreparation } $mdmNoInstance) -or
+        (& $module { param($s) Test-SharedPCGuestRosterReady $s -AllowRecordedPreparation } $mdmUnavailable) -or
+        (& $module { param($s) Test-SharedPCGuestRosterReady $s -AllowRecordedPreparation } $mdmManyInstances)) {
+        throw 'FAIL сохранённая подготовка заменяет только отказ доступа или пустой ответ WMI Bridge'
+    }
     $target.Instance.DeletionPolicy=$null
-    if (& $module {param($s) Test-SharedPCTarget $s} $target) { throw 'FAIL target DeletionPolicy null не является выбранным0.' }
+    if (& $module {param($s) Test-SharedPCGuestRosterReady $s -AllowRecordedPreparation} $target) {
+        throw 'FAIL сохранённая подготовка не заменяет прочитанное расхождение Shared PC'
+    }
     'PASS SharedPC target: explicit0 принят, null не приводится к0'
     $missing=Join-Path $temporary 'missing.json'
     if (& $module {param($p) Test-ExistingFile $p} $missing) { throw 'FAIL missing file должен быть absent.' }
@@ -197,6 +345,34 @@ try {
     $installAst=Get-ParsedSource '..\setup\Install-LocalPilot.ps1'
     $mainAst=Get-ParsedSource '..\windows\ExamLab.psm1'
     $netAst=Get-ParsedSource '..\windows\ExamNetwork.psm1'
+    $readContext=Get-FunctionNode $mainAst 'Read-Context'
+    $setupGuards=@($readContext.FindAll({param($n)
+        $n -is [Management.Automation.Language.IfStatementAst] -and
+        $n.Clauses[0].Item1.Extent.Text -eq '-not $AllowRosterDriftOnlyForNormal' -and
+        @(Get-CommandNodes $n.Clauses[0].Item2 'Get-ExamLabSetupAccountIssue').Count -eq 1 -and
+        @(Get-CommandNodes $n.Clauses[0].Item2 'Get-ExamLabGuestRosterEvidence').Count -eq 1
+    },$true))
+    if ($setupGuards.Count -ne 1 -or @(Get-CommandNodes $readContext.Body 'Get-ExamLabSetupAccountIssue').Count -ne 1 -or
+        @(Get-CommandNodes $readContext.Body 'Get-ExamLabGuestRosterEvidence').Count -ne 1) {
+        throw 'FAIL Setup/OOBE проверяется только на строгом пути, автономный normal доступен.'
+    }
+    $observe=Get-FunctionNode $mainAst 'Get-ExamLabControllerObservation'
+    Assert-CallBefore $observe.Body 'Get-ExamLabControllerPolicyReadback' @('Test-ExamLabWazuhRunning')
+    foreach ($mutation in @('Restore-ExamLabControllerCollection','Open-ExamLabModeLock','Invoke-ExamLabFileTraceAssignment',
+        'Start-ExamLabFileTraceExport','Stop-ExamLabOrphanedFileTrace')) {
+        if (@(Get-CommandNodes $observe.Body $mutation).Count) { throw "FAIL наблюдение вызвало $mutation" }
+    }
+    $poll=Get-FunctionNode $mainAst 'Invoke-ExamLabControllerLoop'
+    Assert-CallBefore $poll.Body 'Invoke-ControllerRequest' @('Set-ExamLabMode','Invoke-ExamLabFileTraceAssignment')
+    foreach ($mutation in @('Restore-ExamLabControllerCollection','Start-ExamLabFileTraceExport','Stop-ExamLabOrphanedFileTrace')) {
+        if (@(Get-CommandNodes $poll.Body $mutation).Count) { throw "FAIL опрос вызвал $mutation" }
+    }
+    $restore=Get-FunctionNode $mainAst 'Restore-ExamLabControllerCollection'
+    Assert-CallBefore $restore.Body 'Test-ControllerActiveExam' @('Get-ExamLabControllerPolicyReadback','Get-ExamLabWazuhRunner')
+    $setMode=Get-FunctionNode $mainAst 'Set-ExamLabMode'
+    Assert-CallBefore $setMode.Body 'Open-ExamLabModeLock' @('Restore-ExamLabControllerCollection','Stop-ExamLabExtendedCollection',
+        'Complete-ExamLabFileTraceNormal')
+    'PASS режим: пригодность Wazuh читается, восстановление и остановка принадлежат назначению и normal.'
     $nativeSource=$null
     foreach ($sourceAst in @($installAst,$mainAst,$netAst)) {
         if ($sourceAst.Extent.Text -match 'QEMU|KVM|Red Hat|ExamLab-TestVM') { throw 'FAIL runtime must not depend on VM identity.' }
@@ -222,8 +398,10 @@ try {
     }
     $entry=@($installAst.EndBlock.Statements | Where-Object {$_ -is [Management.Automation.Language.TryStatementAst]})
     if ($entry.Count -ne 1) { throw 'FAIL installer entry boundary.' }
-    Assert-CallBefore $entry[0].Body 'Assert-NativeAMD64' @('Import-Module','Assert-SafeDirectory','Open-ExamLabMaintenanceLock','Suspend-ExamLabPolling','Register-ScheduledTask')
+    Assert-CallBefore $entry[0].Body 'Assert-NativeAMD64' @('Import-Module','Assert-SafeDirectory','Open-ExamLabMaintenanceLock','Suspend-ExamLabPolling','Add-ExamLabInstallTask')
     $maintenanceAst=Get-ParsedSource '..\setup\ExamLabMaintenance.Core.ps1'
+    $registerTask=Get-FunctionNode $maintenanceAst 'Add-ExamLabInstallTask'
+    Assert-CallBefore $registerTask.Body 'Add-ExamLabInstallChange' @('New-ExamLabScheduledTask')
     $pause=Get-FunctionNode $maintenanceAst 'Suspend-ExamLabPolling'
     Assert-CallBefore $pause.Body 'Assert-ExamLabInactive' @('Disable-ScheduledTask','Stop-ScheduledTask')
     Assert-CallBefore (Get-FunctionNode $mainAst 'Assert-Host') 'Assert-NativeAMD64' @('Get-CimInstance')

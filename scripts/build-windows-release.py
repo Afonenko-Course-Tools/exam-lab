@@ -20,6 +20,9 @@ PILOT_CONTROLLER_DNS = "controller.exam-server-20261119.test"
 PWSH_VERSION = "7.6.10"
 PWSH_MSI = f"PowerShell-{PWSH_VERSION}-win-x64.msi"
 PWSH_SHA256 = "7d8daea48b450d4d62fcd1ac4d6faa7ac2db5e11aba5061ee81b7496adca8c07"
+# https://github.com/windirstat/windirstat/releases/tag/release/v2.9.3
+WINDIRSTAT_MSI = "WinDirStat-2.9.3-x64.msi"
+WINDIRSTAT_SHA256 = "96c4c4beb63c7c5ad6b1a206f96560d7a9a2b6063f3cd175a82f392977a9af5d"
 SOURCES = (
     "setup/Prepare-ExamLab.ps1",
     "setup/Install-ExamLabIdea.ps1",
@@ -41,6 +44,13 @@ SOURCES = (
     "windows/alert/Wait-ExamLabFileRead.ps1",
     "windows/alert/exam-lab-alert.cmd",
     "windows/LICENSE-exam-lab-0.1.0.txt",
+)
+TRACE_SOURCES = (
+    "windows/trace/ExamLab.FileTrace.ps1",
+    "windows/trace/windows-fileio-light.ps1",
+    "windows/trace/Export-ExamLabFileTrace.ps1",
+)
+LEGACY_TRACE_SOURCES = (
     "tests/windows-fileio-light.ps1",
     "tests/Export-ExamLabFileTrace.ps1",
 )
@@ -66,11 +76,13 @@ def published_tools(git, revision, tools_dir):
             hashes[name] = hashlib.file_digest(stream, "sha256").hexdigest()
     if hashes.get(PWSH_MSI) != PWSH_SHA256:
         raise ValueError(f"{PWSH_MSI} не соответствует SHA-256 опубликованного выпуска PowerShell")
+    if WINDIRSTAT_MSI in hashes and hashes[WINDIRSTAT_MSI] != WINDIRSTAT_SHA256:
+        raise ValueError(f"{WINDIRSTAT_MSI} не соответствует SHA-256 опубликованного выпуска WinDirStat")
     return hashes
 
 
 def fill_template(template, substitutions):
-    return re.sub(r"@([A-Z][A-Z0-9_]*)@", lambda match: substitutions[match[1]], template)
+    return re.sub(r"@([A-Z][A-Z0-9_]*)@", lambda match: str(substitutions[match[1]]), template)
 
 
 def read_root(path):
@@ -96,12 +108,42 @@ def bootstrap_pem(certificate):
     return "\n".join(f'{redirect} "%WORK%\\controller-ca.pem" echo {line}' for redirect, line in commands)
 
 
+def bootstrap_payload(name, script):
+    encoded = base64.b64encode(script).decode("ascii")
+    return "\n".join(f"rem EXAMLAB_{name}:{line}" for line in textwrap.wrap(encoded, width=100))
+
+
+def render_cmd(template, substitutions):
+    cmd = fill_template(template, substitutions)
+    return cmd.replace("\r\n", "\n").replace("\n", "\r\n").encode("utf-8")
+
+
+def build_check_script(native, substitutions):
+    payloads = (substitutions["EARLY_CHECK_PAYLOAD"], substitutions["INVENTORY_PAYLOAD"])
+    comments = "\n".join(f"# {line}" for payload in payloads for line in payload.splitlines())
+    script = fill_template(native, {**substitutions, "CHECK_ONLY": "$true"})
+    return f"{comments}\n\n{script}".encode("utf-8-sig")
+
+
+def bootstrap_private_paths(core):
+    start = "# BEGIN EXAMLAB BOOTSTRAP PRIVATE PATHS\n"
+    end = "\n# END EXAMLAB BOOTSTRAP PRIVATE PATHS"
+    script = core.decode("utf-8-sig").replace("\r\n", "\n")
+    _, found_start, remainder = script.partition(start)
+    functions, found_end, _ = remainder.partition(end)
+    if not found_start or not found_end or not functions.strip():
+        raise ValueError("Не найден блок защиты путей для раннего запуска")
+    return functions
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default=f"https://{PILOT_CONTROLLER_IP}:21650/install")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--revision", default="HEAD", help="Точная Git-ревизия исходников")
     parser.add_argument("--launcher", type=Path, required=True, help="Путь к файлу Start-ExamLab.cmd для HTTP")
+    parser.add_argument("--check-launcher", type=Path, help="Путь к Check-ExamLab.cmd для запуска только Check")
+    parser.add_argument("--check-script-base-url", default="", help="Адрес каталога сценариев Check по HTTP или HTTPS")
     parser.add_argument("--controller-ca", type=Path, required=True, help="Публичный CA контроллера в DER")
     parser.add_argument("--squid-ca", type=Path, required=True, help="Публичный CA Squid в DER")
     parser.add_argument("--tools-dir", type=Path, required=True, help="Проверенные файлы для HTTPS-публикации пилота")
@@ -122,6 +164,22 @@ def main():
         parser.error("--moodle-activity-url: неверный номер порта")
     if args.launcher.suffix.lower() != ".cmd" or args.launcher.resolve().is_relative_to(args.output.resolve()):
         parser.error("--launcher: укажите путь к файлу .cmd вне каталога HTTPS-публикации")
+    if args.check_launcher and (
+        args.check_launcher.suffix.lower() != ".cmd"
+        or args.check_launcher.resolve().is_relative_to(args.output.resolve())
+        or args.check_launcher.resolve() == args.launcher.resolve()
+    ):
+        parser.error("--check-launcher: укажите отдельный путь .cmd вне каталога HTTPS-публикации")
+    check_base = args.check_script_base_url.rstrip("/")
+    if args.check_script_base_url:
+        if not args.check_launcher or not re.fullmatch(r"https?://[A-Za-z0-9.-]+(?::[0-9]+)?/[A-Za-z0-9/_-]+", check_base):
+            parser.error("--check-script-base-url требует --check-launcher и адрес каталога публикации")
+        try:
+            check_port = urlsplit(check_base).port
+        except ValueError:
+            parser.error("--check-script-base-url: неверный номер порта")
+        if check_port == 0:
+            parser.error("--check-script-base-url: неверный номер порта")
     try:
         certificate = read_root(args.controller_ca)
         squid_certificate = read_root(args.squid_ca)
@@ -142,7 +200,8 @@ def main():
         return subprocess.check_output(["git", "-C", str(ROOT), *command])
 
     revision = git("rev-parse", "--verify", "--end-of-options", f"{args.revision}^{{commit}}").decode("ascii").strip()
-    files = {path: git("show", f"{revision}:{path}") for path in SOURCES}
+    trace_sources = TRACE_SOURCES if git("ls-tree", revision, "windows/trace") else LEGACY_TRACE_SOURCES
+    files = {path: git("show", f"{revision}:{path}") for path in (*SOURCES, *trace_sources)}
     files["windows/file-trace-exam.txt"] = args.file_trace_exam.encode("utf-8")
     response_pin = re.search(rb"(?m)^\$expectedResponseSha256 = '([0-9A-F]{64})'\r?$",
                              files["setup/Install-ExamLabWazuh.ps1"])
@@ -162,6 +221,34 @@ def main():
     installer_name = f"exam-lab-{revision}.ps1"
     tools_url = f"{base}/exam-lab-{revision}/tools"
     tools_pins = ";\n        ".join(f"'{name}' = '{pin}'" for name, pin in tools_hashes.items())
+    cmd = git("show", f"{revision}:setup/Start-ExamLab.cmd").decode("ascii")
+    native = ""
+    if "@NATIVE_SCRIPT@" in cmd:
+        native = git("show", f"{revision}:setup/Start-ExamLab.Native.ps1.in").decode("utf-8-sig")
+    if args.check_launcher and (
+        "@CHECK_ONLY@" not in (native or cmd)
+        or "@BOOTSTRAP_ARGUMENTS@" not in cmd
+        or "@INVENTORY_PAYLOAD@" not in cmd
+    ):
+        parser.error("--check-launcher требует ревизию с поддержкой входа Check")
+    if args.check_launcher and native and not check_base:
+        parser.error("--check-launcher для раздельной поставки требует --check-script-base-url")
+    if check_base and not native:
+        parser.error("--check-script-base-url требует ревизию с отдельным сценарием Check")
+    include_expanded_sizes = "@BUNDLE_EXPANDED_BYTES@" in (native or cmd)
+    bootstrap_tools = []
+    for name, pin in tools_hashes.items():
+        if name == PWSH_MSI:
+            continue
+        path = args.tools_dir / name
+        sizes = f"Bytes={path.stat().st_size}"
+        if include_expanded_sizes:
+            expanded = "$null"
+            if path.suffix.lower() == ".zip":
+                with zipfile.ZipFile(path) as archive:
+                    expanded = sum(member.file_size for member in archive.infolist())
+            sizes += f"; ExpandedBytes={expanded}"
+        bootstrap_tools.append(f"@{{Name='{name}'; SHA256='{pin}'; {sizes}}}")
     template = git("show", f"{revision}:setup/Install-FromHttps.ps1.in").decode("utf-8-sig")
     installer = fill_template(template, {
         "BUNDLE_URL": f"{base}/{filename}",
@@ -201,21 +288,60 @@ def main():
         native_base = f"https://{native_host}{url.path}"
         curl_resolve = f' --resolve "{PILOT_CONTROLLER_DNS}:{url.port or 443}:{url.hostname}"'
 
-    cmd = git("show", f"{revision}:setup/Start-ExamLab.cmd").decode("ascii")
-    cmd = fill_template(cmd, {
+    cmd_substitutions = {
         "REVISION": revision,
         "CONTROLLER_CA_PEM": bootstrap_pem(certificate),
+        "CONTROLLER_CA_BASE64": base64.b64encode(certificate).decode("ascii"),
         "CONTROLLER_CA_SHA256": sha256(certificate),
         "CONTROLLER_CA_THUMBPRINT": hashlib.sha1(certificate, usedforsecurity=False).hexdigest(),
         "PWSH_VERSION": PWSH_VERSION,
         "CURL_RESOLVE": curl_resolve,
+        "PWSH_FILE": PWSH_MSI,
+        "PWSH_BYTES": (args.tools_dir / PWSH_MSI).stat().st_size,
         "PWSH_URL": f"{native_base}/exam-lab-{revision}/tools/{PWSH_MSI}",
         "PWSH_SHA256": PWSH_SHA256,
+        "INSTALLER_FILE": installer_name,
+        "INSTALLER_BYTES": len(installer_bytes),
         "INSTALLER_URL": f"{native_base}/{installer_name}",
         "INSTALLER_SHA256": sha256(installer_bytes),
         "DIAGNOSTICS_URL": f"{native_base}/diagnostics",
-    })
-    launcher_bytes = cmd.replace("\r\n", "\n").replace("\n", "\r\n").encode("ascii")
+        "PREFETCH_BASE_URL": base,
+        "BUNDLE_FILE": filename,
+        "BUNDLE_BYTES": len(bundle),
+        "BUNDLE_EXPANDED_BYTES": sum(len(data) for data in files.values()),
+        "BUNDLE_SHA256": digest,
+        "BOOTSTRAP_TOOLS": "@(" + ", ".join(bootstrap_tools) + ")",
+        "EARLY_CHECK_PAYLOAD": bootstrap_payload("EARLY_CHECK", files["setup/Prepare-ExamLab.ps1"]),
+    }
+    if "@BOOTSTRAP_PRIVATE_PATHS@" in (native or cmd):
+        cmd_substitutions["BOOTSTRAP_PRIVATE_PATHS"] = bootstrap_private_paths(files["setup/ExamLabMaintenance.Core.ps1"])
+    if "@INVENTORY_PAYLOAD@" in cmd:
+        inventory = git("show", f"{revision}:setup/ExamLabInventory.ps1")
+        cmd_substitutions["INVENTORY_PAYLOAD"] = bootstrap_payload("INVENTORY", inventory)
+        cmd_substitutions["CHECK_ONLY"] = "$false"
+        cmd_substitutions["BOOTSTRAP_ARGUMENTS"] = "\n".join(
+            f'set "EXAMLAB_ARG{number}=%~{number}"' for number in range(1, 5)
+        )
+    if native:
+        cmd_substitutions["NATIVE_SCRIPT"] = fill_template(native, cmd_substitutions)
+    launcher_bytes = render_cmd(cmd, cmd_substitutions)
+    check_script_path = None
+    if args.check_launcher:
+        if native:
+            check_script_name = f"check-{revision}.ps1"
+            check_script_path = args.check_launcher.with_name(check_script_name)
+            check_script_bytes = build_check_script(native, cmd_substitutions)
+            check_script_url = f"{check_base}/{check_script_name}"
+            check_cmd = git("show", f"{revision}:setup/Check-ExamLab.cmd").decode("ascii")
+            check_launcher_bytes = render_cmd(check_cmd, {
+                "CHECK_SCRIPT_URL": check_script_url,
+                "CHECK_SCRIPT_BYTES": len(check_script_bytes),
+                "CHECK_SCRIPT_SHA256": sha256(check_script_bytes),
+            })
+        else:
+            check_launcher_bytes = render_cmd(cmd, {
+                **cmd_substitutions, "CHECK_ONLY": "$true", "BOOTSTRAP_ARGUMENTS": "",
+            })
     args.output.mkdir(parents=True, exist_ok=True)
     (args.output / filename).write_bytes(bundle)
     (args.output / installer_name).write_bytes(installer_bytes)
@@ -224,6 +350,13 @@ def main():
     print(f"{installer_name}  SHA-256 {sha256(installer_bytes)}")
     print(f"{filename}  SHA-256 {digest}")
     print(f"{args.launcher}  SHA-256 {sha256(launcher_bytes)}")
+    if args.check_launcher:
+        if check_script_path:
+            check_script_path.write_bytes(check_script_bytes)
+            print(check_script_url)
+            print(f"{check_script_path}  SHA-256 {sha256(check_script_bytes)}")
+        args.check_launcher.write_bytes(check_launcher_bytes)
+        print(f"{args.check_launcher}  SHA-256 {sha256(check_launcher_bytes)}")
 
 
 if __name__ == "__main__":

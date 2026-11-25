@@ -10,9 +10,7 @@ $script:ControllerStateFile = Join-Path $script:DataRoot 'controller-state.json'
 $script:ControllerHealthFile = Join-Path $script:DataRoot 'controller-health.json'
 $script:ControllerProbeOptIn = Join-Path $script:DataRoot 'controller-policy-probe.enabled'
 $script:ControllerProbeStatusFile = Join-Path $script:DataRoot 'controller-policy-probe.json'
-$script:FileTraceAuthorization = Join-Path $script:CodeRoot 'file-trace-exam.txt'
-$script:FileTraceAttempt = Join-Path $script:DataRoot 'file-trace-attempt.json'
-$script:FileTraceLease = Join-Path $script:DataRoot 'file-trace-worker.lock'
+$script:SharedPcGuestName = '\Ashpctac[0-9a-f]{5}\z'
 Import-Module (Join-Path $PSScriptRoot 'ExamLab.Controller.psm1')
 $script:Namespace = 'root\cimv2\mdm\dmmap'
 $script:LoadedSourceHash = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash
@@ -116,7 +114,7 @@ function Test-DeclaredConfig {
 }
 
 function Test-LiveRoster {
-    param($Config, [object[]]$LocalAccounts, [switch]$AllowDrift, [string]$ObservedGuestSid)
+    param($Config, [object[]]$LocalAccounts, [switch]$AllowDrift, [string]$ObservedGuestSid, [string[]]$InactiveGuestSids)
     $missing=@(); $renamed=@()
     foreach ($account in @($Config.OrdinaryAccounts)) {
         $actual=@($LocalAccounts | Where-Object {$_.SID.Value -ceq $account.Sid})
@@ -126,18 +124,139 @@ function Test-LiveRoster {
             $renamed += [pscustomobject]@{Sid=$account.Sid; DeclaredName=$account.Name; ActualName=$actual[0].Name}
         }
     }
-    # Только наблюдение готовности исключает уже проверенный текущий Guest.
+    # Исключения действуют только для наблюдённого Guest и доказанных неактивных остатков.
     $declared=@($Config.OrdinaryAccounts | ForEach-Object {$_.Sid})
     $unlisted=@($LocalAccounts | Where-Object { [int]($_.SID.Value.Split('-')[-1]) -ge 1000 -and
-        $_.SID.Value -notin $declared -and $_.SID.Value -cne $ObservedGuestSid } |
+        $_.SID.Value -notin $declared -and $_.SID.Value -cne $ObservedGuestSid -and $_.SID.Value -cnotin $InactiveGuestSids } |
         ForEach-Object {[pscustomobject]@{Sid=$_.SID.Value; Name=$_.Name}})
     $unconfirmed=($missing.Count -gt 0 -or $renamed.Count -gt 0 -or $unlisted.Count -gt 0)
     if ($unconfirmed -and -not $AllowDrift) { throw 'Локальный roster изменён: отсутствует SID, изменено имя или есть неописанный SID. Нужна отдельная административная проверка; список не расширяется автоматически.' }
     [pscustomobject]@{IdentityUnconfirmed=$unconfirmed; MissingAccounts=$missing; RenamedAccounts=$renamed; UnlistedAccounts=$unlisted}
 }
 
+function Test-ExamLabSetupAccount($Account) {
+    $sid = [regex]::Match($Account.SID.Value, '\AS-1-5-21-[0-9]+-[0-9]+-[0-9]+-(?<Rid>[0-9]+)\z')
+    [uint32]$rid = 0
+    return ($Account.Name -ceq 'defaultuser0' -and $Account.Enabled -is [bool] -and -not $Account.Enabled -and
+        $sid.Success -and [uint32]::TryParse($sid.Groups['Rid'].Value, [ref]$rid) -and $rid -ge 1000)
+}
+
+function Get-ExamLabSetupCompletionIssue($RegistryImageState, [string]$StateIni, $Setup, [object[]]$Profiles) {
+    $sections = @($StateIni -split '(?m)(?=^[ \t]*\[)' | Where-Object { $_ -match '\A[ \t]*\[State\][ \t]*\r?(?=\n|\z)' })
+    $fields = @(if ($sections.Count -eq 1) {
+        [regex]::Matches($sections[0], '(?im)^[ \t]*ImageState[ \t]*=[ \t]*(?<Value>[^\r\n]*)')
+    })
+    if ($RegistryImageState -isnot [string] -or $RegistryImageState -cne 'IMAGE_STATE_COMPLETE' -or $fields.Count -ne 1 -or
+        $fields[0].Groups['Value'].Value.Trim() -cnotin @('IMAGE_STATE_COMPLETE','"IMAGE_STATE_COMPLETE"')) {
+        return 'Завершение установки Windows при наличии defaultuser0 не подтверждено реестром и State.ini.'
+    }
+    foreach ($name in 'OOBEInProgress','SystemSetupInProgress','SetupType') {
+        $property = $Setup.PSObject.Properties[$name]
+        if (-not $property -or $property.Value -isnot [int] -or $property.Value -ne 0) {
+            return "При наличии defaultuser0 флаг установки Windows $name должен иметь значение DWORD 0."
+        }
+    }
+    $loaded = if ($Profiles.Count -eq 1) { $Profiles[0].PSObject.Properties['Loaded'] }
+    if ($Profiles.Count -gt 1 -or ($Profiles.Count -eq 1 -and
+        (-not $loaded -or $loaded.Value -isnot [bool] -or $loaded.Value))) {
+        return 'При наличии defaultuser0 его профиль загружен или состояние загрузки неизвестно.'
+    }
+}
+
+function Get-ExamLabSetupAccountIssue([object[]]$LocalAccounts) {
+    try {
+        $accounts = @($LocalAccounts | Where-Object Name -eq 'defaultuser0')
+        if ($accounts.Count -eq 0) { return }
+        if ($accounts.Count -ne 1 -or -not (Test-ExamLabSetupAccount $accounts[0])) {
+            return 'Учётная запись Windows defaultuser0 включена или её имя, SID либо состояние не подтверждены.'
+        }
+
+        $imageState = Get-ItemPropertyValue -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Setup\State' -Name ImageState -ErrorAction Stop
+        $stateIni = [IO.File]::ReadAllText((Join-Path ([Environment]::GetFolderPath('Windows')) 'Setup\State\State.ini'))
+        $setup = Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\Setup' -ErrorAction Stop
+        $sid = $accounts[0].SID.Value
+        $profiles = @(Get-CimInstance Win32_UserProfile -Filter "SID='$sid'" -ErrorAction Stop)
+        Get-ExamLabSetupCompletionIssue $imageState $stateIni $setup $profiles
+    } catch { return 'Состояние установки Windows или профиля defaultuser0 недоступно для чтения.' }
+}
+
+function Get-ExamLabGuestCreationEvent([string]$Sid, [string]$Name, [int]$MaxEvents = 1) {
+    if ($Sid -cnotmatch '\AS-1-5-21-[0-9]+-[0-9]+-[0-9]+-[0-9]+\z' -or
+        $Name -cnotmatch $script:SharedPcGuestName) { return }
+    $filter = "*[System[Provider[@Name='Microsoft-Windows-Security-Auditing'] and EventID=4720] and " +
+        "EventData[Data[@Name='TargetSid']='$Sid' and Data[@Name='TargetUserName']='$Name' and Data[@Name='SubjectUserSid']='S-1-5-18']]"
+    $readError = if ($MaxEvents -gt 1) { 'Stop' } else { 'SilentlyContinue' }
+    Get-WinEvent -LogName Security -FilterXPath $filter -MaxEvents $MaxEvents -ErrorAction $readError
+}
+
+function Test-ExamLabInactiveGuestAccount($Account) {
+    $sid = [regex]::Match($Account.SID.Value, '\AS-1-5-21-[0-9]+-[0-9]+-[0-9]+-(?<Rid>[0-9]+)\z')
+    [uint32]$rid = 0
+    return ($Account.Name -cmatch $script:SharedPcGuestName -and $Account.Enabled -is [bool] -and -not $Account.Enabled -and
+        $sid.Success -and [uint32]::TryParse($sid.Groups['Rid'].Value, [ref]$rid) -and $rid -ge 1000)
+}
+
+function Test-ExamLabInactiveGuestEvidence($Account, [object[]]$Profiles, [int]$CreationCount) {
+    if ($CreationCount -ne 1 -or $Profiles.Count -ne 1) { return $false }
+    $profile = $Profiles[0]
+    $loaded = $profile.PSObject.Properties['Loaded']
+    $special = $profile.PSObject.Properties['Special']
+    return ($profile.SID -ceq $Account.SID.Value -and $loaded -and $loaded.Value -is [bool] -and -not $loaded.Value -and
+        $special -and $special.Value -is [bool] -and -not $special.Value)
+}
+
+function Test-ExamLabElevatedNonSystemAdministrator {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    try {
+        return (-not $identity.IsSystem -and [Security.Principal.WindowsPrincipal]::new($identity).IsInRole(
+            [Security.Principal.WindowsBuiltInRole]::Administrator))
+    } finally { $identity.Dispose() }
+}
+
+function Get-ExamLabGuestRosterEvidence([object[]]$LocalAccounts, [object[]]$OrdinaryAccounts, [switch]$IdentifyOnly, [switch]$PreviouslyPrepared, $ObservedGuest) {
+    $declared = @(foreach ($account in $OrdinaryAccounts) { $account.Sid })
+    $observedSid = if ($ObservedGuest) { $ObservedGuest.Sid }
+    $candidates = @($LocalAccounts | Where-Object {
+        $_.Name -match $script:SharedPcGuestName -and $_.SID.Value -cnotin $declared -and $_.SID.Value -cne $observedSid
+    })
+    if (-not $candidates.Count) { return }
+
+    $verified = @()
+    if (-not $IdentifyOnly) {
+        # При недоступном WTS, MDM или SAM все кандидаты остаются расхождениями.
+        try {
+            $eligible = @($candidates | Where-Object { Test-ExamLabInactiveGuestAccount $_ })
+            $observedName = if ($ObservedGuest) {
+                $observed = @($LocalAccounts | Where-Object { $_.SID.Value -ceq $observedSid })
+                if ($observed.Count -eq 1 -and $observed[0].Name -cmatch $script:SharedPcGuestName) { $observed[0].Name }
+            }
+            $allowRecordedPreparation = $PreviouslyPrepared -and -not $ObservedGuest -and (Test-ExamLabElevatedNonSystemAdministrator)
+            if ($eligible.Count -and (-not $ObservedGuest -or $observedName) -and
+                (Test-SharedPCGuestRosterReady (Get-SharedPCState) -AllowRecordedPreparation:$allowRecordedPreparation) -and
+                (Test-ControllerNoGuestSession $ObservedGuest $observedName)) {
+                $admins = @(Get-LocalGroupMember -SID 'S-1-5-32-544' -ErrorAction Stop | ForEach-Object { $_.SID.Value })
+                # Для WQL ниже используются только SID, проверенные Test-ExamLabInactiveGuestAccount.
+                $profileFilter = ($eligible | ForEach-Object { "SID='$($_.SID.Value)'" }) -join ' OR '
+                $profileSnapshot = @(Get-CimInstance Win32_UserProfile -Filter $profileFilter -ErrorAction Stop)
+                $verified = @(foreach ($account in $eligible) {
+                    $sid = $account.SID.Value
+                    if ($sid -cin $admins) { continue }
+                    $exemption = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\Microsoft\Windows\CurrentVersion\SharedPC\Exemptions\'+$sid)
+                    if ($exemption) { $exemption.Dispose(); continue }
+                    $profiles = @($profileSnapshot | Where-Object SID -ceq $sid)
+                    $creations = @(Get-ExamLabGuestCreationEvent $sid $account.Name 2)
+                    if (Test-ExamLabInactiveGuestEvidence $account $profiles $creations.Count) { $sid }
+                })
+            }
+        } catch { $verified = @() }
+    }
+    foreach ($candidate in $candidates) {
+        [pscustomobject]@{ Sid=$candidate.SID.Value; VerifiedInactive=($candidate.SID.Value -cin $verified) }
+    }
+}
+
 function Read-Context {
-    param([switch]$AllowRosterDriftOnlyForNormal, [string]$ObservedGuestSid)
+    param([switch]$AllowRosterDriftOnlyForNormal, $ObservedGuest)
     Assert-Host
     if ($PSScriptRoot -ne $script:CodeRoot -or
         (Get-FileHash -LiteralPath (Join-Path $script:CodeRoot 'ExamLab.psm1') -Algorithm SHA256).Hash -cne $script:LoadedSourceHash) {
@@ -163,7 +282,16 @@ function Read-Context {
     }
     # Ошибка чтения SAM остаётся отказом; только успешная enumeration даёт drift.
     $localAccounts=@(Get-LocalUser -ErrorAction Stop)
-    $roster=Test-LiveRoster $config $localAccounts -AllowDrift:$AllowRosterDriftOnlyForNormal -ObservedGuestSid $ObservedGuestSid
+    $observedSid = if ($ObservedGuest) { $ObservedGuest.Sid }
+    $inactiveGuestSids = @()
+    if (-not $AllowRosterDriftOnlyForNormal) {
+        $setupAccountIssue = Get-ExamLabSetupAccountIssue -LocalAccounts $localAccounts
+        if ($setupAccountIssue) { throw $setupAccountIssue }
+        $inactiveGuestSids = @(Get-ExamLabGuestRosterEvidence -LocalAccounts $localAccounts `
+            -OrdinaryAccounts $config.OrdinaryAccounts -ObservedGuest $ObservedGuest | Where-Object VerifiedInactive | ForEach-Object Sid)
+    }
+    $roster=Test-LiveRoster $config $localAccounts -AllowDrift:$AllowRosterDriftOnlyForNormal `
+        -ObservedGuestSid $observedSid -InactiveGuestSids $inactiveGuestSids
     $lgpo=Join-Path $script:CodeRoot 'LGPO.exe'
     if ((Get-FileHash -LiteralPath $lgpo -Algorithm SHA256).Hash -ne '0C97F29543418B30340C4FF5D930D31E6196DD59C2CC74B6B890FA7B90C910C7') { throw 'Неизвестный LGPO.exe.' }
     $signature=Get-AuthenticodeSignature -LiteralPath $lgpo
@@ -178,9 +306,14 @@ function Read-Context {
 function Get-SharedPCState {
     try {
         $instances=@(Get-CimInstance -Namespace $script:Namespace -ClassName MDM_SharedPC)
-        if ($instances.Count -ne 1) { return [pscustomobject]@{ State='Unknown'; Count=$instances.Count; Instance=$null; Reason="MDM_SharedPC instances=$($instances.Count)" } }
-        [pscustomobject]@{ State='Observed'; Count=1; Instance=$instances[0]; Reason=$null }
-    } catch { [pscustomobject]@{ State='Unknown'; Count=$null; Instance=$null; Reason=$_.Exception.Message } }
+        if ($instances.Count -ne 1) { return [pscustomobject]@{ State='Unknown'; Count=$instances.Count; Instance=$null; Reason="MDM_SharedPC instances=$($instances.Count)"; AccessDenied=$false } }
+        [pscustomobject]@{ State='Observed'; Count=1; Instance=$instances[0]; Reason=$null; AccessDenied=$false }
+    } catch {
+        $accessDenied = $_.Exception -is [Microsoft.Management.Infrastructure.CimException] -and
+            ($_.Exception.NativeErrorCode -eq [Microsoft.Management.Infrastructure.NativeErrorCode]::AccessDenied -or
+                $_.CategoryInfo.Category -eq [Management.Automation.ErrorCategory]::PermissionDenied)
+        [pscustomobject]@{ State='Unknown'; Count=$null; Instance=$null; Reason=$_.Exception.Message; AccessDenied=$accessDenied }
+    }
 }
 
 function Get-ComponentStatus {
@@ -200,6 +333,15 @@ function Test-SharedPCTarget {
     return ($i.EnableSharedPCMode -eq $true -and $i.EnableAccountManager -eq $true -and
         [int]$i.AccountModel -eq 2 -and $null -ne $i.DeletionPolicy -and [int]$i.DeletionPolicy -eq 0 -and
         $i.SetEduPolicies -eq $false -and $i.SetPowerPolicies -eq $false -and $i.RestrictLocalStorage -eq $false)
+}
+
+function Test-SharedPCGuestRosterReady($Shared, [switch]$AllowRecordedPreparation) {
+    if (Test-SharedPCTarget $Shared) { return $true }
+    # Закрытый SYSTEM-раздел WMI Bridge отвечает повышенному администратору
+    # отказом доступа или пустым успешным результатом.
+    return ($AllowRecordedPreparation -and $Shared.State -ceq 'Unknown' -and
+        (($null -eq $Shared.Count -and $Shared.AccessDenied) -or
+            ($Shared.Count -is [int] -and $Shared.Count -eq 0 -and -not $Shared.AccessDenied)))
 }
 
 function Test-SharedPCUnset {
@@ -411,12 +553,10 @@ function Invoke-ExamLabAlertProcess([string]$Path, [string[]]$Arguments) {
     return $output
 }
 
-function Start-ExamLabExtendedCollection {
-    $runner = Get-ExamLabWazuhRunner
-    if (-not $runner) { throw 'Для экзамена не подтверждён выделенный агент Wazuh.' }
-    if ((Get-Service -Name 'WazuhSvc').Status -ne 'Running') {
-        & $runner -Action StartCollection | Out-Null
-    }
+function Test-ExamLabWazuhRunning {
+    if (-not (Get-ExamLabWazuhRunner)) { return $false }
+    $service = Get-Service -Name 'WazuhSvc'
+    return ($service.Status -eq 'Running' -and $service.StartType -eq 'Manual')
 }
 
 function Stop-ExamLabExtendedCollection {
@@ -479,6 +619,12 @@ function Invoke-ExamLabNormalUnderLock {
     return $status
 }
 
+function Test-ExamLabControllerPolicyProbeEnabled {
+    if (-not (Test-ExistingFile $script:ControllerProbeOptIn)) { return $false }
+    Assert-SafePath $script:ControllerProbeOptIn
+    return [IO.File]::ReadAllText($script:ControllerProbeOptIn) -ceq 'true'
+}
+
 function Invoke-ExamLabControllerPolicyProbe {
     param($Assignment,[IO.FileStream]$Lock)
     $probe = [pscustomobject]@{
@@ -489,8 +635,7 @@ function Invoke-ExamLabControllerPolicyProbe {
     }
     $phase = 'Preflight'
     try {
-        Assert-SafePath $script:ControllerProbeOptIn
-        if ([IO.File]::ReadAllText($script:ControllerProbeOptIn) -cne 'true') { throw 'Стендовая проба не включена административным установщиком.' }
+        if (-not (Test-ExamLabControllerPolicyProbeEnabled)) { throw 'Стендовая проба не включена административным установщиком.' }
         $context = Read-Context
         $status = Get-Status $context
         $network = $context.Config.PSObject.Properties['Network']
@@ -562,7 +707,10 @@ function Set-ExamLabMode {
             $change = Compare-ControllerAssignment $ControllerAssignment $controller.Assignment
             if ($change -ceq 'repeat' -and $controller.Result -and
                 $controller.Result.reason -cnotin @('machine-preflight-failed','local-action-failed','local-normal-incomplete',
-                    'collection-stop-failed','guest-still-present')) { return }
+                    'collection-stop-failed','guest-still-present')) {
+                Restore-ExamLabControllerCollection $controller
+                return
+            }
             if ($change -ceq 'new') {
                 $controller.Assignment = $ControllerAssignment
                 $controller.Result = $null
@@ -596,6 +744,7 @@ function Set-ExamLabMode {
                     Set-ControllerResult $controller 'blocked' 'full-not-ready' $false
                 }
                 Write-ControllerJson $script:ControllerStateFile $controller
+                Restore-ExamLabControllerCollection $controller
                 return
             }
             if (-not (Test-ControllerNoGuestSession)) {
@@ -603,11 +752,14 @@ function Set-ExamLabMode {
                 Write-ControllerJson $script:ControllerStateFile $controller
                 return
             }
-        } elseif (Test-ExistingFile $script:ControllerConfigurationFile) {
+        } else {
             # Ошибка чтения состояния останавливает опрос, но оставляет доступным
             # локальное восстановление Windows.
-            try { $controller = Read-ControllerState $script:ControllerStateFile }
-            catch { Write-Warning 'Состояние контроллера недоступно. Локальный normal продолжает восстановление.' }
+            try {
+                if ((Test-ExistingFile $script:ControllerStateFile) -or (Test-ExistingFile $script:ControllerConfigurationFile)) {
+                    $controller = Read-ControllerState $script:ControllerStateFile
+                }
+            } catch { Write-Warning 'Состояние контроллера недоступно. Локальный normal продолжает восстановление.' }
             if ($controller) {
                 $controller.LocalGeneration = [Guid]::NewGuid().ToString('N')
                 if (-not $controller.Assignment) { $controller.AwaitingBaseline = $true }
@@ -662,6 +814,10 @@ function Set-ExamLabMode {
             }
         }
         if ($controller) { Write-ControllerJson $script:ControllerStateFile $controller }
+        if ($script:FileTraceLoaded) {
+            try { Complete-ExamLabFileTraceNormal $controller }
+            catch { Write-Warning 'Не удалось закрыть или экспортировать локальную пробу FileIO.light.' }
+        }
         return $status
     } finally { $lock.Dispose() }
 }
@@ -674,17 +830,38 @@ function Get-ExamLabActiveGuest([DateTime]$Boot) {
     $account = Get-LocalUser -SID ([Security.Principal.SecurityIdentifier]::new($logon.Sid))
     # Префикс наблюдался у временных учётных записей на эталонной Windows.
     # Запись аудита дополнительно связывает имя и SID с созданием от SYSTEM.
-    if (-not $account.Enabled -or $account.Name -cnotmatch '\Ashpctac[0-9a-f]{5}\z' -or
+    if (-not $account.Enabled -or $account.Name -cnotmatch $script:SharedPcGuestName -or
         $logon.Sid -cin @(Get-LocalGroupMember -SID 'S-1-5-32-544' | ForEach-Object {$_.SID.Value})) {
         return [pscustomobject]@{Logon=$null; Status='GuestAccountUnconfirmed'}
     }
-    $filter = "*[System[Provider[@Name='Microsoft-Windows-Security-Auditing'] and EventID=4720] and " +
-        "EventData[Data[@Name='TargetSid']='$($logon.Sid)' and Data[@Name='TargetUserName']='$($account.Name)' and Data[@Name='SubjectUserSid']='S-1-5-18']]"
-    $created = Get-WinEvent -LogName Security -FilterXPath $filter -MaxEvents 1 -ErrorAction SilentlyContinue
+    $created = Get-ExamLabGuestCreationEvent $logon.Sid $account.Name
     if (-not $created -or $created.TimeCreated.ToUniversalTime() -lt $Boot) {
         return [pscustomobject]@{Logon=$null; Status='GuestCreationUnconfirmed'}
     }
     return [pscustomobject]@{Logon=$logon; Status='GuestCandidate'}
+}
+
+function Get-ExamLabControllerPolicyReadback($Guest) {
+    $context = Read-Context -ObservedGuest $Guest
+    $status = Get-Status $context
+    $usb = $status.Components.Usb
+    if ($status.Prepared -and $usb.State -ceq 'Applied' -and $usb.OwnSourceEntries -eq 1 -and
+        $usb.MetadataRevisionMatches -and -not $status.Conflicts.Count -and $status.Components.Network.EffectiveApplied) {
+        return $context
+    }
+}
+
+function Restore-ExamLabControllerCollection($State) {
+    # Вызывается под operation.lock с состоянием после проверки свежего ответа сервера.
+    if (-not (Test-ControllerActiveExam $State) -or -not (Test-ExamLabControllerPolicyProbeEnabled) -or
+        (Test-ExamLabWazuhRunning)) { return }
+    $boot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime()
+    $guest = (Get-ExamLabActiveGuest $boot).Logon
+    $context = Get-ExamLabControllerPolicyReadback $guest
+    if (-not $context -or -not $context.Config.Network.PSObject.Properties['WazuhEndpoint']) { return }
+    $runner = Get-ExamLabWazuhRunner
+    if (-not $runner) { throw 'Для экзамена не подтверждён выделенный агент Wazuh.' }
+    & $runner -Action StartCollection | Out-Null
 }
 
 function Get-ExamLabControllerGuestBinding {
@@ -695,8 +872,7 @@ function Get-ExamLabControllerGuestBinding {
     Assert-SafePath $script:ControllerStateFile
     $configuration = Read-ControllerConfiguration $script:ControllerConfigurationFile
     $state = Read-ControllerState $script:ControllerStateFile $configuration.deviceId
-    if (-not $state.Result -or $state.Result.mode -cne 'exam' -or $state.Result.outcome -cne 'source-applied' -or
-        $state.Result.reason -cne 'machine-policies-only' -or $state.StoppedExamId -ceq $state.Result.examId) { return }
+    if (-not (Test-ControllerActiveExam $state)) { return }
     $boot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime()
     $guest = (Get-ExamLabActiveGuest $boot).Logon
     if (-not $guest) { return }
@@ -717,50 +893,46 @@ function Get-ExamLabControllerObservation($Configuration, $Snapshot, [DateTime]$
     }
     if ([StringComparer]::Ordinal.Compare($readiness.observedUtc, $BootUtc) -lt 0) { return $observation }
     $observation.Readiness = $readiness
-    if ($Snapshot.Result.mode -cne 'exam' -or $Snapshot.Result.outcome -cne 'source-applied' -or
-        $Snapshot.Result.reason -cne 'machine-policies-only') { return $observation }
+    if (-not (Test-ControllerActiveExam $Snapshot)) { return $observation }
 
     $lock = $null
     try {
         $lockPath = Join-Path $script:DataRoot 'operation.lock'
         Assert-SafePath $lockPath
-        $lock = Open-ExamLabModeLock $lockPath
+        $lock = [IO.File]::Open($lockPath, 'Open', 'Read', 'None')
         $state = Read-ControllerState $script:ControllerStateFile $Configuration.deviceId
-        if ($state.LocalGeneration -cne $Snapshot.LocalGeneration -or -not $state.Result -or
+        if ($state.LocalGeneration -cne $Snapshot.LocalGeneration -or -not (Test-ControllerActiveExam $state) -or
             $state.Result.revision -ne $Snapshot.Result.revision -or
-            $state.Result.observedUtc -cne $Snapshot.Result.observedUtc -or
-            $state.Result.outcome -cne $Snapshot.Result.outcome -or
-            $state.Result.reason -cne $Snapshot.Result.reason -or $state.StoppedExamId -ceq $state.Result.examId) {
+            $state.Result.observedUtc -cne $Snapshot.Result.observedUtc) {
             return $observation
         }
 
-        Assert-SafePath $script:ControllerProbeOptIn
-        if ([IO.File]::ReadAllText($script:ControllerProbeOptIn) -cne 'true') { return $observation }
+        if (-not (Test-ExamLabControllerPolicyProbeEnabled)) { return $observation }
         $guest = $null
         try {
             $guestCandidate = Get-ExamLabActiveGuest $Boot
             $guest = $guestCandidate.Logon
             $observation.GuestObservation = $guestCandidate.Status
         } catch { $observation.GuestObservation = 'GuestObservationUnavailable' }
-        $guestSid = if ($guest) { $guest.Sid }
-        $context = Read-Context -ObservedGuestSid $guestSid
-        $status = Get-Status $context
-        $usb = $status.Components.Usb
-        if (-not $status.Prepared -or $usb.State -cne 'Applied' -or $usb.OwnSourceEntries -ne 1 -or
-            -not $usb.MetadataRevisionMatches -or $status.Conflicts.Count -or -not $status.Components.Network.EffectiveApplied) {
+        $context = Get-ExamLabControllerPolicyReadback $guest
+        if (-not $context) { return $observation }
+        if (-not $context.Config.Network.PSObject.Properties['WazuhEndpoint']) {
+            $observation.GuestObservation = 'WazuhNotConfigured'
             return $observation
         }
         try {
-            if ($context.Config.Network.PSObject.Properties['WazuhEndpoint']) { Start-ExamLabExtendedCollection }
-        }
-        catch {
-            $observation.GuestObservation = 'WazuhStartFailed'
+            if (-not (Test-ExamLabWazuhRunning)) {
+                $observation.GuestObservation = 'WazuhNotRunning'
+                return $observation
+            }
+        } catch {
+            $observation.GuestObservation = 'WazuhObservationUnavailable'
             return $observation
         }
 
         $guestSessionId = $null
         if ($guest) {
-            if ($guestSid -cin @($context.Config.OrdinaryAccounts.Sid)) {
+            if ($guest.Sid -cin @($context.Config.OrdinaryAccounts.Sid)) {
                 $observation.GuestObservation = 'GuestListedAsOrdinary'
             } else {
                 try {
@@ -833,7 +1005,7 @@ function Invoke-ExamLabControllerAlertAcknowledgement($Command, $Assignment, $Sn
     $lock = Open-ExamLabModeLock $lockPath
     try {
         $state = Read-ControllerState $script:ControllerStateFile $Assignment.deviceId
-        if ($state.LocalGeneration -cne $Snapshot.LocalGeneration -or -not $state.Assignment -or
+        if ($state.LocalGeneration -cne $Snapshot.LocalGeneration -or -not (Test-ControllerActiveExam $state) -or
             (Compare-ControllerAssignment $Assignment $state.Assignment) -cne 'repeat') { return }
         $runner = Get-ExamLabAlertRunner
         if ($runner) {
@@ -845,205 +1017,9 @@ function Invoke-ExamLabControllerAlertAcknowledgement($Command, $Assignment, $Sn
     } finally { $lock.Dispose() }
 }
 
-function Test-ExamLabFileTraceAuthorization([string]$ExamId) {
-    if ($ExamId -cnotmatch '\Afile-trace-[A-Za-z0-9._-]{1,53}\z' -or
-        -not (Test-ExistingFile $script:FileTraceAuthorization)) { return $false }
-    $file = Get-Item -LiteralPath $script:FileTraceAuthorization -Force
-    if ($file.Length -eq 0) { return $false }
-    if ($file.Length -gt 64) { throw 'Некорректная настройка файлового экзамена.' }
-    Assert-SafePath $script:FileTraceAuthorization -Readable
-    return [IO.File]::ReadAllText($script:FileTraceAuthorization) -ceq $ExamId
-}
-
-function Test-ExamLabFileTraceAssignment($State, $Attempt) {
-    $assignment = $State.Assignment
-    $result = $State.Result
-    return ($assignment -and $result -and $State.LocalGeneration -ceq $Attempt.localGeneration -and
-        $assignment.mode -ceq 'exam' -and $assignment.revision -eq $Attempt.revision -and
-        $assignment.examId -cmatch '\Afile-trace-[A-Za-z0-9._-]+\z' -and $assignment.examId -ceq $Attempt.examId -and
-        $State.StoppedExamId -cne $assignment.examId -and $result.outcome -ceq 'source-applied' -and
-        $result.reason -ceq 'machine-policies-only')
-}
-
-function Get-ExamLabFileTraceStopReason($Context) {
-    try {
-        $attempt = $Context.Attempt
-        if (-not (Test-ExamLabFileTraceAuthorization $attempt.examId)) { return 'opt-out' }
-        $state = Read-ControllerState $script:ControllerStateFile $attempt.deviceId
-        if (-not (Test-ExamLabFileTraceAssignment $state $attempt)) { return 'assignment-ended' }
-        $current = Get-ControllerConsoleLogon
-        if (-not $current -or
-            (Get-ControllerGuestSessionId $Context.Token $attempt.bootUtc $current) -cne $attempt.guestSessionId) {
-            return 'guest-changed'
-        }
-    } catch { return 'binding-unavailable' }
-}
-
-function Read-ExamLabFileTraceAttempt {
-    if (-not (Test-ExistingFile $script:FileTraceAttempt)) { return }
-    Assert-SafePath $script:FileTraceAttempt
-    $stream = [IO.File]::Open($script:FileTraceAttempt, 'Open', 'Read', 'ReadWrite, Delete')
-    try {
-        if ($stream.Length -gt 8KB) { throw 'Отметка пробы FileIO.light превышает допустимый размер.' }
-        $reader = [IO.StreamReader]::new($stream)
-        try { $reader.ReadToEnd() | ConvertFrom-Json -DateKind String }
-        finally { $reader.Dispose() }
-    } finally { $stream.Dispose() }
-}
-
-function Open-ExamLabFileTraceLease {
-    if (Test-ExistingFile $script:FileTraceLease) { Assert-SafePath $script:FileTraceLease }
-    try { [IO.File]::Open($script:FileTraceLease, 'OpenOrCreate', 'ReadWrite', 'None') }
-    catch {
-        $failure = $_.Exception.GetBaseException()
-        if ($failure -isnot [IO.IOException] -or ($failure.HResult -band 0xffff) -notin 32,33) { throw }
-    }
-}
-
-function Stop-ExamLabOrphanedFileTrace([string]$BootUtc) {
-    $previous = Read-ExamLabFileTraceAttempt
-    if (-not $previous -or $previous.phase -cne 'running') { return }
-    $lease = Open-ExamLabFileTraceLease
-    if (-not $lease) { return }
-    try {
-        # Полученный lease означает, что worker уже не сможет начать или продолжить эту попытку.
-        $attempt = Read-ExamLabFileTraceAttempt
-        if (-not $attempt -or $attempt.phase -cne 'running') { return }
-        if ($attempt.runId -cnotmatch '\A[0-9a-f]{32}\z') { throw 'Некорректное имя экземпляра FileIO.light.' }
-        if ($attempt.bootUtc -ceq $BootUtc) {
-            $wpr = Join-Path ([Environment]::GetFolderPath('System')) 'wpr.exe'
-            Start-Process -FilePath $wpr -ArgumentList ('-cancel -instancename ExamLabFileIO-' + $attempt.runId) -WindowStyle Hidden
-        }
-        $attempt.phase = 'cleanup-requested'
-        Write-ControllerJson $script:FileTraceAttempt $attempt
-    } finally { $lease.Dispose() }
-}
-
-function Start-ExamLabFileTraceProbe($Assignment, $Configuration, $Snapshot, $Observation) {
-    if ($Assignment.mode -cne 'exam' -or $Assignment.examId -cnotmatch '\Afile-trace-[A-Za-z0-9._-]+\z' -or
-        -not $Observation.Readiness -or -not $Observation.Readiness.machineReady -or
-        $Observation.Readiness.revision -ne $Assignment.revision -or -not $Observation.Readiness.guestSessionId -or
-        -not (Test-ExamLabFileTraceAuthorization $Assignment.examId)) { return }
-    $lockPath = Join-Path $script:DataRoot 'operation.lock'
-    Assert-SafePath $lockPath
-    $lock = Open-ExamLabModeLock $lockPath
-    try {
-        $lease = Open-ExamLabFileTraceLease
-        if (-not $lease) { return }
-        try {
-            $last = Read-ExamLabFileTraceAttempt
-            if ($last) {
-                if ($last.deviceId -cne $Assignment.deviceId) { throw 'Отметка пробы относится к другой регистрации ПК.' }
-                if ($last.revision -ge $Assignment.revision -or $last.phase -ceq 'running') { return }
-            }
-            $attempt = [pscustomobject]@{
-                deviceId = $Assignment.deviceId
-                revision = $Assignment.revision
-                examId = $Assignment.examId
-                guestSessionId = $Observation.Readiness.guestSessionId
-                bootUtc = $Observation.Readiness.bootUtc
-                localGeneration = $Snapshot.LocalGeneration
-                runId = [guid]::NewGuid().ToString('N')
-                phase = 'pending'
-            }
-            if (Get-ExamLabFileTraceStopReason @{Attempt=$attempt; Token=$Configuration.token}) { return }
-            $entry = Join-Path $script:CodeRoot 'exam-lab.ps1'
-            Assert-SafePath $entry -Readable
-            Assert-SafePath (Join-Path $script:CodeRoot 'windows-fileio-light.ps1') -Readable
-            $pwsh = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'PowerShell\7\pwsh.exe'
-            # Фиксируем попытку до запуска, в том числе при перезапуске опроса.
-            Write-ControllerJson $script:FileTraceAttempt $attempt
-        } finally { $lease.Dispose() }
-        $arguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -Action file-trace -TraceRunId {1}' -f $entry, $attempt.runId
-        Start-Process -FilePath $pwsh -ArgumentList $arguments -WindowStyle Hidden
-    } finally { $lock.Dispose() }
-}
-
-function Test-ExamLabFileTraceNormal($State, $Attempt) {
-    if (-not $State -or -not $State.Assignment -or $State.Assignment.deviceId -cne $Attempt.deviceId) { return $false }
-    if ($State.Assignment.mode -ceq 'exam') {
-        return ($State.Assignment.revision -eq $Attempt.revision -and $State.Assignment.examId -ceq $Attempt.examId -and
-            $State.LocalNormal -and $State.StoppedExamId -ceq $Attempt.examId -and
-            $State.LocalNormal.SourceCleanupCompleted -eq $true -and -not $State.LocalNormal.BaselineUnknown -and
-            $State.Result -and $State.Result.outcome -ceq 'overridden' -and
-            $State.Result.reason -ceq 'local-normal-source-confirmed')
-    }
-    return ($State.Result -and $State.Assignment.mode -ceq 'normal' -and
-        $State.Assignment.revision -gt $Attempt.revision -and $State.Result.revision -eq $State.Assignment.revision -and
-        $State.Result.mode -ceq 'normal' -and
-        ($State.Result.outcome -ceq 'applied' -or
-            ($State.Result.outcome -ceq 'source-applied' -and $State.Result.reason -ceq 'effective-readback-pending')))
-}
-
-function Start-ExamLabFileTraceExport($State) {
-    if (-not [IO.File]::Exists($script:FileTraceAttempt)) { return }
-    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-    try { if (-not $identity.IsSystem) { return } } finally { $identity.Dispose() }
-    $attempt = Read-ExamLabFileTraceAttempt
-    if (-not $attempt -or $attempt.phase -cne 'finished' -or $attempt.PSObject.Properties['exportRequestedUtc'] -or
-        -not (Test-ExamLabFileTraceNormal $State $attempt)) { return }
-    $lease = Open-ExamLabFileTraceLease
-    if (-not $lease) { return }
-    try {
-        $attempt = Read-ExamLabFileTraceAttempt
-        if (-not $attempt -or $attempt.phase -cne 'finished' -or $attempt.PSObject.Properties['exportRequestedUtc'] -or
-            -not (Test-ExamLabFileTraceNormal $State $attempt) -or
-            -not (Test-ExamLabFileTraceAuthorization $attempt.examId)) { return }
-        if ($attempt.runId -cnotmatch '\A[0-9a-f]{32}\z' -or
-            ($attempt.revision -isnot [int] -and $attempt.revision -isnot [long]) -or
-            $attempt.revision -lt 1 -or $attempt.revision -gt [int]::MaxValue) {
-            throw 'Некорректная отметка экспорта FileIO.light.'
-        }
-        $exporter = Join-Path $script:CodeRoot 'Export-ExamLabFileTrace.ps1'
-        Assert-SafePath $exporter -Readable
-        $instance = 'ExamLabFileIO-' + $attempt.runId
-        $reportsRoot = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'ExamLabSetupReports'
-        $directory = Join-Path $reportsRoot $instance
-        Assert-SafePath $reportsRoot
-        Assert-SafePath $directory
-        $stdout = Join-Path $directory 'export.json'
-        $stderr = Join-Path $directory 'export-error.txt'
-        if ((Test-Path -LiteralPath $stdout) -or (Test-Path -LiteralPath $stderr)) { throw 'Отчёт экспорта уже существует.' }
-        $pwsh = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'PowerShell\7\pwsh.exe'
-        $arguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -ExpectedComputerName "{1}" -TraceInstance {2} -Upload -ExamRevision {3} -Headless' -f
-            $exporter, $env:COMPUTERNAME, $instance, $attempt.revision
-        $attempt | Add-Member -NotePropertyName exportRequestedUtc -NotePropertyValue (Get-ControllerUtc)
-        Write-ControllerJson $script:FileTraceAttempt $attempt
-        Start-Process -FilePath $pwsh -ArgumentList $arguments -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr
-    } finally { $lease.Dispose() }
-}
-
-function Invoke-ExamLabFileTraceProbe([guid]$TraceRunId) {
-    Assert-Host
-    if ($PSScriptRoot -cne $script:CodeRoot -or $TraceRunId -eq [guid]::Empty) {
-        throw 'Запустите установленную пробу ExamLab с отметкой попытки.'
-    }
-    Assert-SafePath $script:CodeRoot -Readable
-    Assert-SafePath $script:DataRoot
-    Assert-SafePath $script:ControllerConfigurationFile
-    Assert-SafePath $script:ControllerStateFile
-    $configuration = Read-ControllerConfiguration $script:ControllerConfigurationFile
-    $lease = Open-ExamLabFileTraceLease
-    if (-not $lease) { return }
-    try {
-        $attempt = Read-ExamLabFileTraceAttempt
-        if (-not $attempt -or $attempt.phase -cne 'pending' -or
-            $attempt.runId -cne $TraceRunId.ToString('N') -or $attempt.deviceId -cne $configuration.deviceId) { return }
-        $context = @{Attempt=$attempt; Token=$configuration.token}
-        if (Get-ExamLabFileTraceStopReason $context) { return }
-        $guest = Get-ExamLabControllerGuestBinding
-        if (-not $guest -or $guest.Revision -ne $attempt.revision -or $guest.BootUtc -cne $attempt.bootUtc -or
-            $guest.GuestSessionId -cne $attempt.guestSessionId) { return }
-        $capture = Join-Path $script:CodeRoot 'windows-fileio-light.ps1'
-        Assert-SafePath $capture -Readable
-        $attempt.phase = 'running'
-        Write-ControllerJson $script:FileTraceAttempt $attempt
-        $records = & $capture -ExpectedComputerName $env:COMPUTERNAME -Seconds 35 -RunId $TraceRunId `
-            -StopWhen { param($Current) Get-ExamLabFileTraceStopReason $Current } -StopContext $context
-        $completed = @($records | ConvertFrom-Json | Where-Object { $_.event -ceq 'completed' })
-        $attempt.phase = if ($completed.Count -eq 1) { 'finished' } else { 'closed-without-trace' }
-        Write-ControllerJson $script:FileTraceAttempt $attempt
-    } finally { $lease.Dispose() }
+function Get-ControllerPollDelayMilliseconds([long]$ElapsedMilliseconds, [string]$Status) {
+    if ($Status -cne 'Connected') { return 15000 }
+    return [int][Math]::Max(1000L, 15000L - $ElapsedMilliseconds)
 }
 
 function Invoke-ExamLabControllerLoop {
@@ -1074,8 +1050,7 @@ function Invoke-ExamLabControllerLoop {
     $client = New-ExamLabHttpClient
     try {
         while ($true) {
-            try { Stop-ExamLabOrphanedFileTrace $bootUtc }
-            catch { Write-Warning 'Не удалось закрыть прерванную локальную пробу FileIO.light.' }
+            $cycle = [Diagnostics.Stopwatch]::StartNew()
             $health.LastAttemptUtc = Get-ControllerUtc
             $health.ActionDetail = $null
             $health.Readiness = $null
@@ -1088,12 +1063,9 @@ function Invoke-ExamLabControllerLoop {
                 $health.Status='LocalError'
                 $health.Reason='controller-state-unreadable'
                 Write-ControllerJson $script:ControllerHealthFile $health
-                Start-Sleep -Seconds 15
+                Start-Sleep -Milliseconds (Get-ControllerPollDelayMilliseconds $cycle.ElapsedMilliseconds $health.Status)
                 continue
             }
-            # Проверка предшествует запросу, поэтому локальный normal срабатывает и без связи.
-            try { Start-ExamLabFileTraceExport $snapshot }
-            catch { Write-Warning 'Не удалось запустить экспорт закрытой трассы FileIO.light.' }
             try {
                 $observation = Get-ExamLabControllerObservation $configuration $snapshot $boot $bootUtc
                 $clientReport = Get-ExamLabControllerClientReport $observation
@@ -1112,8 +1084,11 @@ function Invoke-ExamLabControllerLoop {
                 Write-ControllerJson $script:ControllerHealthFile $health
                 try {
                     $null = Set-ExamLabMode -Mode $assignment.mode -ControllerAssignment $assignment -LocalGeneration $snapshot.LocalGeneration
-                    try { Start-ExamLabFileTraceProbe $assignment $configuration $snapshot $observation }
-                    catch { Write-Warning 'Не удалось запустить локальную пробу FileIO.light.' }
+                    if ($assignment.mode -ceq 'exam' -and $assignment.examId -clike 'file-trace-*') {
+                        if (-not $script:FileTraceLoaded) { throw 'Установленный обработчик FileIO.light недоступен.' }
+                        Invoke-ExamLabFileTraceAssignment -Assignment $assignment -Configuration $configuration `
+                            -Snapshot $snapshot -Observation $observation
+                    }
                     if ($response.AlertAcknowledgement) {
                         Invoke-ExamLabControllerAlertAcknowledgement $response.AlertAcknowledgement $assignment $snapshot
                     }
@@ -1128,9 +1103,25 @@ function Invoke-ExamLabControllerLoop {
                 $health.Reason = $_.Exception.Message
                 Write-ControllerJson $script:ControllerHealthFile $health
             }
-            Start-Sleep -Seconds 15
+            Start-Sleep -Milliseconds (Get-ControllerPollDelayMilliseconds $cycle.ElapsedMilliseconds $health.Status)
         }
     } finally { $client.Dispose() }
 }
 
-Export-ModuleMember -Function Get-ExamLabStatus,Initialize-ExamLab,Set-ExamLabMode,Invoke-ExamLabControllerLoop,Get-ExamLabControllerGuestBinding,Invoke-ExamLabFileTraceProbe,Test-ExamLabFileTraceNormal
+$script:FileTraceLoaded = $false
+if ($PSScriptRoot -eq $script:CodeRoot) {
+    $fileTrace = Join-Path $script:CodeRoot 'ExamLab.FileTrace.ps1'
+    try {
+        if (Test-ExistingFile $fileTrace) {
+            Assert-SafePath $script:CodeRoot -Readable
+            Assert-SafePath $fileTrace -Readable
+            . $fileTrace
+            $script:FileTraceLoaded = $true
+        }
+    } catch { Write-Warning 'Установленный обработчик FileIO.light недоступен.' }
+} else {
+    . (Join-Path $PSScriptRoot 'trace/ExamLab.FileTrace.ps1')
+    $script:FileTraceLoaded = $true
+}
+
+Export-ModuleMember -Function Get-ExamLabStatus,Initialize-ExamLab,Set-ExamLabMode,Invoke-ExamLabControllerLoop,Get-ExamLabControllerGuestBinding,Invoke-ExamLabFileTraceProbe,Test-ExamLabFileTraceNormal,Get-ExamLabSetupAccountIssue,Get-ExamLabGuestRosterEvidence

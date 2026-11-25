@@ -8,3 +8,4 @@ PolicyFileEditor-3.0.1.zip	3.0.1	https://www.powershellgallery.com/api/v2/packag
 wazuh-agent-4.14.10-1.msi	4.14.10-1	https://packages.wazuh.com/4.x/windows/wazuh-agent-4.14.10-1.msi
 gradle-exam-cache.zip	локальный	-
 PowerShell-7.6.10-win-x64.msi	7.6.10	https://github.com/PowerShell/PowerShell/releases/download/v7.6.10/PowerShell-7.6.10-win-x64.msi
+WinDirStat-2.9.3-x64.msi	2.9.3	https://github.com/windirstat/windirstat/releases/download/release/v2.9.3/WinDirStat-x64.msi
